@@ -16,7 +16,7 @@ import numpy as np
 import pypdfium2
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from media_analysis import measure, probe, run, video_info
+from media_analysis import alignment_module, measure, probe, run, video_info
 from report_html import write_html
 from ssroutine import MAX_PACKAGE, consume, container_digest, read_manifest, require, validate_manifest
 
@@ -64,13 +64,15 @@ def decoded_window(path, start, seconds):
     return np.frombuffer(data, dtype="<f4").astype(np.float64)
 
 
-def timing_windows(song, audio, video):
+def timing_windows(song, audio, video, alignment):
     chapter = song.get("chapter")
     if not chapter or chapter["evidence"] != "audioMatched":
         return {"status": chapter["evidence"] if chapter else "unlocated", "windows": []}
     start, length = chapter["start"], song["duration"]
     width = min(5.0, length * 0.16)
-    margin = 0.36
+    # Searching only near the claimed timestamp can lock onto a nearby beat
+    # even when the same recording has a stronger match one or two beats away.
+    margin = 2.5
     windows = []
     for part in (0.14, 0.48, 0.80):
         inside = length * part
@@ -79,24 +81,27 @@ def timing_windows(song, audio, video):
         b = decoded_window(video, start + inside - actual_margin, width + 2 * actual_margin)
         if len(a) < 600 or len(b) < len(a):
             continue
-        a -= a.mean()
-        products = np.correlate(b, a, "valid")
-        energy = np.insert(np.cumsum(b * b), 0, 0.0)
-        denominator = np.sqrt(np.maximum(0, np.dot(a, a) * (energy[len(a):] - energy[:-len(a)])))
-        scores = np.divide(products, denominator, out=np.zeros_like(products), where=denominator > 0)
-        peak = int(np.argmax(scores))
-        windows.append({"position": part, "offsetMS": round((peak / 4000 - actual_margin) * 1000, 1),
-                        "correlation": round(float(scores[peak]), 4)})
+        try:
+            scores = alignment.normalized_waveform_correlation(b, a)
+        except alignment.AlignmentError:
+            continue
+        peak = alignment.best_alignment_peak(scores, exclusion_frames=600)
+        windows.append({"position": part,
+                        "offsetMS": round((peak.offset_frames / 4000 - actual_margin) * 1000, 1),
+                        "correlation": round(peak.score, 4),
+                        "runnerUpGap": round(peak.score_gap or 0, 4)})
     offsets = [window["offsetMS"] for window in windows]
     matches = (len(windows) == 3 and max(abs(value) for value in offsets) <= 150
                and max(offsets) - min(offsets) <= 120
                and min(window["correlation"] for window in windows) >= 0.10
-               and max(window["correlation"] for window in windows) >= 0.22)
+               and max(window["correlation"] for window in windows) >= 0.22
+               and sum(window["runnerUpGap"] >= 0.035 for window in windows) >= 2)
     return {"status": "measured" if matches else "review", "windows": windows}
 
 
 def inspect_tracks(manifest, paths, optional):
     result = []
+    alignment = alignment_module() if optional.get("video") else None
     for song, path in zip(manifest["music"], paths):
         measured = {}
         try:
@@ -108,7 +113,7 @@ def inspect_tracks(manifest, paths, optional):
             measured.update(decoded=False)
         chapter = song.get("chapter")
         try:
-            timing = timing_windows(song, path, optional["video"]) if chapter else {"status": "unlocated", "windows": []}
+            timing = timing_windows(song, path, optional["video"], alignment) if chapter else {"status": "unlocated", "windows": []}
         except (ValueError, OSError):
             timing = {"status": "review", "windows": []}
         rows = len(song.get("cues") or [])

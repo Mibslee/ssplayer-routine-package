@@ -60,7 +60,7 @@ def track_panel(track, song, has_video):
     if chapter := track["chapter"]:
         rows.append(("视频位置", f"{clock(chapter['start'])}–{clock(chapter['end'])}"))
     if track["windows"]:
-        rows.append(("前／中／尾偏差", " / ".join(f"{window['offsetMS']:+.1f} ms（相关 {window['correlation']:.3f}）"
+        rows.append(("前／中／尾偏差", " / ".join(f"{window['offsetMS']:+.1f} ms（相关 {window['correlation']:.3f}、次峰差 {window['runnerUpGap']:.3f}）"
                                                 for window in track["windows"])))
     if track["decoded"]:
         rows.append(("音乐响度与峰值", f"{track['lufs']:.2f} LUFS · {track['truePeakDBTP']:.2f} dBTP"))

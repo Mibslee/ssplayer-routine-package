@@ -31,13 +31,16 @@ Check video offsets early, midway, and late using the exact recording. Confirm t
 
 ## Build and verify
 
-    python3 scripts/ssroutine.py build review.json --output-dir "/deliverables"
-    python3 scripts/ssroutine.py verify "/deliverables/TONE_26_1.ssroutine"
+    python3 scripts/ssroutine.py build review.json --output-dir "/local-work/output"
+    python3 scripts/ssroutine.py verify "/local-work/output/TONE_26_1.ssroutine"
+    python3 scripts/qa_preview.py "/local-work/output/TONE_26_1.ssroutine" --output-dir "/local-work/output" --strict
 
-Follow the [quality checklist](references/quality-check.md) to check playback, loudness, true peak, hashes, and the selected opening pages. With a compatible Pro App, exercise import, media and pages, class selection, save and reopen, and duplicate import. Report the checks that actually ran and the missing or unresolved media. Give the user the verified PROJECT_ROUTINE_REVISION.ssroutine.
+Rerun analysis after changing a section, variant, catalogue slot, or PDF cue-page selection. The review can still approve a source-backed opening page, amend display text or record what is missing.
+
+Use the [quality checklist](references/quality-check.md) to review what the package can do. Resolve the strict report's media failures before delivery. Leave missing or unverified items clearly identified. With a compatible Pro App, select the package through an actual import entry, verify its destination and media, then save and reopen a class using the imported tracks.
 
 For re-encoded video, verify the frame timestamps and retained audio before accepting the file, then remeasure all declared audio matches in the offline report. Show the resulting codec, size, resolution and measured bitrate. Raise the package revision when changing an already shared video.
 
-For review before Pro access, run `scripts/qa_preview.py PACKAGE --output-dir OUTPUT`. Use the user-provided credit. Deliver the nine images, 3×3 overview, and visual report.html. The report expands all measured tracks and shows gaps first. It remeasures declared audio matches with the packaged media. Record App acceptance separately.
+Use the user-provided credit. Deliver the verified package, nine images, 3×3 overview and visual report.html to the requested directory. Check the final package's SHA-256 against the local copy. Record App acceptance separately from the offline evidence.
 
 Use the [format reference](references/format.md) for manifest editing or compatibility errors.

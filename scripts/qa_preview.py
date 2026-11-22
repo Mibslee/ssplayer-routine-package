@@ -16,9 +16,9 @@ import numpy as np
 import pypdfium2
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from media_analysis import measure, run, video_info
+from media_analysis import measure, probe, run, video_info
 from report_html import write_html
-from ssroutine import MAX_PACKAGE, consume, digest, read_manifest, require, validate_manifest
+from ssroutine import MAX_PACKAGE, consume, container_digest, read_manifest, require, validate_manifest
 
 SIZE = (1200, 810)
 BACKGROUND = "#0b1521"
@@ -40,21 +40,21 @@ def source_files(package, work):
     require(before.st_size <= MAX_PACKAGE, "Package too large")
     with package.open("rb") as stream:
         encoded, manifest = read_manifest(stream)
+        full_digest = container_digest(encoded)
         paths = []
         for index, asset in enumerate(validate_manifest(manifest)):
             path = work / f"{index}.{asset['ext']}"
             with path.open("xb") as destination:
-                consume(stream, asset, destination=destination)
+                consume(stream, asset, destination=destination, package_digest=full_digest)
             paths.append(path)
         require(not stream.read(1), "Trailing data in package")
-    full_sha = digest(package)
     after = package.stat()
     require((before.st_ino, before.st_size, before.st_mtime_ns) ==
             (after.st_ino, after.st_size, after.st_mtime_ns), "Package changed during inspection")
     music_count = len(manifest["music"])
     others = iter(paths[music_count:])
     optional = {key: next(others) for key in ("video", "pdf", "cover") if manifest.get(key)}
-    return manifest, paths[:music_count], optional, full_sha, hashlib.sha256(encoded).hexdigest()
+    return manifest, paths[:music_count], optional, full_digest.hexdigest(), hashlib.sha256(encoded).hexdigest()
 
 
 def decoded_window(path, start, seconds):
@@ -101,7 +101,9 @@ def inspect_tracks(manifest, paths, optional):
         measured = {}
         try:
             loudness, peak = measure(path)
-            measured.update(lufs=loudness, truePeakDBTP=peak, decoded=True)
+            duration, _ = probe(path, "audio")
+            measured.update(lufs=loudness, truePeakDBTP=peak, decoded=True,
+                            durationMatches=abs(duration - song["duration"]) <= 0.25)
         except (ValueError, OSError, subprocess.SubprocessError):
             measured.update(decoded=False)
         chapter = song.get("chapter")
@@ -109,7 +111,7 @@ def inspect_tracks(manifest, paths, optional):
             timing = timing_windows(song, path, optional["video"]) if chapter else {"status": "unlocated", "windows": []}
         except (ValueError, OSError):
             timing = {"status": "review", "windows": []}
-        rows = len(song.get("cues", []))
+        rows = len(song.get("cues") or [])
         result.append({"section": song["section"], "variant": song["variant"], "title": song.get("title"),
                        "duration": song["duration"], "pdfPage": song.get("pdfPage")
                        or (song["cues"][0]["page"] if rows else None), "cueRows": rows,
@@ -185,14 +187,22 @@ def screenshot_cards(manifest, files, report, font_path):
     cue_tracks = [song for song in manifest["music"] if song.get("cues")]
     with_cues = sum(entry["cueRows"] for entry in tracks)
     marker = report["sha256"][:12]
+    issues = report["blockingIssues"]
 
     def card(number, title):
         return Card(title, f"{number:02d} / 09     {art}     SHA-256 {marker}", font_path)
 
     cover = card(1, art)
     if "cover" in files:
-        with Image.open(files["cover"]) as source:
-            cover.media(source, (676, 181, 466, 500))
+        try:
+            with Image.open(files["cover"]) as source:
+                expected = "JPEG" if manifest["cover"]["ext"] == "jpg" else "PNG"
+                require(source.format == expected and all(1 <= value <= 8192 for value in source.size),
+                        "Cover content, extension or dimensions do not match the App format")
+                cover.media(source, (676, 181, 466, 500))
+        except (ValueError, OSError, Image.DecompressionBombError):
+            issues.append("封面无法解码，或图片格式、尺寸不符合 App 要求。")
+            cover.text(720, 262, "封面需修正", 32, WARNING)
     for i, (label, value) in enumerate([
         ("制作者", report["credit"] or "未署名"), ("项目", manifest["program"]),
         ("套路号", manifest["routine"]), ("版本号", manifest["revision"]),
@@ -222,20 +232,24 @@ def screenshot_cards(manifest, files, report, font_path):
     yield "03-track-list.png", music.image
 
     video = card(4, "视频画面与定位")
-    if chapter_set and "video" in files:
-        entry = next((row for row in chapter_set if row["status"] == "measured"), chapter_set[0])
-        chapter = entry["chapter"]
-        point = chapter["start"] + min(12, (chapter["end"] - chapter["start"]) / 2)
+    if "video" in files and picture:
+        entry = next((row for row in chapter_set if row["status"] == "measured"), next(iter(chapter_set), None))
+        chapter = entry["chapter"] if entry else None
+        point = (chapter["start"] + min(12, (chapter["end"] - chapter["start"]) / 2)
+                 if chapter else min(3, picture["duration"] / 2))
         try:
             image = run("ffmpeg", "-nostdin", "-v", "error", "-ss", str(point), "-i", str(files["video"]),
-                        "-map", "0:v:0", "-frames:v", "1", "-vf", "scale=880:-2", "-f", "image2pipe", "-vcodec", "png", "-")
+                        "-map", "0:V:0", "-frames:v", "1", "-vf", "scale=880:-2", "-f", "image2pipe", "-vcodec", "png", "-")
             with Image.open(BytesIO(image)) as frame:
                 video.media(frame, (48, 181, 1104, 478))
-            video.text(48, 680, f"{entry['section']}    画面取自 {clock(point)}    章 {clock(chapter['start'])}–{clock(chapter['end'])}", 27)
+            label = (f"{entry['section']}    画面取自 {clock(point)}    章 {clock(chapter['start'])}–{clock(chapter['end'])}"
+                     if chapter else f"画面取自 {clock(point)}    当前未声明小节定位")
+            video.text(48, 680, label, 27)
         except (ValueError, OSError):
+            issues.append("包内视频的抽查帧无法解码。")
             video.text(48, 185, "视频帧解码需复查", 34, WARNING)
     else:
-        video.text(48, 185, "包中无已声明的视频定位")
+        video.text(48, 185, "视频信息无法读取" if "video" in files else "包中没有视频")
     yield "04-video-seek.png", video.image
 
     timing = card(5, "音乐与视频时钟复测")
@@ -263,10 +277,16 @@ def screenshot_cards(manifest, files, report, font_path):
                 selection.append(with_pages[index])
         if not selection:
             selection = [{"section": "原谱", "pdfPage": 1}]
-        for index, row in enumerate(selection):
-            x = 48 + index * 365
-            pdf.media(opening_preview(files["pdf"], row["pdfPage"]), (x, 184, 342, 480))
-            pdf.text(x, 679, f"{row['section']}    物理页 {row['pdfPage']}", 25, limit=340)
+        try:
+            with pypdfium2.PdfDocument(files["pdf"]) as document:
+                require(len(document) == manifest["pdf"]["pageCount"], "Original PDF page count does not match")
+            for index, row in enumerate(selection):
+                x = 48 + index * 365
+                pdf.media(opening_preview(files["pdf"], row["pdfPage"]), (x, 184, 342, 480))
+                pdf.text(x, 679, f"{row['section']}    物理页 {row['pdfPage']}", 25, limit=340)
+        except (ValueError, OSError, pypdfium2.PdfiumError):
+            issues.append("原谱无法打开、页数不符，或抽查页无法渲染。")
+            pdf.text(48, 185, "原谱需修正", 32, WARNING)
     else:
         pdf.text(48, 185, "包中没有原谱")
     yield "07-source-pdf.png", pdf.image
@@ -277,14 +297,14 @@ def screenshot_cards(manifest, files, report, font_path):
     yield "08-loudness.png", volume.image
 
     gaps = card(9, "复核清单")
-    issues = [(row["section"], " / ".join([reason for condition, reason in [
+    track_notes = [(row["section"], " / ".join([reason for condition, reason in [
         (not row["decoded"], "音乐解码"), (row["status"] == "review", "对位"),
         (row["status"] == "unlocated" and "video" in files, "无视频定位")] if condition]))
               for row in tracks]
-    gaps.rows([("App", "离线质检已生成，实际导入与排课需在 App 核对"),
-               ("署名", "随本次报告显示"), ("完整摘要", marker + "… 见完整报告"),
+    gaps.rows([*(("需修正", item) for item in issues),
+               ("App", "导入与排课结果以实际 App 验收为准"),
                *(("编号间隔", f"T{number} · 对照原谱确认") for number in report["sectionGaps"]),
-               *(item for item in issues if item[1])])
+               *(item for item in track_notes if item[1])])
     yield "09-review.png", gaps.image
 
 
@@ -309,12 +329,24 @@ def generate(args):
                   "madeAtLabel": "制作时间" if args.made_at else "质检时间",
                   "bytes": args.package.stat().st_size, "sha256": full_sha, "manifestSHA256": manifest_sha,
                   "sectionGaps": sorted(set(range(1, max(sections) + 1)) - sections),
-                  "appImportVerified": False, "tracks": inspect_tracks(manifest, audio, optional)}
+                  "appImportVerified": False, "tracks": inspect_tracks(manifest, audio, optional),
+                  "blockingIssues": []}
+        issues = report["blockingIssues"]
+        for song in report["tracks"]:
+            slot = f"{song['section']} · {song['variant']}"
+            if not song["decoded"]:
+                issues.append(f"{slot} 音乐无法解码或无可测声音。")
+            elif not song["durationMatches"]:
+                issues.append(f"{slot} 实际音乐时长与清单不符。")
+            if song["status"] == "review":
+                issues.append(f"{slot} 声明为按音乐定位，但包内三段复测未通过。")
         if "video" in optional:
             try:
                 report["videoInfo"] = video_info(optional["video"])
+                require(abs(report["videoInfo"]["duration"] - manifest["video"]["duration"]) <= 0.25,
+                        "Video duration does not match")
             except (ValueError, OSError):
-                report["videoInfo"] = None
+                issues.append("视频流无法读取，或实际视频时长与清单不符。")
         output = Path(report_staging) / "evidence"
         output.mkdir()
         contact = Image.new("RGB", (1832, 1250), BACKGROUND)
@@ -323,11 +355,14 @@ def generate(args):
             contact.paste(ImageOps.contain(frame, (596, 403), Image.Resampling.LANCZOS),
                           (14 + (index % 3) * 605, 14 + (index // 3) * 407))
         contact.save(output / "3x3-overview.png")
+        report["offlineMediaPassed"] = not issues
         write_html(output, manifest, report)
         (output / "qa.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         output.rename(destination)
     print(json.dumps({"output": str(destination.resolve()), "screenshots": 9, "sha256": full_sha,
-                      "measuredChapters": sum(row["status"] == "measured" for row in report["tracks"])}))
+                      "measuredChapters": sum(row["status"] == "measured" for row in report["tracks"]),
+                      "offlineMediaPassed": report["offlineMediaPassed"], "blockingIssues": len(issues)}))
+    return report["offlineMediaPassed"]
 
 
 def main():
@@ -337,8 +372,12 @@ def main():
     parser.add_argument("--credit", help="Display credit for this evidence set")
     parser.add_argument("--made-at", help="Verified creation time in ISO 8601; omit to use evidence generation time")
     parser.add_argument("--font", type=Path, help="Optional font with Chinese glyphs")
+    parser.add_argument("--strict", action="store_true", help="Write full evidence but exit 2 for confirmed media issues")
+    args = parser.parse_args()
     try:
-        generate(parser.parse_args())
+        passed = generate(args)
+        if args.strict and not passed:
+            parser.exit(2, "Package media needs correction. See report.html.\n")
     except (ValueError, OSError, TypeError, KeyError) as error:
         parser.exit(1, f"{error}\n")
 

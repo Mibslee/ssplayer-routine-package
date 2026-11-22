@@ -59,10 +59,12 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
     python scripts/ssroutine.py doctor
     python scripts/ssroutine.py plan "/资料/TONE 26" --program TONE --routine 26 --release-date 2024Q3 --output plan.json
     python scripts/ssroutine.py analyze plan.json --output review.json
-    python scripts/ssroutine.py build review.json --output-dir "/成品"
-    python scripts/ssroutine.py verify "/成品/TONE_26_1.ssroutine"
+    python scripts/ssroutine.py build review.json --output-dir "/本机工作区/成品"
+    python scripts/ssroutine.py verify "/本机工作区/成品/TONE_26_1.ssroutine"
 
 先核对 `plan.json` 中的资料和归属，再运行 `analyze`。只有查过正确录音、原谱与时间的章节和动作才在 `review.json` 中设置 `approved: true`。见[制作和质检](quality-check.md)。
+
+修改小节、曲目版本、目录槽位或动作提取页后，更新计划并重新分析。独立的原谱打开页可在核对后填写。把完成质检的包复制到用户指定的 NAS 或网盘目录，再对目标文件执行 `verify`，核对两边的完整 SHA-256。同名文件内容不一致时使用新修订号。
 
 ## 选择视频质量
 
@@ -83,8 +85,10 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 无需 Pro 即可在本机执行。 `--credit` 指定本次质检上屏的署名，省略时使用包内署名。若已知准确的制作时间，用 `--made-at` 给出 ISO 8601 时间，省略时显示质检生成时间。可用 `--font` 指定本机带中文的字体。
 
-    python scripts/qa_preview.py "/成品/TONE_26_1.ssroutine" --output-dir "/成品" --credit "我的署名"
+    python scripts/qa_preview.py "/成品/TONE_26_1.ssroutine" --output-dir "/成品" --credit "我的署名" --strict
 
 输出一个同名 `.qa` 目录，包含九张单图、`3x3-overview.png` 和 `report.html`。九张图覆盖信息与封面、素材完整性、曲目/替换/分段、实际视频画面、包内音乐与视频三个窗口的对位复测、动作时间线、原谱物理页、响度解码和缺项。可视报告把复核项放在前面，每首歌可以展开看具体结果。`qa.json` 是工具间交换用的数据。
+
+严格质检发现音乐无法解码、清单时长与实物不符、标为按音乐定位却复测失败，或已附的封面和原谱打不开时，会留下可读报告，命令以状态码 2 结束。没附的素材和未声明定位会列为复核项，允许交付已核实的内容。
 
 把总览和可视报告作为初审材料，先核对曲目和对位，再用 Pro 验证代表性的 App 导入和排课。报告 HTML 内嵌总览，可以单独打开。带原谱或视频画面的证据使用约定渠道提交。

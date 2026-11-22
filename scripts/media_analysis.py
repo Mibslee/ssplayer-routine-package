@@ -115,7 +115,8 @@ def video_info(path):
     duration, media = probe(path, "video")
     picture = picture_stream(media)
     return {"codec": picture["codec_name"], "width": picture["width"], "height": picture["height"],
-            "bytes": path.stat().st_size, "bitrateKbps": round(path.stat().st_size * 8 / duration / 1000)}
+            "bytes": path.stat().st_size, "duration": duration,
+            "bitrateKbps": round(path.stat().st_size * 8 / duration / 1000)}
 
 
 def video_timestamps(path):

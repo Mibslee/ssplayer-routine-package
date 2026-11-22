@@ -80,7 +80,8 @@ def track_panel(track, song, has_video):
 def write_html(folder, manifest, report):
     tracks = report["tracks"]
     panels = [track_panel(track, song, bool(manifest.get("video"))) for track, song in zip(tracks, manifest["music"])]
-    alerts = "".join(f'<p class="note">编号间隔 T{number} · 请对照原谱确认。</p>' for number in report["sectionGaps"])
+    alerts = "".join(f'<p class="note">{show(issue)}</p>' for issue in report["blockingIssues"])
+    alerts += "".join(f'<p class="note">编号间隔 T{number} · 请对照原谱确认。</p>' for number in report["sectionGaps"])
     alerts += "".join(panel for problem, panel in panels if problem)
     alerts = alerts or '<p class="muted">当前测量没有触发复核项。</p>'
     normal = "".join(panel for problem, panel in panels if not problem)
@@ -100,12 +101,13 @@ def write_html(folder, manifest, report):
     meta = " · ".join([report["credit"] or "未署名", f"版本 {report['revision']}",
                        report["releaseDate"] or "发行时间待核对",
                        f"{report['madeAtLabel']} {report['madeAt'][:19].replace('T', ' ')}"])
+    verification = "离线媒体核验通过" if report["offlineMediaPassed"] else "发现需修正的问题"
     html = f"""<!doctype html>
 <html lang="zh-Hans"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{show(identity)} · SSplayer 资源包质检</title><style>{CSS}</style>
 <main>
 <header><div class="kicker">SSplayer · 离线资源包质检</div><h1>{show(identity)}</h1>
-<p>{show(meta)}</p><div class="stats">{stats}</div></header>
+<p>{show(meta)}</p><div class="stats">{stats}</div><p style="margin-top:12px">{verification}</p></header>
 <section class="panel"><h2>九宫格总览</h2><img alt="九宫格质检图" src="data:image/jpeg;base64,{image}"></section>
 <section class="panel"><h2>先核对这些项目</h2>{alerts}</section>
 <section class="panel"><h2>其他曲目</h2>{normal or '<p class="muted">曲目都已列在复核区。</p>'}</section>

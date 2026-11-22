@@ -15,6 +15,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 from media_analysis import (alignment_module, audio_packet_hash, balance_audio, extract_cues, locate_chapters,
@@ -33,8 +34,9 @@ PROGRAM_ALBUMS = {
     "BODYCOMBAT": "BC", "BODYJAM": "BJ", "BODYPUMP": "BP", "BODYATTACK": "BA", "RPM": "RPM",
     "BC": "BC", "BJ": "BJ", "BP": "BP", "BA": "BA", "CORE": "CORE", "TONE": "TONE", "GRIT": "GRIT",
 }
-PROGRAM_ALIASES = {**PROGRAM_ALBUMS, "LESMILLSCORE": "CORE", "LESMILLSGRIT": "GRIT", "LESMILLSTONE": "TONE",
-                   "莱美核心": "CORE", "莱美核心训练": "CORE"}
+PROGRAM_ALIASES = {**PROGRAM_ALBUMS, **{f"LESMILLS{name}": code for name, code in PROGRAM_ALBUMS.items()},
+                   "莱美核心": "CORE", "莱美核心训练": "CORE", "莱美GRIT": "GRIT", "莱美TONE": "TONE"}
+NATIVE_PROGRAMS = {"BC", "BJ", "BP", "RPM"}
 VIDEO_PROFILES = {"ipad": (1080, 1800), "compact": (720, 950)}
 
 
@@ -82,8 +84,7 @@ def read_identity(value):
     require(re.fullmatch(r"[A-Z0-9][A-Z0-9-]{0,15}", routine) is not None
             and (not routine.isdigit() or int(routine) > 0), "Invalid routine number")
     require(type(revision) is int and 0 < revision <= 2147483647, "Revision must be a positive integer")
-    if "releaseDate" in value:
-        text = value["releaseDate"]
+    if (text := value.get("releaseDate")) is not None:
         match = re.fullmatch(r"([0-9]{4})(?:Q[1-4]|-([0-9]{2})(?:-([0-9]{2}))?)?", text)
         require(match, "Use YYYY, YYYYQn, YYYY-MM or YYYY-MM-DD for the release date")
         date(int(match[1]), int(match[2] or 1), int(match[3] or 1))
@@ -92,7 +93,7 @@ def read_identity(value):
 
 def author_identity(project, routine):
     raw = project.strip().upper()
-    key = re.sub(r"[ ._-]", "", raw)
+    key = re.sub(r"[\s._-]", "", raw)
     program = PROGRAM_ALIASES.get(key, raw)
     number = routine.strip().upper()
     for prefix in (key, program):
@@ -167,8 +168,10 @@ def plan(args):
                     continue
                 variant, title = explicit, suffix[2]
             section = f"T{int(number)}{letter.upper()}"
-            if value["program"] == "BC" and letter:
+            if value["program"] in NATIVE_PROGRAMS - {"BJ"} and letter:
                 review.append(str(file))
+                warnings.append({"file": file.name, "section": section,
+                                 "reason": "This native catalogue requires a whole section. Check the source."})
                 continue
             try:
                 duration, conflict = labeled_album(file, value["program"], value["routine"])
@@ -217,18 +220,19 @@ def plan(args):
 
 def analyze(args):
     config = read_json(args.plan)
-    read_identity(config)
+    program, _, _ = read_identity(config)
     songs = config["music"]
     require(1 <= len(songs) <= 128, "Choose the music files in the plan")
+    validate_slots(program, songs)
     audio = []
     for row in songs:
-        require(re.fullmatch(r"T[1-9][0-9]{0,2}[A-Z]?", row["section"]) is not None
-                and row["variant"] in VARIANTS, "Invalid music section or variant")
         path = Path(row["file"]).resolve(strict=True)
         require(extension(path) in AUDIO, f"Unsupported audio: {path.name}")
         duration, _ = probe(path, "audio")
         audio.append({**row, "file": path, "duration": duration, "source": identity(path)})
-    review = {"plan": config, "tracks": [{"source": row["source"], "duration": row["duration"]} for row in audio]}
+    review = {"plan": config, "programRoutine": [config["program"], config["routine"]],
+              "tracks": [{"source": row["source"], "duration": row["duration"], "selection": source_selection(row)}
+                         for row in audio]}
     if config.get("pdf"):
         pdf = Path(config["pdf"]).resolve(strict=True)
         page_count, cues, warnings = extract_cues(pdf, audio, ocr=args.ocr)
@@ -262,14 +266,46 @@ def same_source(value, expected):
     return path
 
 
+def source_selection(song):
+    return {key: song[key] for key in ("section", "variant", "catalogTrackID", "pdfPages") if key in song}
+
+
+def valid_text(value, limit, *, single_line=False):
+    return (isinstance(value, str) and len(value.encode("utf-8")) <= limit
+            and all(unicodedata.category(character) not in {"Cc", "Cf"}
+                    or (not single_line and character in "\n\t") for character in value))
+
+
+def validate_slots(program, songs):
+    program = PROGRAM_ALIASES.get(program, program)
+    slots = set()
+    recordings = set()
+    for song in songs:
+        section = re.fullmatch(r"T([1-9][0-9]{0,2})([A-Z]?)", song["section"])
+        require(section and int(section[1]) <= 128 and song["variant"] in VARIANTS,
+                f"Invalid music section or variant: {song['section']}")
+        require(not section[2] or program == "BJ" or program not in NATIVE_PROGRAMS,
+                f"{program} requires a whole section: {song['section']}")
+        for key, limit in (("catalogTrackID", 128), ("title", 256)):
+            if (value := song.get(key)) is not None:
+                require(value and valid_text(value, limit), f"Invalid {key} in {song['section']}")
+        key = (song["section"], song["variant"], song.get("catalogTrackID") if program in NATIVE_PROGRAMS else None)
+        require(key not in slots, f"Duplicate music slot: {key[0]} · {key[1]}")
+        slots.add(key)
+        if program not in NATIVE_PROGRAMS and "asset" in song:
+            sha = song["asset"]["sha256"]
+            require(sha not in recordings, f"The same audio bytes occupy two slots: {song['section']}")
+            recordings.add(sha)
+
+
 def validate_manifest(value):
-    read_identity(value)
+    program, _, _ = read_identity(value)
     songs = value["music"]
-    require(value["schemaVersion"] == 1 and 1 <= len(songs) <= 128, "Unsupported package manifest")
-    if "credit" in value:
-        credit = value["credit"]
-        require(0 < len(credit.encode("utf-8")) <= 128 and all(ord(c) >= 32 and not 127 <= ord(c) <= 159 for c in credit),
-                "Invalid contributor credit")
+    require(type(value["schemaVersion"]) is int and value["schemaVersion"] == 1
+            and isinstance(songs, list) and 1 <= len(songs) <= 128, "Unsupported package manifest")
+    if (credit := value.get("credit")) is not None:
+        require(credit and valid_text(credit, 128, single_line=True), "Invalid contributor credit")
+    validate_slots(program, songs)
     video, pdf, cover = (value.get(k) for k in ("video", "pdf", "cover"))
     assets = [item["asset"] for item in songs]
     allowed = [(AUDIO, 384)] * len(songs)
@@ -280,44 +316,37 @@ def validate_manifest(value):
     if pdf:
         assets.append(pdf["asset"])
         allowed.append(({"pdf"}, 64))
-        require(1 <= pdf["pageCount"] <= 2000, "Invalid PDF page count")
+        require(type(pdf["pageCount"]) is int and 1 <= pdf["pageCount"] <= 2000, "Invalid PDF page count")
     if cover:
         assets.append(cover)
         allowed.append(({"png", "jpg"}, 8))
     for asset, (extensions, max_mib) in zip(assets, allowed):
-        require(asset["ext"] in extensions and 0 < asset["bytes"] <= max_mib * MIB
+        require(asset["ext"] in extensions and type(asset["bytes"]) is int and 0 < asset["bytes"] <= max_mib * MIB
                 and re.fullmatch(r"[a-f0-9]{64}", asset["sha256"]) is not None, "Invalid media entry")
-    slots = set()
     for item in songs:
-        section = re.fullmatch(r"T([1-9][0-9]{0,2})([A-Z]?)", item["section"])
-        require(section and int(section[1]) <= 128 and item["variant"] in VARIANTS
-                and 0 < item["duration"] <= 43200, "Invalid music entry")
-        key = (item["section"], item["variant"], item.get("catalogTrackID"))
-        require(key not in slots, f"Duplicate music slot: {key[0]}")
-        slots.add(key)
-        chapter = item.get("chapter")
-        if chapter:
+        require(type(item["duration"]) in (int, float) and 0 < item["duration"] <= 43200, "Invalid music duration")
+        if (chapter := item.get("chapter")) is not None:
             require(video and 0 <= chapter["start"] < chapter["end"] <= video["duration"] and
                     chapter["evidence"] in {"audioMatched", "visuallyConfirmed", "approximate"},
                     "Invalid chapter timing")
             if chapter["evidence"] == "audioMatched":
                 require(abs(chapter["end"] - chapter["start"] - item["duration"]) <= 0.25,
                         "Audio match is not a complete unit-rate video window")
-        if "pdfPage" in item:
-            page = item["pdfPage"]
+        if (page := item.get("pdfPage")) is not None:
             require(pdf and type(page) is int and 1 <= page <= pdf["pageCount"],
                     f"Invalid original PDF opening page for {item['section']}")
-        rows = item.get("cues", [])
-        require(not rows or (pdf and len(rows) <= 4096), "Cues require a bounded source PDF")
+        rows = item.get("cues")
+        require(rows is None or (pdf and isinstance(rows, list) and 1 <= len(rows) <= 4096),
+                "Cues require a bounded source PDF")
         previous = -1
-        for cue in rows:
+        for cue in rows or []:
             require(previous <= cue["time"] <= item["duration"] and cue["time"] >= 0 and
                     type(cue["page"]) is int and 1 <= cue["page"] <= pdf["pageCount"] and
                     cue["action"].strip(), f"Invalid cue for {item['section']}")
             previous = cue["time"]
             for key in ("action", "music", "counts", "repetitions", "coaching"):
-                if key in cue:
-                    require(len(cue[key].encode("utf-8")) <= 4096, f"Long cue field for {item['section']}")
+                if (text := cue.get(key)) is not None:
+                    require(valid_text(text, 4096), f"Invalid cue field for {item['section']}")
             if level := cue.get("level"):
                 require(all(0 <= level[channel] <= 1 for channel in ("red", "green", "blue")), "Invalid PDF level color")
     return assets
@@ -329,6 +358,12 @@ def package(args):
     program, routine, revision = read_identity(config)
     require(-24 <= args.lufs <= -12, "Select a loudness target between -24 and -12 LUFS")
     require(len(config["music"]) == len(review["tracks"]), "Review does not cover every music file")
+    validate_slots(program, config["music"])
+    require(review.get("programRoutine", [program, routine]) == [program, routine],
+            "Project or routine changed. Update the plan and run analyze again.")
+    for song, findings in zip(config["music"], review["tracks"]):
+        require(findings.get("selection", source_selection(song)) == source_selection(song),
+                f"Section, variant, catalogue slot or cue pages changed for {song['section']}. Run analyze again.")
     if args.video_quality == "original":
         require(args.video_max_height is None and args.video_bitrate_kbps is None and args.video_codec is None,
                 "Choose ipad or compact before setting video encoding options")
@@ -410,13 +445,15 @@ def package(args):
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
 
 
-def consume(stream, asset, destination=None):
+def consume(stream, asset, destination=None, package_digest=None):
     remaining = asset["bytes"]
     observed = hashlib.sha256()
     while remaining:
         chunk = stream.read(min(MIB, remaining))
         require(bool(chunk), "Truncated media payload")
         observed.update(chunk)
+        if package_digest is not None:
+            package_digest.update(chunk)
         if destination is not None:
             destination.write(chunk)
         remaining -= len(chunk)
@@ -432,19 +469,29 @@ def read_manifest(stream):
     return encoded, json.loads(encoded)
 
 
+def container_digest(encoded):
+    return hashlib.sha256(MAGIC + struct.pack(">I", len(encoded)) + encoded)
+
+
 def verify(path):
-    require(path.stat().st_size <= MAX_PACKAGE, "Package too large")
+    before = path.stat()
+    require(before.st_size <= MAX_PACKAGE, "Package too large")
     with path.open("rb") as stream:
         encoded, manifest = read_manifest(stream)
+        package_digest = container_digest(encoded)
         for asset in validate_manifest(manifest):
-            consume(stream, asset)
+            consume(stream, asset, package_digest=package_digest)
         require(not stream.read(1), "Trailing data in package")
-    return {"file": path.name, "bytes": path.stat().st_size, "manifestSHA256": hashlib.sha256(encoded).hexdigest(),
+    after = path.stat()
+    require((before.st_ino, before.st_size, before.st_mtime_ns) ==
+            (after.st_ino, after.st_size, after.st_mtime_ns), "Package changed during verification")
+    return {"file": path.name, "bytes": before.st_size, "sha256": package_digest.hexdigest(),
+            "manifestSHA256": hashlib.sha256(encoded).hexdigest(),
             "releaseDate": manifest.get("releaseDate"),
             "music": len(manifest["music"]), "video": bool(manifest.get("video")), "pdf": bool(manifest.get("pdf")),
             "cover": bool(manifest.get("cover")), "chapters": sum("chapter" in m for m in manifest["music"]),
-            "pdfOpeningPages": sum("pdfPage" in m for m in manifest["music"]),
-            "cueRows": sum(len(m.get("cues", [])) for m in manifest["music"])}
+            "pdfOpeningPages": sum(m.get("pdfPage") is not None for m in manifest["music"]),
+            "cueRows": sum(len(m.get("cues") or []) for m in manifest["music"])}
 
 
 def doctor():

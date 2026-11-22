@@ -164,8 +164,15 @@ def clock(seconds):
 def opening_preview(path, page):
     with pypdfium2.PdfDocument(path) as document:
         require(1 <= page <= len(document), "Opening page out of range")
-        with document[page - 1] as source:
-            return source.render(scale=1.5).to_pil().copy()
+        source = document[page - 1]
+        try:
+            bitmap = source.render(scale=1.5)
+            try:
+                return bitmap.to_pil().copy()
+            finally:
+                bitmap.close()
+        finally:
+            source.close()
 
 
 def screenshot_cards(manifest, files, report, font_path):

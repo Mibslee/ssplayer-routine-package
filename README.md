@@ -1,24 +1,22 @@
-# SSplayer 套路资源包制作
+# ssplayer_package_creator
 
-这个 Skill 帮教练把自己的音乐、视频、波形图和封面做成 SSplayer 可以识别的单文件。可交给支持 Agent Skills 的工具使用，也可以直接运行 Python 命令。[制作流程](SKILL.md)
+用本地已有的音乐、视频、原版波形图和封面制作 SSplayer 可导入的单文件资源包。可以交给 WorkBuddy、DeepSeek Harness、MiniMax Code 等智能体，也可以直接运行命令行工具。
 
-## 开始制作
+- [安装与启动](references/agent-setup.md) 包含 WorkBuddy、dsh、MiniMax Code 和命令行的具体步骤。
+- [制作和质检](references/quality-check.md) 包含命名、日期、封面、替换曲、AB 段、原谱和 App 验收。
+- [SKILL.md](SKILL.md) 是智能体读取的入口。下载安装时保留完整目录和脚本。
+- [文件格式](references/format.md) 说明清单与兼容要求。
 
-1. 下载仓库并把这个目录作为 Skill 交给 Agent。提供本地素材目录、项目名和套路号。
-2. 安装 Python 3.10 或更新版本及 FFmpeg。用独立环境安装 Python 依赖。
+## 快速开始
 
-       python3 -m venv .venv
-       .venv/bin/python -m pip install -r requirements.txt
+提供原始资料目录和输出目录。告诉 Agent 已知的项目、套路号和发行时间；缺失信息可以先从来源核对。交付一个文件，例 `TONE_26_1.ssroutine`。
 
-3. 核对逐节视频定位、原谱动作行和期望音量后，用工具制作并验证成品。成品命名例如 BC_108_1.ssroutine 或 CORE_63_1.ssroutine。
-4. 在支持这个格式的 SSplayer 版本中，用已激活 Pro 的账号从「文件」或 App 的本机导入入口打开成品。
+在支持该格式的 SSplayer 2.5.0 或更新版激活 Pro，从「文件」打开成品，或选择 App 内的本机导入入口。在资料库核对套路、分节和原谱，可在该项目下创建课单或打开排课模板。
+
+没有 Pro 也能先做离线质检。运行 `scripts/qa_preview.py` 输出 9 张证据图、3×3 总览和 `qa.json`。可填写自己的署名。视频与音乐的对位图基于实际解码结果。[质检命令与说明](references/agent-setup.md#生成九宫格质检图)
 
 ## 贡献资源包
 
-先做一套，与开发者确认素材授权、提交方式和审核结果。累计提交 10 套不同并经开发者核验可用的套路，可兑换一个月 Pro 激活码。同一套路的更新计为同一套。制作人可在计划的 credit 字段填写公开署名。
+先完成一套并约定提交渠道。累计 10 套不同套路，经开发者核验可用后可兑换 1 个月 Pro 激活码。同一套路的修订沿用原记录。制作人可以填写愿意公开的署名。GitHub Issues 用于报告制作工具问题。
 
-请仅分享你有权分享的素材。通过私下约定的渠道提交样包，GitHub Issues 用于报告制作工具问题。
-
-可以下载本仓库的 Skill 和工具，在自己的设备或 Agent 工作区使用，制作 SSplayer 套路资源包。原音乐、视频、波形图及封面的使用和分享权由各素材的权利人决定。
-
-[文件格式](references/format.md)
+本仓库的 Skill 和工具可下载到个人设备或 Agent 工作区，用于制作 SSplayer 套路资源包。请通过约定渠道提交有权分享的资料，原音乐、视频、波形图和封面的权利由各素材权利人决定。

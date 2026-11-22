@@ -13,6 +13,7 @@ Manifest length is at most 4 MiB. The total file is at most 12 GiB. Each asset d
 | schemaVersion | Integer 1 |
 | program, routine, revision | Package identity |
 | credit | Optional contributor credit, at most 128 UTF-8 bytes |
+| releaseDate | Optional confirmed YYYY, YYYYQn, YYYY-MM or YYYY-MM-DD |
 | music | 1–128 entries containing section, variant, optional catalogTrackID and title, asset, and duration in seconds |
 | video | Optional asset and duration in seconds |
 | pdf | Optional asset and physical pageCount |
@@ -25,5 +26,6 @@ Music accepts AAC, AIFF, FLAC, M4A, MP3 and WAV. Video accepts MP4, M4V and MOV.
 - section is T followed by a positive integer through 128 and an optional A–Z suffix for split sections. Normal values of variant are standard, alternative and bonus. The app validates native catalogue slots from the release, section, variant and any explicit catalogTrackID. Other projects are created in the user's custom projects.
 - A chapter has start, end and evidence on the whole-video clock. The audioMatched evidence class requires a unit-rate window that spans the complete recording within 0.25 seconds. Other accepted evidence classes are visuallyConfirmed and approximate. Omit a chapter to leave it unresolved.
 - Optional cues are ordered by time on the current music track. Each row has time in seconds, 1-based physical page, and action. Optional music, counts, repetitions and coaching are source text. Optional level has red, green and blue components in [0,1] from the printed PDF. PDF pages and cue times must exist in the associated assets.
+- Optional pdfPage is the 1-based opening page for that recording, even when cues are unavailable. Use it for source tables containing interval durations and keep the original PDF intact. The App binds it to the exact PDF and recording and preserves a user's manual choice.
 
-The private plan and review files are editing inputs. plan.music items use file for the local source path, plus optional pdfPages for explicit source ownership. The review's approved flag is specific to that item and source; verify the source before raising it. A generated package contains only the portable manifest and supplied assets.
+The private plan and review files are editing inputs. plan.music items use file for the local source path, optional pdfPages for cue extraction, and optional pdfPage for a separately verified opening page. An empty pdfPages list suppresses cue extraction for that track. The review's approved flag is specific to the item and source. The generated package contains the portable manifest and selected assets.

@@ -1,0 +1,75 @@
+# 安装与启动
+
+公开名为 `ssplayer_package_creator`，智能体使用技能标识 `ssplayer-package-creator`。从 [GitHub Releases](https://github.com/Mibslee/ssplayer_package_creator/releases) 下载完整 ZIP。解开后，`SKILL.md`、`requirements.txt`、`scripts` 和 `references` 处在同一级。ZIP 用来安装 Skill，交给 SSplayer 的成品是 `.ssroutine`。
+
+## 准备环境
+
+用能访问素材目录和输出目录的桌面或命令行 Agent。先确认当前 Agent 的终端能运行 Python 3.10 或更新版本、FFmpeg 和 ffprobe。新装工具后重开终端，检查 PATH。[FFmpeg 下载](https://ffmpeg.org/download.html)
+
+macOS 可通过 Homebrew 安装 FFmpeg。需要识别无文本层的 PDF 时，再装可选的 Poppler 和 Tesseract。
+
+    brew install ffmpeg
+    brew install poppler tesseract
+
+在 Skill 目录创建独立的 Python 环境。将下文命令里的 `python` 换成这个环境中的 Python。
+
+    python3 -m venv .venv
+    .venv/bin/python -m pip install -r requirements.txt
+    .venv/bin/python scripts/ssroutine.py doctor
+
+Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路径改用 `& .\.venv\Scripts\python.exe`。把已安装的 FFmpeg 和可选 OCR 工具所在目录加入 PATH。处理有文本层的 PDF 时，`doctor` 可以显示 `ocr: false`。
+
+## WorkBuddy 桌面端
+
+1. 在「技能」中选择「添加技能」和「上传技能」，选择完整 Skill ZIP。检查安装目录包含脚本。
+2. 打开能读原始资料、能写输出目录的本地工作区，从技能工具列表选择 `ssplayer-package-creator`，或在对话中点名使用。
+3. 如果当前客户端导入后找不到脚本，解压 ZIP 并让 WorkBuddy 直接读该目录的 `SKILL.md`，在同一目录运行 `doctor`。[WorkBuddy 官方技能文档](https://www.tencentcloud.com/zh/document/product/1316/84503)
+
+## DeepSeek Harness（dsh）
+
+1. 从所用工作区根目录开始。如果目录属于 Git 仓库，使用该仓库的根。把完整 Skill 放在 `.dsh/skills/ssplayer-package-creator/`，也可以执行下列命令。已有同名 Skill 时先核对来源，再更新。
+
+       mkdir -p .dsh/skills
+       git clone https://github.com/Mibslee/ssplayer_package_creator.git .dsh/skills/ssplayer-package-creator
+
+2. 在同一个工作区运行已配置的 `dsh`。在会话点名使用 Skill，并给出两个路径。如没有自动发现，明确指定 `.dsh/skills/ssplayer-package-creator/SKILL.md`。[DSH 官方技能发现规则](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/skills.md)
+
+## MiniMax Code
+
+1. 在桌面端选本地项目，或在工作区运行已配置的 `mcode`。把完整 Skill 放在 `.minimax/skills/ssplayer-package-creator/`，也可以执行下列命令。
+
+       mkdir -p .minimax/skills
+       git clone https://github.com/Mibslee/ssplayer_package_creator.git .minimax/skills/ssplayer-package-creator
+
+2. 新开或重新载入会话，从中点名使用 Skill。技能列表没刷新时直接给 `SKILL.md` 路径。用能访问私有原始资料的本地工作区运行辅助工具。[MiniMax Code 官方技能目录说明](https://github.com/MiniMax-AI/mcode-stack#installation)
+
+## 发给智能体的提示
+
+    使用 ssplayer-package-creator 制作一个 SSplayer 套路资源包。
+    原始资料目录是「填写可读的完整目录」。
+    输出目录是「填写最终成品目录」。
+    我知道的信息是「项目、套路号、发行季度、希望使用的封面或视频版本」。
+    请保留源文件，标出待确认的曲目、替换曲、AB 段、原谱页和定位。
+    交付前核对实际内容、时间、音量和完整性，给我成品路径和验收结果。
+
+## 命令行示例
+
+在工作目录保留 `plan.json` 和 `review.json`。如有已核对的独立封面，可为 `plan` 传入 `--cover "/图片/cover.jpg"`。
+
+    python scripts/ssroutine.py doctor
+    python scripts/ssroutine.py plan "/资料/TONE 26" --program TONE --routine 26 --release-date 2024Q3 --output plan.json
+    python scripts/ssroutine.py analyze plan.json --output review.json
+    python scripts/ssroutine.py build review.json --output-dir "/成品"
+    python scripts/ssroutine.py verify "/成品/TONE_26_1.ssroutine"
+
+先核对 `plan.json` 中的资料和归属，再运行 `analyze`。只有查过正确录音、原谱与时间的章节和动作才在 `review.json` 中设置 `approved: true`。见[制作和质检](quality-check.md)。
+
+## 生成九宫格质检图
+
+无需 Pro 即可在本机执行。 `--credit` 指定本次质检上屏的署名，省略时使用包内署名。若已知准确的制作时间，用 `--made-at` 给出 ISO 8601 时间，省略时显示质检生成时间。可用 `--font` 指定本机带中文的字体。
+
+    python scripts/qa_preview.py "/成品/TONE_26_1.ssroutine" --output-dir "/成品" --credit "我的署名"
+
+输出一个同名 `.qa` 目录，包含九张单图、`3x3-overview.png` 和 `qa.json`。九张图覆盖信息与封面、素材完整性、曲目/替换/分段、实际视频画面、包内音乐与视频三个窗口的对位复测、动作时间线、原谱物理页、响度解码、缺项。 `qa.json` 提供全量曲目的时间、测量结果及文件摘要。
+
+把总览和结果作为初审材料，先核对曲目和对位，再用 Pro 验证代表性的 App 导入和排课。带原谱或视频画面的证据图使用约定渠道提交。

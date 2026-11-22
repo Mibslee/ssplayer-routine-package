@@ -22,7 +22,11 @@ def run(*args):
 
 def alignment_module():
     local = Path(__file__).with_name("rehearsal_alignment.py")
-    location = local if local.is_file() else Path(__file__).resolve().parents[3] / "scripts" / "rehearsal_alignment.py"
+    parents = Path(__file__).resolve().parents
+    source = parents[3] / "scripts" / "rehearsal_alignment.py" if len(parents) > 3 else local
+    location = local if local.is_file() else source
+    if not location.is_file():
+        raise ValueError("Missing scripts/rehearsal_alignment.py. Download the complete public Skill folder.")
     spec = importlib.util.spec_from_file_location("rehearsal_alignment", location)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
@@ -40,6 +44,11 @@ def probe(path, kind):
     if not math.isfinite(duration) or not 0 < duration <= 43200:
         raise ValueError(f"{path.name} has an invalid duration")
     return duration, result
+
+
+def audio_packet_hash(path):
+    return run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path), "-map", "0:a:0",
+               "-c", "copy", "-f", "streamhash", "-hash", "sha256", "-").strip()
 
 
 def measure(path):
@@ -130,6 +139,8 @@ def locate_chapters(video, rows, duration, audio_duration):
         reviewed = (result.status == "matched" and result.confidence == "high" and not
                     any("sequence" in w.lower() or "overlap" in w.lower() for w in result.warnings)
                     and 0 <= start < end <= duration)
+        if not reviewed:
+            warnings.append(f"{row['section']} has a provisional offset ({result.status}, {result.confidence}); review the exact recording before use.")
         chapters[index] = {
             "start": round(start, 4), "end": round(min(duration, end), 4),
             "evidence": "audioMatched" if reviewed else "approximate",
@@ -179,13 +190,20 @@ def visible_level(page, position, top):
 
 def read_page_rows(page, words, page_number, parse_time):
     for line in row_lines(words):
-        headers = {w["text"].upper(): w["x0"] for w in line}
+        headers = {word["text"].upper(): word for word in line}
         if "MUSIC" not in headers or "EXERCISE" not in headers:
             continue
         if not any(h in headers for h in ("CTS", "REPS", "LEVEL")):
             continue
-        music, exercise = headers["MUSIC"] - 4, headers["EXERCISE"] - 4
-        counts, reps, level = (headers.get(k, page.width + 4) - 4 for k in ("CTS", "REPS", "LEVEL"))
+        def leading(key):
+            return headers[key]["x0"] - 4 if key in headers else page.width
+        music, exercise = leading("MUSIC"), leading("EXERCISE")
+        counts, reps, level = (leading(key) for key in ("CTS", "REPS", "LEVEL"))
+        if "CTS" in headers and "REPS" in headers and exercise < counts < reps:
+            # Entries like AMRAP may be centered and extend left of the REPS label.
+            right, left = headers["CTS"]["x1"], headers["REPS"]["x0"]
+            if right < left:
+                reps = (right + left) / 2
         floor = line[0]["top"] + 5
         # Captions and copyright at the bottom are outside the choreography table.
         words = [w for w in words if floor < w["top"] < page.height * 0.92]

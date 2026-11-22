@@ -1,38 +1,39 @@
 ---
-name: ssplayer-routine-package
-description: "Prepare a local SSplayer .ssroutine package from coach-provided BC, BJ, or other routine media. Use for identifying music slots, matching video chapters, reading choreography PDFs, balancing loudness, packaging, or validating an SSplayer contribution."
+name: ssplayer-package-creator
+description: "Create and verify local SSplayer routine packages from music, video, choreography PDF and artwork. Resolve replacement recordings, lettered parts, opening pages and timeline clocks before Pro import and class planning."
+metadata:
+  display-name: ssplayer_package_creator
 ---
 
-# Make an SSplayer routine package
+# ssplayer_package_creator
 
-Use the user's local music, video, original choreography PDF and optional cover. Produce one portable package named PROJECT_ROUTINE_REVISION.ssroutine. Ask about ownership only when the user's intended distribution requires a rights decision. Keep original files intact and process them locally.
+## Collect the two paths
 
-Use [scripts/ssroutine.py](scripts/ssroutine.py) with Python 3.10+, FFmpeg and ffprobe. The Python dependencies are in [requirements.txt](requirements.txt). Optional scanned-page analysis uses Poppler's pdftoppm and Tesseract.
+Start by obtaining the original material folder and the output folder. Use any paths the user has already given. Ask for whichever is missing. Read the originals in place. Do analysis and encoding in a local working folder, and place the verified package in the requested output folder. Preserve an existing file if its contents differ.
 
-## Identify the routine
+Identify the stable project code, routine number, and package revision. Preserve only confirmed release-date precision. Check the original source before asking for information that might be in its cover, track list or metadata. Read the [quality checklist](references/quality-check.md) for naming and choosing a cover.
 
-Run the plan command from this skill directory, using an output path outside the original media folder.
+## Plan and review
 
-    python3 scripts/ssroutine.py plan "/path/to/routine" --program BC --routine 108 --revision 1 --output plan.json
+Use Python 3.10+, FFmpeg and ffprobe. The complete public Skill includes its alignment helper. For installation and optional scanned-PDF OCR, see [agent setup](references/agent-setup.md).
 
-Review every selected file and each entry in reviewSources. Correct course identity, primary/alternate assignments, and duplicate source versions against the actual files and source track list. For a catalogue slot with multiple candidates, supply the matching catalogTrackID. Use T3 for a complete section or T3A for an independently identified part. Preserve a cover if available. Optional credit is the contributor's chosen public name. Use a new revision after changing a delivered package.
-
-## Analyze and review
-
+    python3 scripts/ssroutine.py doctor
+    python3 scripts/ssroutine.py plan "/originals" --program TONE --routine 26 --output plan.json
     python3 scripts/ssroutine.py analyze plan.json --output review.json
 
-- Check video alignment early, midway and late in each independently matched track. Compare the actual music and video at the proposed offset. Verify the selected audio language and that the entire window fits. Approve audioMatched only for a consistent unit-rate match. A verified visual chapter can use visuallyConfirmed. Leave ambiguous or unmatched chapters out of the published timing.
-- If the video has narration only, analysis can run with --skip-alignment. A verified chapter may be entered manually in the review using start, end, evidence and approved. Keep timing unresolved where the source is ambiguous.
-- Read action rows against the physical source PDF pages. The timestamp is relative to that music section. Check alternate and split-section headings, continuation lines, counts, repeats, coaching notes and literal LEVEL colours. Preserve a printed repeat mark as Repeat if the glyph is absent from extraction. Add pdfPages to a plan entry when the page owner needs an explicit choice. For image-only pages, rerun with --ocr into a fresh review and compare against the rendered PDF. Keep the source PDF even if the action rows remain unresolved.
-- Set approved to true only on the reviewed chapter and cue collection for that recording. Keep exact source identities in the review. If a file changes, rerun analysis. Report unresolved sections with their reason.
+Read both reviewSources and musicWarnings. Verify the music against the track inventory and printed title, variant and duration. Distinguish replacement and bonus recordings, independent lettered parts such as T3A/T3B, and A/B movement combinations inside one recording. Keep unknown or wrong music out of the published slots.
 
-## Build and check
+Read the actual PDF headings, tables, and continuation pages, including CTS, REPS, coaching notes, repeat marks, directions, and printed level colors. Use pdfPages for cue-source physical pages and pdfPage for the approved opening page. Interval lengths are not cue timestamps. Preserve the original PDF and a proven opening page when there is no reliable action clock.
 
-    python3 scripts/ssroutine.py build review.json --output-dir "/path/to/output"
-    python3 scripts/ssroutine.py verify "/path/to/output/BC_108_1.ssroutine"
+Check video offsets early, midway, and late using the exact recording. Confirm the language edition and full chapter range. Approve audioMatched only for a stable unit-rate match. A visual chapter can use visuallyConfirmed along its own video clock. Keep unverified chapter and cue fields unapproved. Report which information is missing and what remains usable.
 
-Music is measured for integrated LUFS and true peak. The default target is −16 LUFS, with headroom and constant gain. When necessary, write a separate lossless audio copy and check its measured duration and loudness. Use --balance-video when the one-stream video audio also needs balancing. Verify the picture bitstream, picture timing and audio start. The tool hashes the finished bytes and reads the whole package back before delivery.
+## Build and verify
 
-In a compatible SSplayer build with Pro active, import the single file from Files or the app's local import picker. Check the project, routine, track order, cover, original PDF, music playback, video seek and action rows, then reopen the app and reimport the package to check persistence and duplicates. Report the results that were actually verified. Give the user the package and the concise counts from the verification output.
+    python3 scripts/ssroutine.py build review.json --output-dir "/deliverables"
+    python3 scripts/ssroutine.py verify "/deliverables/TONE_26_1.ssroutine"
 
-Use [the format reference](references/format.md) when inspecting a package contract, editing a plan or diagnosing an import refusal.
+Follow the [quality checklist](references/quality-check.md) to check playback, loudness, true peak, hashes, and the selected opening pages. With a compatible Pro App, exercise import, media and pages, class selection, save and reopen, and duplicate import. Report the checks that actually ran and the missing or unresolved media. Give the user the verified PROJECT_ROUTINE_REVISION.ssroutine.
+
+For review before Pro access, run `scripts/qa_preview.py PACKAGE --output-dir OUTPUT`. Use the author credit the user provides. It renders nine evidence images and a 3×3 overview from the validated package. It remeasures declared audio matches with the packaged media. Record App acceptance separately.
+
+Use the [format reference](references/format.md) for manifest editing or compatibility errors.

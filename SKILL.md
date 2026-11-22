@@ -34,6 +34,6 @@ Check video offsets early, midway, and late using the exact recording. Confirm t
 
 Follow the [quality checklist](references/quality-check.md) to check playback, loudness, true peak, hashes, and the selected opening pages. With a compatible Pro App, exercise import, media and pages, class selection, save and reopen, and duplicate import. Report the checks that actually ran and the missing or unresolved media. Give the user the verified PROJECT_ROUTINE_REVISION.ssroutine.
 
-For review before Pro access, run `scripts/qa_preview.py PACKAGE --output-dir OUTPUT`. Use the author credit the user provides. It renders nine evidence images and a 3×3 overview from the validated package. It remeasures declared audio matches with the packaged media. Record App acceptance separately.
+For review before Pro access, run `scripts/qa_preview.py PACKAGE --output-dir OUTPUT`. Use the user-provided credit. Deliver the nine images, 3×3 overview, and visual report.html. The report expands all measured tracks and shows gaps first. It remeasures declared audio matches with the packaged media. Record App acceptance separately.
 
 Use the [format reference](references/format.md) for manifest editing or compatibility errors.

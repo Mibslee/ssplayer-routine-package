@@ -17,6 +17,7 @@ import pypdfium2
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from media_analysis import measure, run
+from report_html import write_html
 from ssroutine import MAX_PACKAGE, consume, digest, read_manifest, require, validate_manifest
 
 SIZE = (1200, 810)
@@ -147,7 +148,7 @@ class Card:
             self.text(x + 13, y + 7, label, 23, ACCENT, 170)
             self.text(x + 177, y + 7, detail, 23, PRIMARY, width - 195)
         if len(values) > len(visible):
-            self.text(50, 701, f"另有 {len(values) - len(visible)} 项，详见 qa.json", 24, SECONDARY)
+            self.text(50, 701, f"另有 {len(values) - len(visible)} 项，见完整报告", 24, SECONDARY)
 
     def media(self, image, box=(48, 180, 1104, 515)):
         if image:
@@ -278,7 +279,7 @@ def screenshot_cards(manifest, files, report, font_path):
         (row["status"] == "unlocated" and "video" in files, "无视频定位")] if condition]))
               for row in tracks]
     gaps.rows([("App", "离线质检已生成，实际导入与排课需在 App 核对"),
-               ("署名", "随本次报告显示"), ("完整摘要", marker + "… 见 qa.json"),
+               ("署名", "随本次报告显示"), ("完整摘要", marker + "… 见完整报告"),
                *(("编号间隔", f"T{number} · 对照原谱确认") for number in report["sectionGaps"]),
                *(item for item in issues if item[1])])
     yield "09-review.png", gaps.image
@@ -314,6 +315,7 @@ def generate(args):
             contact.paste(ImageOps.contain(frame, (596, 403), Image.Resampling.LANCZOS),
                           (14 + (index % 3) * 605, 14 + (index // 3) * 407))
         contact.save(output / "3x3-overview.png")
+        write_html(output, manifest, report)
         (output / "qa.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         output.rename(destination)
     print(json.dumps({"output": str(destination.resolve()), "screenshots": 9, "sha256": full_sha,

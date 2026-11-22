@@ -64,6 +64,21 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 先核对 `plan.json` 中的资料和归属，再运行 `analyze`。只有查过正确录音、原谱与时间的章节和动作才在 `review.json` 中设置 `approved: true`。见[制作和质检](quality-check.md)。
 
+## 选择视频质量
+
+| 选项 | 视频规格 |
+| --- | --- |
+| `--video-quality original` | 默认沿用输入视频编码与分辨率 |
+| `--video-quality ipad` | HEVC，最高 1080p，视频目标码率 1800 kb/s |
+| `--video-quality compact` | HEVC，最高 720p，视频目标码率 950 kb/s |
+
+按素材细节调整 `--video-max-height` 和 `--video-bitrate-kbps`。需要 H.264 时明确加 `--video-codec h264`。降低分辨率时保持比例，已低于上限的画面沿用原分辨率或向下取偶。画质档应用于制包，App 使用包内现成的编码。
+
+    python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality ipad
+    python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality compact --video-max-height 540 --video-bitrate-kbps 750
+
+转码后用质检页核对实际尺寸、总码率和体积，查看运动画面的细节与小字可读性。音轨保留在秒级定位的同一时钟，制包工具核对视频每帧时间和原嵌入音频，再由离线报告复测已关联曲目。HDR、特殊画面或多个机位可选原画。发布过的套路以新修订号另存。
+
 ## 生成九宫格质检图
 
 无需 Pro 即可在本机执行。 `--credit` 指定本次质检上屏的署名，省略时使用包内署名。若已知准确的制作时间，用 `--made-at` 给出 ISO 8601 时间，省略时显示质检生成时间。可用 `--font` 指定本机带中文的字体。

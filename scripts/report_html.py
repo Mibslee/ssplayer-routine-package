@@ -93,6 +93,10 @@ def write_html(folder, manifest, report):
                      card("对位吻合", f"{sum(track['status'] == 'measured' for track in tracks)} 个定位"),
                      card("原谱入口", sum(bool(track["pdfPage"]) for track in tracks)),
                      card("动作提示", sum(track["cueRows"] for track in tracks))])
+    picture = report.get("videoInfo")
+    if picture:
+        video = f"{picture['width']}×{picture['height']} · {picture['codec'].upper()} · {picture['bitrateKbps']:,} kb/s"
+        stats += card(f"视频 · {picture['bytes'] / (1024 * 1024):,.0f} MiB", video)
     meta = " · ".join([report["credit"] or "未署名", f"版本 {report['revision']}",
                        report["releaseDate"] or "发行时间待核对",
                        f"{report['madeAtLabel']} {report['madeAt'][:19].replace('T', ' ')}"])

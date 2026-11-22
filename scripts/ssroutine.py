@@ -17,7 +17,8 @@ import sys
 import tempfile
 from pathlib import Path
 
-from media_analysis import alignment_module, audio_packet_hash, balance_audio, extract_cues, locate_chapters, probe
+from media_analysis import (alignment_module, audio_packet_hash, balance_audio, extract_cues, locate_chapters,
+                            optimize_video, probe, video_info)
 
 
 MAGIC = b"SSRT0001"
@@ -32,6 +33,9 @@ PROGRAM_ALBUMS = {
     "BODYCOMBAT": "BC", "BODYJAM": "BJ", "BODYPUMP": "BP", "BODYATTACK": "BA", "RPM": "RPM",
     "BC": "BC", "BJ": "BJ", "BP": "BP", "BA": "BA", "CORE": "CORE", "TONE": "TONE", "GRIT": "GRIT",
 }
+PROGRAM_ALIASES = {**PROGRAM_ALBUMS, "LESMILLSCORE": "CORE", "LESMILLSGRIT": "GRIT", "LESMILLSTONE": "TONE",
+                   "莱美核心": "CORE", "莱美核心训练": "CORE"}
+VIDEO_PROFILES = {"ipad": (1080, 1800), "compact": (720, 950)}
 
 
 def require(condition, reason):
@@ -86,6 +90,18 @@ def read_identity(value):
     return program, routine, revision
 
 
+def author_identity(project, routine):
+    raw = project.strip().upper()
+    key = re.sub(r"[ ._-]", "", raw)
+    program = PROGRAM_ALIASES.get(key, raw)
+    number = routine.strip().upper()
+    for prefix in (key, program):
+        remainder = number.removeprefix(prefix).lstrip(" -_")
+        if re.fullmatch(r"[0-9]+", remainder) and int(remainder) > 0:
+            return program, str(int(remainder))
+    return program, number
+
+
 def labeled_album(path, program, routine):
     duration, media = probe(path, "audio")
     tags = {key.lower(): value for key, value in media["format"].get("tags", {}).items()}
@@ -115,7 +131,8 @@ def canonical_duplicate(items):
 def plan(args):
     root = args.source.resolve(strict=True)
     require(root.is_dir(), "Select a source folder")
-    value = {"program": args.program.upper(), "routine": args.routine.upper(), "revision": args.revision, "music": []}
+    program, routine = author_identity(args.program, args.routine)
+    value = {"program": program, "routine": routine, "revision": args.revision, "music": []}
     if args.credit:
         value["credit"] = args.credit
     if args.release_date:
@@ -312,6 +329,13 @@ def package(args):
     program, routine, revision = read_identity(config)
     require(-24 <= args.lufs <= -12, "Select a loudness target between -24 and -12 LUFS")
     require(len(config["music"]) == len(review["tracks"]), "Review does not cover every music file")
+    if args.video_quality == "original":
+        require(args.video_max_height is None and args.video_bitrate_kbps is None and args.video_codec is None,
+                "Choose ipad or compact before setting video encoding options")
+    if args.video_max_height is not None:
+        require(240 <= args.video_max_height <= 2160, "Choose a video height from 240 to 2160")
+    if args.video_bitrate_kbps is not None:
+        require(250 <= args.video_bitrate_kbps <= 12000, "Choose a video bitrate from 250 to 12000 kb/s")
     destination = args.output_dir
     destination.mkdir(parents=True, exist_ok=True)
     name = f"{program}_{routine}_{revision}.ssroutine"
@@ -325,6 +349,7 @@ def package(args):
                 manifest[key] = config[key]
         files = []
         loudness = []
+        video_quality = None
         for index, (song, findings) in enumerate(zip(config["music"], review["tracks"])):
             path = same_source(song["file"], findings["source"])
             if not args.keep_music:
@@ -343,9 +368,17 @@ def package(args):
             manifest["music"].append(row)
         if config.get("video"):
             path = same_source(config["video"], review["video"]["source"])
+            original_picture = video_info(path)
             if args.balance_video:
                 path, levels = balance_audio(path, work / "video.mp4", args.lufs, video=True)
                 loudness.append({"section": "video", **levels})
+            if args.video_quality != "original":
+                height, bitrate = VIDEO_PROFILES[args.video_quality]
+                path, encoded_picture = optimize_video(path, work / "compact.mp4",
+                    args.video_max_height or height, args.video_bitrate_kbps or bitrate, args.video_codec or "hevc")
+            else:
+                encoded_picture = video_info(path)
+            video_quality = {"preset": args.video_quality, "source": original_picture, "output": encoded_picture}
             duration, _ = probe(path, "video")
             manifest["video"] = {"asset": identity(path), "duration": round(duration, 6)}
             files.append(path)
@@ -373,7 +406,7 @@ def package(args):
             os.fsync(stream.fileno())
         receipt = verify(pending)
         os.link(pending, output)
-    receipt.update(output=str(output.resolve()), loudness=loudness)
+    receipt.update(output=str(output.resolve()), loudness=loudness, videoQuality=video_quality)
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
 
 
@@ -450,6 +483,10 @@ def main():
     p.add_argument("--lufs", type=float, default=-16.0)
     p.add_argument("--keep-music", action="store_true")
     p.add_argument("--balance-video", action="store_true")
+    p.add_argument("--video-quality", choices=("original", "ipad", "compact"), default="original")
+    p.add_argument("--video-max-height", type=int, help="Override the selected preset's height limit")
+    p.add_argument("--video-bitrate-kbps", type=int, help="Override the selected preset's video bitrate")
+    p.add_argument("--video-codec", choices=("hevc", "h264"), help="HEVC by default for ipad and compact")
     p = commands.add_parser("verify")
     p.add_argument("package", type=Path)
     args = parser.parse_args()

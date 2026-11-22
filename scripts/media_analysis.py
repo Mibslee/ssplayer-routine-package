@@ -106,6 +106,95 @@ def balance_audio(source, destination, target, video=False):
                          "gainDB": round(gain, 3)}
 
 
+def picture_stream(media):
+    return next(stream for stream in media["streams"] if stream["codec_type"] == "video"
+                and not stream.get("disposition", {}).get("attached_pic"))
+
+
+def video_info(path):
+    duration, media = probe(path, "video")
+    picture = picture_stream(media)
+    return {"codec": picture["codec_name"], "width": picture["width"], "height": picture["height"],
+            "bytes": path.stat().st_size, "bitrateKbps": round(path.stat().st_size * 8 / duration / 1000)}
+
+
+def video_timestamps(path):
+    packets = run("ffprobe", "-v", "error", "-select_streams", "V:0", "-show_packets",
+                  "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path))
+    return sorted(float(line.split(b",")[0]) for line in packets.splitlines() if line.strip())
+
+
+def audio_stream_hashes(path, media):
+    if not any(stream["codec_type"] == "audio" for stream in media["streams"]):
+        return b""
+    return run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path), "-map", "0:a",
+               "-c", "copy", "-f", "streamhash", "-hash", "sha256", "-").strip()
+
+
+def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
+    """Keep every audio/subtitle stream and verify the video clock after compression."""
+    duration, before = probe(source, "video")
+    pictures = [stream for stream in before["streams"] if stream["codec_type"] == "video"
+                and not stream.get("disposition", {}).get("attached_pic")]
+    if len(pictures) != 1:
+        raise ValueError("Choose one camera stream or export with original video quality.")
+    picture = pictures[0]
+    if picture.get("color_transfer") in {"smpte2084", "arib-std-b67"} or picture.get("pix_fmt") not in {
+        "yuv420p", "yuvj420p", "nv12", "yuv422p", "yuv444p",
+    }:
+        raise ValueError("Use original video quality for HDR or special picture formats.")
+
+    software = "libx265" if codec == "hevc" else "libx264"
+    hardware = "hevc_videotoolbox" if codec == "hevc" else "h264_videotoolbox"
+    encoders = run("ffmpeg", "-hide_banner", "-encoders").decode(errors="replace")
+    filter_graph = f"scale=-2:'trunc(min(ih,{maximum_height})/2)*2',format=yuv420p"
+    arguments = ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-copyts", "-i", str(source),
+                 "-map", "0:V:0", "-map", "0:a?", "-map", "0:s?", "-map_metadata", "0", "-map_chapters", "0",
+                 "-c:a", "copy", "-c:s", "copy", "-vf", filter_graph, "-fps_mode", "passthrough",
+                 "-avoid_negative_ts", "disabled", "-movflags", "+faststart",
+                 "-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k", "-bufsize", f"{bitrate_kbps * 2}k"]
+    if codec == "hevc":
+        arguments += ["-tag:v", "hvc1"]
+    remaining = []
+    if sys.platform == "darwin" and hardware in encoders:
+        remaining.append((hardware, ["-allow_sw", "0"]))
+    if software in encoders:
+        settings = ["-preset", "fast", "-threads", "4"]
+        if codec == "hevc":
+            settings += ["-x265-params", "pools=4:frame-threads=2"]
+        remaining.append((software, settings))
+    if not remaining:
+        raise ValueError(f"Install an FFmpeg build with a {codec} encoder or select original quality.")
+    for encoder, settings in remaining:
+        try:
+            run(*arguments, "-c:v", encoder, *settings, str(destination))
+            break
+        except ValueError:
+            destination.unlink(missing_ok=True)
+            if encoder == remaining[-1][0]:
+                raise
+
+    final_duration, after = probe(destination, "video")
+    old_pts, new_pts = video_timestamps(source), video_timestamps(destination)
+    new_picture = picture_stream(after)
+    if (abs(duration - final_duration) > 0.06 or not old_pts or len(old_pts) != len(new_pts)
+            or max(abs(first - second) for first, second in zip(old_pts, new_pts)) > 0.005
+            or new_picture["height"] > maximum_height or new_picture["codec_name"] != codec):
+        raise ValueError("Compression moved the video clock or missed the quality limit.")
+    for kind in ("audio", "subtitle"):
+        old_streams = [stream for stream in before["streams"] if stream["codec_type"] == kind]
+        new_streams = [stream for stream in after["streams"] if stream["codec_type"] == kind]
+        if len(old_streams) != len(new_streams) or any(
+            first["codec_name"] != second["codec_name"]
+            or abs(float(first.get("start_time", 0)) - float(second.get("start_time", 0))) > 0.01
+            for first, second in zip(old_streams, new_streams)
+        ):
+            raise ValueError(f"Compression changed a {kind} track or its start time.")
+    if audio_stream_hashes(source, before) != audio_stream_hashes(destination, after):
+        raise ValueError("Compression changed the original video audio packets.")
+    return destination, {**video_info(destination), "encoder": encoder, "framesVerified": len(old_pts)}
+
+
 def locate_chapters(video, rows, duration, audio_duration):
     alignment = alignment_module()
     chapters = [None] * len(rows)

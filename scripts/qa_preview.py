@@ -16,7 +16,7 @@ import numpy as np
 import pypdfium2
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from media_analysis import measure, run
+from media_analysis import measure, run, video_info
 from report_html import write_html
 from ssroutine import MAX_PACKAGE, consume, digest, read_manifest, require, validate_manifest
 
@@ -204,7 +204,10 @@ def screenshot_cards(manifest, files, report, font_path):
     yield "01-identity.png", cover.image
 
     counts = card(2, "包内资料")
-    counts.rows([("音乐", f"{len(tracks)} 首"), ("视频", "已包含" if "video" in files else "缺失"),
+    picture = report.get("videoInfo")
+    video_format = (f"{picture['width']}×{picture['height']} · {picture['codec'].upper()} · {picture['bitrateKbps']:,} kb/s"
+                    if picture else "待核对" if "video" in files else "缺失")
+    counts.rows([("音乐", f"{len(tracks)} 首"), ("视频", video_format),
                  ("原谱", f"{manifest['pdf']['pageCount']} 页" if "pdf" in files else "缺失"),
                  ("封面", "已包含" if "cover" in files else "App 会用占位图"),
                  ("视频定位", f"{len(chapter_set)} 个 · 实测吻合 {measured} 个"),
@@ -307,6 +310,11 @@ def generate(args):
                   "bytes": args.package.stat().st_size, "sha256": full_sha, "manifestSHA256": manifest_sha,
                   "sectionGaps": sorted(set(range(1, max(sections) + 1)) - sections),
                   "appImportVerified": False, "tracks": inspect_tracks(manifest, audio, optional)}
+        if "video" in optional:
+            try:
+                report["videoInfo"] = video_info(optional["video"])
+            except (ValueError, OSError):
+                report["videoInfo"] = None
         output = Path(report_staging) / "evidence"
         output.mkdir()
         contact = Image.new("RGB", (1832, 1250), BACKGROUND)

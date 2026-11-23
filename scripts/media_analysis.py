@@ -12,6 +12,20 @@ import tempfile
 from pathlib import Path
 
 
+STRUCTURAL_REPEAT = re.compile(
+    r"\b(?:REPEAT|RPT)\s+(?:(?:THE\s+)?(?:BLOCKS?|SEQUENCES?|COMBOS?|SECTIONS?)\s+"
+    r"(?:\d+|[A-Z][0-9]*)(?!\w)|[A-Z][0-9]*\s*(?:[-–—&+]|AND|TO)\s*[A-Z][0-9]*\b)",
+    re.IGNORECASE,
+)
+
+
+def unresolved_repeat_times(rows):
+    """Identify structural shorthand that cannot be a finished cue row."""
+    return [row["time"] for row in rows if any(
+        STRUCTURAL_REPEAT.search(row.get(key) or "") for key in ("action", "coaching")
+    )]
+
+
 def run(*args):
     completed = subprocess.run(args, stdin=subprocess.DEVNULL, capture_output=True, check=False)
     if completed.returncode:
@@ -114,9 +128,13 @@ def picture_stream(media):
 def video_info(path):
     duration, media = probe(path, "video")
     picture = picture_stream(media)
+    size = path.stat().st_size
+    bit_rate = str(picture.get("bit_rate", ""))
     return {"codec": picture["codec_name"], "width": picture["width"], "height": picture["height"],
-            "bytes": path.stat().st_size, "duration": duration,
-            "bitrateKbps": round(path.stat().st_size * 8 / duration / 1000)}
+            "bytes": size, "duration": duration, "bitrateKbps": round(size * 8 / duration / 1000),
+            "pictureBitrateKbps": round(int(bit_rate) / 1000) if bit_rate.isdecimal() else None,
+            "subtitleTracks": sum(stream["codec_type"] == "subtitle" for stream in media["streams"]),
+            "closedCaptions": picture.get("closed_captions") == 1}
 
 
 def video_timestamps(path):
@@ -125,15 +143,59 @@ def video_timestamps(path):
     return sorted(float(line.split(b",")[0]) for line in packets.splitlines() if line.strip())
 
 
-def audio_stream_hashes(path, media):
-    if not any(stream["codec_type"] == "audio" for stream in media["streams"]):
-        return b""
-    return run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path), "-map", "0:a",
+def stream_hashes(path, stream):
+    return run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i", str(path), "-map", f"0:{stream}",
                "-c", "copy", "-f", "streamhash", "-hash", "sha256", "-").strip()
+
+
+def video_quality_samples(source, encoded, duration, width, height):
+    length = min(2.0, duration / 3)
+    normalize = "format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS"
+    graph = (f"[0:V:0]scale={width}:{height},{normalize}[reference];"
+             f"[1:V:0]{normalize}[test];"
+             "[reference][test]ssim=stats_file=-:shortest=1[comparison]")
+    scores = []
+    for position in (0.12, 0.50, 0.84):
+        start = (duration - length) * position
+        window = ("-ss", f"{start:.6f}", "-t", f"{length:.6f}")
+        result = run("ffmpeg", "-nostdin", "-v", "error", *window, "-i", str(source),
+                     *window, "-i", str(encoded), "-filter_complex_threads", "2",
+                     "-filter_complex", graph, "-map", "[comparison]", "-an", "-f", "null", "-")
+        frames = [float(value) for value in re.findall(rb"\bAll:(-?\d+(?:\.\d+)?)", result)]
+        if not frames:
+            raise ValueError("No comparable frames in a video quality sample.")
+        scores.append(sum(frames) / len(frames))
+    return scores
+
+
+def efficient_video(source, destination, maximum_height, bitrate_kbps, codec):
+    """Keep the smaller candidate only when its playback and sampled picture pass."""
+    original = video_info(source)
+    if bitrate_kbps is None and codec == original["codec"] == "hevc":
+        if existing_rate := original["pictureBitrateKbps"]:
+            bitrate_kbps = max(250, round(existing_rate * 0.85))
+    scores = []
+    try:
+        output, candidate = optimize_video(source, destination, maximum_height, bitrate_kbps, codec)
+        if candidate["bytes"] > original["bytes"] * 0.90:
+            raise ValueError("Video size savings were below 10%.")
+        scores = video_quality_samples(source, output, original["duration"],
+                                       candidate["width"], candidate["height"])
+        if min(scores) < 0.96:
+            raise ValueError("A sampled section did not meet the picture quality threshold.")
+    except ValueError as error:
+        destination.unlink(missing_ok=True)
+        picture = {**original, "compression": "keptOriginal", "reason": str(error)}
+        if scores:
+            picture["sampleSSIM"] = [round(score, 5) for score in scores]
+        return source, picture
+    return output, {**candidate, "compression": "optimized", "sampleSSIM": [round(score, 5) for score in scores]}
 
 
 def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
     """Keep every audio/subtitle stream and verify the video clock after compression."""
+    if destination.exists() or destination.is_symlink():
+        raise FileExistsError("Choose a new filename for the encoded video.")
     duration, before = probe(source, "video")
     pictures = [stream for stream in before["streams"] if stream["codec_type"] == "video"
                 and not stream.get("disposition", {}).get("attached_pic")]
@@ -144,25 +206,36 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
         "yuv420p", "yuvj420p", "nv12", "yuv422p", "yuv444p",
     }:
         raise ValueError("Use original video quality for HDR or special picture formats.")
+    if picture.get("closed_captions") == 1:
+        raise ValueError("Use original video quality to preserve captions carried by the video stream.")
 
     software = "libx265" if codec == "hevc" else "libx264"
     hardware = "hevc_videotoolbox" if codec == "hevc" else "h264_videotoolbox"
     encoders = run("ffmpeg", "-hide_banner", "-encoders").decode(errors="replace")
-    filter_graph = f"scale=-2:'trunc(min(ih,{maximum_height})/2)*2',format=yuv420p"
+    filter_graph = "format=yuv420p"
+    if maximum_height is not None:
+        filter_graph = f"scale=-2:'trunc(min(ih,{maximum_height})/2)*2',{filter_graph}"
     arguments = ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-copyts", "-i", str(source),
                  "-map", "0:V:0", "-map", "0:a?", "-map", "0:s?", "-map_metadata", "0", "-map_chapters", "0",
                  "-c:a", "copy", "-c:s", "copy", "-vf", filter_graph, "-fps_mode", "passthrough",
-                 "-avoid_negative_ts", "disabled", "-movflags", "+faststart",
-                 "-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k", "-bufsize", f"{bitrate_kbps * 2}k"]
+                 "-avoid_negative_ts", "disabled", "-movflags", "+faststart"]
+    if bitrate_kbps is not None:
+        arguments += ["-b:v", f"{bitrate_kbps}k", "-maxrate", f"{bitrate_kbps}k",
+                      "-bufsize", f"{bitrate_kbps * 2}k"]
     if codec == "hevc":
         arguments += ["-tag:v", "hvc1"]
     remaining = []
     if sys.platform == "darwin" and hardware in encoders:
-        remaining.append((hardware, ["-allow_sw", "0"]))
+        settings = ["-allow_sw", "0"]
+        if bitrate_kbps is None:
+            settings += ["-q:v", "65"]
+        remaining.append((hardware, settings))
     if software in encoders:
         settings = ["-preset", "fast", "-threads", "4"]
         if codec == "hevc":
             settings += ["-x265-params", "pools=4:frame-threads=2"]
+        if bitrate_kbps is None:
+            settings += ["-crf", "22" if codec == "hevc" else "20"]
         remaining.append((software, settings))
     if not remaining:
         raise ValueError(f"Install an FFmpeg build with a {codec} encoder or select original quality.")
@@ -178,21 +251,27 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
     final_duration, after = probe(destination, "video")
     old_pts, new_pts = video_timestamps(source), video_timestamps(destination)
     new_picture = picture_stream(after)
+    if maximum_height is None:
+        dimensions_match = ((new_picture["width"], new_picture["height"]) ==
+                            (picture["width"], picture["height"]))
+    else:
+        dimensions_match = new_picture["height"] <= maximum_height
     if (abs(duration - final_duration) > 0.06 or not old_pts or len(old_pts) != len(new_pts)
             or max(abs(first - second) for first, second in zip(old_pts, new_pts)) > 0.005
-            or new_picture["height"] > maximum_height or new_picture["codec_name"] != codec):
+            or not dimensions_match or new_picture["codec_name"] != codec):
         raise ValueError("Compression moved the video clock or missed the quality limit.")
-    for kind in ("audio", "subtitle"):
+    for kind, stream in (("audio", "a"), ("subtitle", "s")):
         old_streams = [stream for stream in before["streams"] if stream["codec_type"] == kind]
         new_streams = [stream for stream in after["streams"] if stream["codec_type"] == kind]
         if len(old_streams) != len(new_streams) or any(
             first["codec_name"] != second["codec_name"]
             or abs(float(first.get("start_time", 0)) - float(second.get("start_time", 0))) > 0.01
+            or (first.get("tags", {}).get("language") or "und") != (second.get("tags", {}).get("language") or "und")
             for first, second in zip(old_streams, new_streams)
         ):
             raise ValueError(f"Compression changed a {kind} track or its start time.")
-    if audio_stream_hashes(source, before) != audio_stream_hashes(destination, after):
-        raise ValueError("Compression changed the original video audio packets.")
+        if old_streams and stream_hashes(source, stream) != stream_hashes(destination, stream):
+            raise ValueError(f"Compression changed the original {kind} packets.")
     return destination, {**video_info(destination), "encoder": encoder, "framesVerified": len(old_pts)}
 
 
@@ -346,6 +425,10 @@ def extract_cues(path, songs, ocr=False):
                 rows.extend(read_page_rows(pdf.pages[n - 1], words[n], n, alignment.parse_timestamp))
             valid = all(0 <= row["time"] <= song["duration"] for row in rows)
             valid = valid and all(a["time"] <= b["time"] for a, b in zip(rows, rows[1:]))
+            repeats = unresolved_repeat_times(rows)
+            status = "unresolved"
+            if valid and rows:
+                status = "needsExpansion" if repeats else "review"
             result.append({"rows": rows, "pages": list(pages), "approved": False,
-                           "status": "review" if valid and rows else "unresolved"})
+                           "status": status, "structuralRepeatTimes": repeats})
         return len(pdf.pages), result, warnings

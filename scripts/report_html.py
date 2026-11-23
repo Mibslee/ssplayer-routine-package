@@ -67,10 +67,17 @@ def track_panel(track, song, has_video):
     content = "".join(f"<dt>{show(key)}</dt><dd>{show(value)}</dd>" for key, value in rows)
     actions = ""
     if song.get("cues"):
-        entries = "".join(f"<li><strong>{show(clock(cue['time']))}</strong> {show(cue['action'])}"
-                          + (f" · {show(cue['coaching'])}" if cue.get("coaching") else "") + "</li>"
-                          for cue in song["cues"])
-        actions = f'<details><summary>展开动作与教练注记</summary><ol class="cues">{entries}</ol></details>'
+        entries = []
+        for cue in song["cues"]:
+            metadata = [f"原谱第 {cue['page']} 页"]
+            if cue.get("block") is not None:
+                metadata.insert(0, f"Block {cue['block']}")
+            metadata.extend(str(cue[key]) for key in ("counts", "repetitions") if cue.get(key))
+            details = show(" · ".join(metadata))
+            note = f"<br>{show(cue['coaching'])}" if cue.get("coaching") else ""
+            entries.append(f"<li><strong>{show(clock(cue['time']))}</strong> {show(cue['action'])}"
+                           f"<br><span class='muted'>{details}</span>{note}</li>")
+        actions = f'<details><summary>查看包内动作时间线与原谱页</summary><ol class="cues">{"".join(entries)}</ol></details>'
     cls = "track review" if needs_review else "track"
     return needs_review, (f'<details><summary class="{cls}"><span>{show(section)}</span>'
                           f'<span>{show(title)}</span><span>{show(status)}</span></summary>'
@@ -93,7 +100,7 @@ def write_html(folder, manifest, report):
     stats = "".join([card("音乐解码", f"{sum(track['decoded'] for track in tracks)}/{len(tracks)}"),
                      card("对位吻合", f"{sum(track['status'] == 'measured' for track in tracks)} 个定位"),
                      card("原谱入口", sum(bool(track["pdfPage"]) for track in tracks)),
-                     card("动作提示", sum(track["cueRows"] for track in tracks))])
+                     card("包内动作时间线", f"{sum(track['cueRows'] > 0 for track in tracks)}/{len(tracks)} 首")])
     picture = report.get("videoInfo")
     if picture:
         video = f"{picture['width']}×{picture['height']} · {picture['codec'].upper()} · {picture['bitrateKbps']:,} kb/s"

@@ -45,41 +45,52 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 ## 发给智能体的提示
 
-    使用 ssplayer-package-creator 制作一个 SSplayer 套路资源包。
+    使用 ssplayer-package-creator 制作一批 SSplayer 套路资源包。
     原始资料目录是「填写可读的完整目录」。
     输出目录是「填写最终成品目录」。
-    我知道的信息是「项目、套路号、发行季度、希望使用的封面或视频版本」。
-    请保留源文件，标出待确认的曲目、替换曲、AB 段、原谱页和定位。
-    交付前核对实际内容、时间、音量和完整性，给我成品路径和验收结果。
+    把识别出的项目、套路、发行时间和封面选项列成一张表，一次和我核对。
+    整批视频规格和署名用「填写偏好」，单套例外在表里标出。
+    保留源文件，核对替换曲、AB 段、原谱页、视频定位和动作时间线。
+    完成质检后执行 submit，给我可上传的批次目录和需要了解的缺项。
 
 ## 命令行示例
 
-在工作目录保留 `plan.json` 和 `review.json`。如有已核对的独立封面，可为 `plan` 传入 `--cover "/图片/cover.jpg"`。
+在工作目录保留 `plan.json` 和 `review.json`。先把 `coverCandidates` 里的图片展示给制作者。示例里的 `/工作区/已确认.jpg` 可以是独立图片，也可以是计划提取的内嵌封面。制作者选择留空时，用 `--without-cover` 代替 `--cover`。
 
     python scripts/ssroutine.py doctor
     python scripts/ssroutine.py plan "/资料/TONE 26" --program TONE --routine 26 --release-date 2024Q3 --output plan.json
-    python scripts/ssroutine.py analyze plan.json --output review.json
+    python scripts/ssroutine.py select-cover plan.json --cover "/工作区/已确认.jpg" --output confirmed-plan.json
+    python scripts/ssroutine.py analyze confirmed-plan.json --output review.json
     python scripts/ssroutine.py build review.json --output-dir "/本机工作区/成品"
     python scripts/ssroutine.py verify "/本机工作区/成品/TONE_26_1.ssroutine"
 
 先核对 `plan.json` 中的资料和归属，再运行 `analyze`。只有查过正确录音、原谱与时间的章节和动作才在 `review.json` 中设置 `approved: true`。见[制作和质检](quality-check.md)。
 
-修改小节、曲目版本、目录槽位或动作提取页后，更新计划并重新分析。独立的原谱打开页可在核对后填写。把完成质检的包复制到用户指定的 NAS 或网盘目录，再对目标文件执行 `verify`，核对两边的完整 SHA-256。同名文件内容不一致时使用新修订号。
+修改小节、曲目版本、目录槽位或动作提取页后，更新计划并重新分析。独立的原谱打开页可在核对后填写。同名文件内容不一致时使用新修订号。
+
+## 提交一批
+
+确认成品后，从本机工作区选择要提交的包。可以只交一套，也可以合并多套。
+
+    python scripts/ssroutine.py submit "/本机工作区/成品/TONE_26_1.ssroutine" "/本机工作区/成品/CORE_63_3.ssroutine" --output-dir "/交付目录"
+
+上传生成的整个批次目录，里面有「套路资源包」「质检图」和一份指纹文件。发给审校人的内容是网盘链接。若要核对网盘副本，从网盘读回包执行 `verify`，把输出里的完整 SHA-256 与批次指纹比较。审校人签回的 `.ssapproval` 可以和对应的资源包一起分发。
 
 ## 选择视频质量
 
 | 选项 | 视频规格 |
 | --- | --- |
-| `--video-quality original` | 默认沿用输入视频编码与分辨率 |
+| `--video-quality efficient` | 默认尝试高画质 HEVC，保留输入分辨率和画面时钟，核验通过后选用较小成品 |
+| `--video-quality original` | 沿用输入视频编码与分辨率 |
 | `--video-quality ipad` | HEVC，最高 1080p，视频目标码率 1800 kb/s |
 | `--video-quality compact` | HEVC，最高 720p，视频目标码率 950 kb/s |
 
-按素材细节调整 `--video-max-height` 和 `--video-bitrate-kbps`。需要 H.264 时明确加 `--video-codec h264`。降低分辨率时保持比例，已低于上限的画面沿用原分辨率或向下取偶。画质档应用于制包，App 使用包内现成的编码。
+按素材细节调整 `--video-max-height` 和 `--video-bitrate-kbps`。需要指定 H.264 时可选 iPad 或轻量档并加 `--video-codec h264`。降低分辨率时保持比例，已低于上限的画面沿用原分辨率或向下取偶。输入已是 HEVC 时，默认档参照原画面码率试压。默认档要求视频体积至少减少 10%，头、中、尾三个画面样本的平均 SSIM 均达到 0.96。遇到不适合转码的素材，或任何核验未通过，成品沿用输入视频，原因随制作回执记录。
 
     python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality ipad
     python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality compact --video-max-height 540 --video-bitrate-kbps 750
 
-转码后用质检页核对实际尺寸、总码率和体积，查看运动画面的细节与小字可读性。音轨保留在秒级定位的同一时钟，制包工具核对视频每帧时间和原嵌入音频，再由离线报告复测已关联曲目。HDR、特殊画面或多个机位可选原画。发布过的套路以新修订号另存。
+转码后核对实际尺寸、总码率和体积，查看快速动作、小字及画面字幕的可读性。制包工具比较视频时间戳和音轨、内嵌字幕的数据，再由离线报告复测已关联曲目。HDR、特殊画面或多个机位可选原画。发布过的套路以新修订号另存。
 
 ## 生成九宫格质检图
 
@@ -87,8 +98,10 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
     python scripts/qa_preview.py "/成品/TONE_26_1.ssroutine" --output-dir "/成品" --credit "我的署名" --strict
 
-输出一个同名 `.qa` 目录，包含九张单图、`3x3-overview.png` 和 `report.html`。九张图覆盖信息与封面、素材完整性、曲目/替换/分段、实际视频画面、包内音乐与视频三个窗口的对位复测、动作时间线、原谱物理页、响度解码和缺项。可视报告把复核项放在前面，每首歌可以展开看具体结果。`qa.json` 是工具间交换用的数据。
+输出一个同名 `.qa` 目录，包含九张单图、`3x3-overview.png` 和 `report.html`。左上首图 `01-identity.png` 汇总套路、封面、发行时间、包版本、署名、总包大小、视频实测参数、音乐与原谱。视频有独立字幕轨时显示轨数，压进画面的字幕需看片确认。其余八图覆盖素材完整性、曲目与替换、视频画面、对位实测、动作时间线、原谱打开页、响度及复核项。可视报告把复核项放在前面，每首歌可以展开看具体结果。`qa.json` 是工具间交换用的数据。
+
+首图沿用电影条目的阅读顺序，大封面旁是标题、发行时间和时长，下方突出包体积与离线质检结果。质检结果包含抽查视频帧和原谱打开页时发现的问题。
 
 严格质检发现音乐无法解码、清单时长与实物不符、标为按音乐定位却复测失败，或已附的封面和原谱打不开时，会留下可读报告，命令以状态码 2 结束。没附的素材和未声明定位会列为复核项，允许交付已核实的内容。
 
-把总览和可视报告作为初审材料，先核对曲目和对位，再用 Pro 验证代表性的 App 导入和排课。报告 HTML 内嵌总览，可以单独打开。带原谱或视频画面的证据使用约定渠道提交。
+在本机用总览和可视报告核对曲目和对位，有 Pro 时再验证 App 导入和排课。报告 HTML 内嵌总览，可以单独打开。上传时使用 `submit` 整理过的批次目录，确需补充远程排查证据时再通过约定渠道提供。

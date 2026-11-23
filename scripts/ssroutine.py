@@ -16,10 +16,11 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+from io import BytesIO
 from pathlib import Path
 
-from media_analysis import (alignment_module, audio_packet_hash, balance_audio, extract_cues, locate_chapters,
-                            optimize_video, probe, video_info)
+from media_analysis import (alignment_module, audio_packet_hash, balance_audio, efficient_video, extract_cues,
+                            locate_chapters, optimize_video, probe, run, unresolved_repeat_times, video_info)
 
 
 MAGIC = b"SSRT0001"
@@ -37,7 +38,7 @@ PROGRAM_ALBUMS = {
 PROGRAM_ALIASES = {**PROGRAM_ALBUMS, **{f"LESMILLS{name}": code for name, code in PROGRAM_ALBUMS.items()},
                    "莱美核心": "CORE", "莱美核心训练": "CORE", "莱美GRIT": "GRIT", "莱美TONE": "TONE"}
 NATIVE_PROGRAMS = {"BC", "BJ", "BP", "RPM"}
-VIDEO_PROFILES = {"ipad": (1080, 1800), "compact": (720, 950)}
+VIDEO_PROFILES = {"efficient": (None, None), "ipad": (1080, 1800), "compact": (720, 950)}
 
 
 def require(condition, reason):
@@ -112,8 +113,114 @@ def labeled_album(path, program, routine):
     if program in PROGRAM_ALBUMS.values() and routine.isdigit() and label:
         source = PROGRAM_ALBUMS[label[1]], int(label[2])
         if source != (program, int(routine)):
-            return duration, f"The album tag points to {source[0]} {source[1]}."
-    return duration, None
+            return duration, f"The album tag points to {source[0]} {source[1]}.", []
+    attached = [stream["index"] for stream in media["streams"]
+                if stream["codec_type"] == "video" and stream.get("disposition", {}).get("attached_pic")]
+    return duration, None, attached
+
+
+def track_stem(stem, program, routine):
+    aliases = {program} | {name for name, code in PROGRAM_ALIASES.items() if code == program}
+    names = "|".join(re.escape(name) for name in sorted(aliases, key=lambda name: (-len(name), name)))
+    release = ("0*" if routine.isdigit() else "") + re.escape(routine)
+    match = re.match(rf"^(?:{names})[ ._-]*{release}[ ._-]+(.+)$", stem, re.I)
+    return match[1] if match else stem
+
+
+def cover_extension(source):
+    from PIL import Image
+
+    try:
+        with Image.open(source) as image:
+            ext = {"JPEG": "jpg", "PNG": "png"}.get(image.format)
+            require(ext and all(1 <= size <= 8192 for size in image.size),
+                    "Choose a JPEG or PNG image up to 8192 pixels per side.")
+            image.load()
+            return ext
+    except (OSError, Image.DecompressionBombError) as error:
+        raise ValueError("The cover image cannot be decoded.") from error
+
+
+def cover_asset(path):
+    require(path.is_file(), "Choose a local cover image.")
+    with path.open("rb") as artwork:
+        data = artwork.read(8 * MIB + 1)
+    require(0 < len(data) <= 8 * MIB, "Choose a cover image of at most 8 MiB.")
+    ext = cover_extension(BytesIO(data))
+    require(extension(path) == ext, "The cover extension must match the image format.")
+    return {"ext": ext, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
+
+
+def list_cover_candidates(files, songs, embedded, plan_path):
+    candidates = {}
+    for path in files:
+        try:
+            asset = cover_asset(path)
+        except (ValueError, OSError):
+            continue
+        candidates.setdefault(asset["sha256"], {"file": str(path), "source": "image"})
+    for song in songs:
+        for index in embedded.get(song["file"], ()):
+            try:
+                data = run("ffmpeg", "-nostdin", "-v", "error", "-i", song["file"], "-map", f"0:{index}",
+                           "-c:v", "copy", "-frames:v", "1", "-f", "image2pipe", "-")
+                require(0 < len(data) <= 8 * MIB, "Embedded artwork is too large.")
+                sha = hashlib.sha256(data).hexdigest()
+                if sha in candidates:
+                    continue
+                ext = cover_extension(BytesIO(data))
+            except (ValueError, OSError):
+                continue
+            previews = plan_path.resolve().with_name(f".{plan_path.stem}-covers")
+            previews.mkdir(parents=True, exist_ok=True)
+            path = previews / f"{sha}.{ext}"
+            if path.exists():
+                require(digest(path) == sha, "A saved cover preview was modified. Choose a different plan filename.")
+            else:
+                with path.open("xb") as output:
+                    output.write(data)
+            candidates[sha] = {"file": str(path), "source": "embedded", "section": song["section"]}
+    return list(candidates.values())
+
+
+def set_cover_selection(config, choice):
+    if choice is None:
+        config.pop("cover", None)
+        config["coverSelection"] = {"omit": True}
+        return None
+    path = choice.resolve(strict=True)
+    asset = cover_asset(path)
+    config["cover"] = str(path)
+    config["coverSelection"] = {"sha256": asset["sha256"]}
+    return asset
+
+
+def selected_cover(config):
+    selected = config.get("coverSelection")
+    if path := config.get("cover"):
+        require(selected and selected.get("sha256"),
+                "Show the artwork to the creator and run select-cover with the confirmed image.")
+        asset = cover_asset(Path(path))
+        require(selected == {"sha256": asset["sha256"]},
+                "The confirmed artwork changed. Show it again and run select-cover.")
+        return asset
+    if config.get("coverCandidates") or selected:
+        require(selected == {"omit": True},
+                "Show the cover candidates to the creator. Run select-cover with the approved image or --without-cover.")
+    return None
+
+
+def select_cover(args):
+    document = read_json(args.input)
+    config = document.get("plan", document)
+    read_identity(config)
+    asset = set_cover_selection(config, args.cover)
+    if config is not document:
+        if asset:
+            document["cover"] = asset
+        else:
+            document.pop("cover", None)
+    write_json(args.output, document)
 
 
 def canonical_duplicate(items):
@@ -132,6 +239,7 @@ def canonical_duplicate(items):
 def plan(args):
     root = args.source.resolve(strict=True)
     require(root.is_dir(), "Select a source folder")
+    require(not args.output.exists(), "Choose a new output path for the plan.")
     program, routine = author_identity(args.program, args.routine)
     value = {"program": program, "routine": routine, "revision": args.revision, "music": []}
     if args.credit:
@@ -140,7 +248,8 @@ def plan(args):
         value["releaseDate"] = args.release_date
     read_identity(value)
     recognized = {}
-    assets = {"video": [], "pdf": [], "cover": []}
+    assets = {"video": [], "pdf": []}
+    cover_images, embedded = [], {}
     review = []
     warnings = []
     for file in sorted(root.rglob("*")):
@@ -148,8 +257,9 @@ def plan(args):
             continue
         suffix = extension(file)
         if suffix in AUDIO:
-            match = re.match(r"^(?:(ALTERNATIVE|ALT|BNS|BONUS|替换曲|替换|备选|A|B)[ ._-]*)?T?(\d{1,3})([A-Z]?)(?:[ ._-]+(.*)|$)",
-                             file.stem, re.I)
+            stem = track_stem(file.stem, program, routine)
+            match = re.match(r"^(?:(ALTERNATIVE|ALT|BNS|BONUS|替换曲|替换|备选|A|B)[ ._-]*)?(?:T[ ._-]*)?(\d{1,3})([A-Z]?)(?:[ ._-]+(.*)|$)",
+                             stem, re.I)
             if not match or not 1 <= int(match[2]) <= 128:
                 review.append(str(file))
                 continue
@@ -174,21 +284,23 @@ def plan(args):
                                  "reason": "This native catalogue requires a whole section. Check the source."})
                 continue
             try:
-                duration, conflict = labeled_album(file, value["program"], value["routine"])
+                duration, conflict, attached = labeled_album(file, value["program"], value["routine"])
             except (ValueError, TypeError, KeyError):
-                duration, conflict = 0, "Audio tracks or duration could not be verified."
+                duration, conflict, attached = 0, "Audio tracks or duration could not be verified.", []
             if conflict:
                 review.append(str(file))
                 warnings.append({"file": file.name, "section": section, "reason": conflict})
                 continue
             item = {"section": section, "variant": variant, "file": str(file), "title": title or section}
             recognized.setdefault((section, variant), []).append((item, duration))
+            if attached:
+                embedded[str(file)] = attached
         elif suffix in VIDEO:
             assets["video"].append(str(file))
         elif suffix == "pdf":
             assets["pdf"].append(str(file))
-        elif suffix in PICTURE and re.search("cover|artwork|封面", file.stem, re.I):
-            assets["cover"].append(str(file))
+        elif suffix in PICTURE:
+            cover_images.append(file)
     for items in recognized.values():
         if len(items) == 1:
             value["music"].append(items[0][0])
@@ -208,19 +320,21 @@ def plan(args):
         elif paths:
             review.extend(paths)
     if args.cover:
-        cover = args.cover.resolve(strict=True)
-        require(cover.is_file() and extension(cover) in PICTURE, "Choose a JPEG or PNG cover")
-        value["cover"] = str(cover)
+        set_cover_selection(value, args.cover)
+    else:
+        value["coverCandidates"] = list_cover_candidates(cover_images, value["music"], embedded, args.output)
     value["reviewSources"] = review
     value["musicWarnings"] = warnings
     write_json(args.output, value)
     print(json.dumps({"musicProposed": len(value["music"]), "reviewSources": len(review),
-                      "musicWarnings": len(warnings)}, ensure_ascii=False))
+                      "musicWarnings": len(warnings),
+                      "coverCandidates": len(value.get("coverCandidates", []))}, ensure_ascii=False))
 
 
 def analyze(args):
     config = read_json(args.plan)
     program, _, _ = read_identity(config)
+    cover = selected_cover(config)
     songs = config["music"]
     require(1 <= len(songs) <= 128, "Choose the music files in the plan")
     validate_slots(program, songs)
@@ -253,8 +367,8 @@ def analyze(args):
             review["videoWarnings"] = warnings
             for record, chapter in zip(review["tracks"], chapters):
                 record["chapter"] = chapter
-    if config.get("cover"):
-        review["cover"] = identity(Path(config["cover"]).resolve(strict=True))
+    if cover:
+        review["cover"] = cover
     write_json(args.output, review)
     print(json.dumps({"music": len(audio), "chaptersProposed": sum(bool(x.get("chapter")) for x in review["tracks"]),
                       "cueRowsProposed": sum(len(x.get("cues", {}).get("rows", [])) for x in review["tracks"])}))
@@ -268,6 +382,23 @@ def same_source(value, expected):
 
 def source_selection(song):
     return {key: song[key] for key in ("section", "variant", "catalogTrackID", "pdfPages") if key in song}
+
+
+def approved_timeline(song, findings):
+    analysis = findings.get("cues")
+    if not analysis or analysis.get("approved") is not True:
+        return None
+    label = f"{song['section']} ({song['variant']})"
+    rows = analysis["rows"]
+    pages = analysis["pages"]
+    require(rows and pages and all(row["page"] in pages for row in rows),
+            f"{label}: verify the complete timed rows against the selected PDF pages")
+    repeats = unresolved_repeat_times(rows)
+    require(not repeats, f"{label}: expand the structural repeat at {', '.join(map(str, repeats))} seconds before packing")
+    clocks = {row["time"] for row in rows}
+    missing = [start for start in analysis.get("structuralRepeatTimes", []) if start not in clocks]
+    require(not missing, f"{label}: preserve the printed repeat opening at {', '.join(map(str, missing))} seconds")
+    return rows
 
 
 def valid_text(value, limit, *, single_line=False):
@@ -339,10 +470,23 @@ def validate_manifest(value):
         require(rows is None or (pdf and isinstance(rows, list) and 1 <= len(rows) <= 4096),
                 "Cues require a bounded source PDF")
         previous = -1
+        previous_block, block_time = 0, None
+        known_blocks = set()
         for cue in rows or []:
             require(previous <= cue["time"] <= item["duration"] and cue["time"] >= 0 and
                     type(cue["page"]) is int and 1 <= cue["page"] <= pdf["pageCount"] and
                     cue["action"].strip(), f"Invalid cue for {item['section']}")
+            repeated = cue.get("repeatsBlock")
+            if (block := cue.get("block")) is not None:
+                require(type(block) is int and previous_block < block <= 128 and previous < cue["time"],
+                        f"Invalid block boundary for {item['section']}")
+                require(repeated is None or (type(repeated) is int and repeated in known_blocks),
+                        f"The repeat in {item['section']} must refer to an earlier marked block")
+                known_blocks.add(block)
+                previous_block, block_time = block, cue["time"]
+            else:
+                require(cue["time"] != block_time, f"Combine cues sharing a block's opening clock in {item['section']}")
+                require(repeated is None, f"Add the repeat reference only at the opening of {item['section']}'s block")
             previous = cue["time"]
             for key in ("action", "music", "counts", "repetitions", "coaching"):
                 if (text := cue.get(key)) is not None:
@@ -356,6 +500,8 @@ def package(args):
     review = read_json(args.review)
     config = review["plan"]
     program, routine, revision = read_identity(config)
+    require((program, routine) == author_identity(program, routine),
+            "Use canonical project and routine identifiers in the plan.")
     require(-24 <= args.lufs <= -12, "Select a loudness target between -24 and -12 LUFS")
     require(len(config["music"]) == len(review["tracks"]), "Review does not cover every music file")
     validate_slots(program, config["music"])
@@ -364,9 +510,13 @@ def package(args):
     for song, findings in zip(config["music"], review["tracks"]):
         require(findings.get("selection", source_selection(song)) == source_selection(song),
                 f"Section, variant, catalogue slot or cue pages changed for {song['section']}. Run analyze again.")
+    timelines = [approved_timeline(song, findings) for song, findings in zip(config["music"], review["tracks"])]
+    cover = selected_cover(config)
+    if cover:
+        require(review.get("cover") == cover, "Review no longer matches the confirmed cover image.")
     if args.video_quality == "original":
         require(args.video_max_height is None and args.video_bitrate_kbps is None and args.video_codec is None,
-                "Choose ipad or compact before setting video encoding options")
+                "Choose efficient, ipad or compact before setting video encoding options")
     if args.video_max_height is not None:
         require(240 <= args.video_max_height <= 2160, "Choose a video height from 240 to 2160")
     if args.video_bitrate_kbps is not None:
@@ -385,7 +535,7 @@ def package(args):
         files = []
         loudness = []
         video_quality = None
-        for index, (song, findings) in enumerate(zip(config["music"], review["tracks"])):
+        for index, (song, findings, timeline) in enumerate(zip(config["music"], review["tracks"], timelines)):
             path = same_source(song["file"], findings["source"])
             if not args.keep_music:
                 path, levels = balance_audio(path, work / f"audio-{index}.m4a", args.lufs)
@@ -397,8 +547,8 @@ def package(args):
                 row["chapter"] = {key: chapter[key] for key in ("start", "end", "evidence")}
                 if chapter["evidence"] == "audioMatched":
                     row["chapter"]["end"] = round(chapter["start"] + duration, 6)
-            if (cues := findings.get("cues")) and cues.get("approved") is True and cues["rows"]:
-                row["cues"] = cues["rows"]
+            if timeline:
+                row["cues"] = timeline
             files.append(path)
             manifest["music"].append(row)
         if config.get("video"):
@@ -409,21 +559,21 @@ def package(args):
                 loudness.append({"section": "video", **levels})
             if args.video_quality != "original":
                 height, bitrate = VIDEO_PROFILES[args.video_quality]
-                path, encoded_picture = optimize_video(path, work / "compact.mp4",
+                encode = efficient_video if args.video_quality == "efficient" else optimize_video
+                path, encoded_picture = encode(path, work / "encoded.mp4",
                     args.video_max_height or height, args.video_bitrate_kbps or bitrate, args.video_codec or "hevc")
             else:
                 encoded_picture = video_info(path)
             video_quality = {"preset": args.video_quality, "source": original_picture, "output": encoded_picture}
-            duration, _ = probe(path, "video")
-            manifest["video"] = {"asset": identity(path), "duration": round(duration, 6)}
+            manifest["video"] = {"asset": identity(path), "duration": round(encoded_picture["duration"], 6)}
             files.append(path)
         if config.get("pdf"):
             path = same_source(config["pdf"], review["pdf"]["source"])
             manifest["pdf"] = {"asset": identity(path), "pageCount": review["pdf"]["pageCount"]}
             files.append(path)
-        if config.get("cover"):
-            path = same_source(config["cover"], review["cover"])
-            manifest["cover"] = identity(path)
+        if cover:
+            path = same_source(config["cover"], cover)
+            manifest["cover"] = cover
             files.append(path)
         assets = validate_manifest(manifest)
         encoded = json.dumps(manifest, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
@@ -494,6 +644,66 @@ def verify(path):
             "cueRows": sum(len(m.get("cues") or []) for m in manifest["music"])}
 
 
+def extract_manifest(args):
+    with args.package.open("rb") as stream:
+        _, manifest = read_manifest(stream)
+    validate_manifest(manifest)
+    write_json(args.output, manifest)
+
+
+def revise(args):
+    updated = read_json(args.manifest)
+    program, routine, _ = read_identity(updated)
+    require((program, routine) == author_identity(program, routine), "Use canonical project and routine identifiers")
+    require(args.revision > updated["revision"], "Use a higher revision than the package being corrected")
+    updated["revision"] = args.revision
+    reviewed_assets = validate_manifest(updated)
+    for song in updated["music"]:
+        require(not unresolved_repeat_times(song.get("cues") or []),
+                f"Finish structural repeats before submitting {song['section']}")
+    replacing_cover = args.cover is not None or args.without_cover
+    if replacing_cover:
+        if args.cover is not None:
+            updated["cover"] = cover_asset(args.cover)
+        else:
+            updated.pop("cover", None)
+    assets = validate_manifest(updated)
+    encoded = json.dumps(updated, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+    require(0 < len(encoded) <= MAX_MANIFEST and
+            12 + len(encoded) + sum(asset["bytes"] for asset in assets) <= MAX_PACKAGE,
+            "Package exceeds the format size limit")
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    name = f"{program}_{routine}_{args.revision}.ssroutine"
+    output = args.output_dir / name
+    require(not output.exists(), f"Package already exists: {name}")
+    with args.package.open("rb") as source, tempfile.TemporaryDirectory(
+            dir=args.output_dir, prefix=".ssroutine-revision-") as directory:
+        _, old = read_manifest(source)
+        require((program, routine) == (old["program"], old["routine"]) and args.revision > old["revision"],
+                "A revision must retain the package identity and increase its version")
+        old_assets = validate_manifest(old)
+        require(old_assets == reviewed_assets, "Changing media requires building a new package from source")
+        temporary = Path(directory) / name
+        with temporary.open("xb") as stream:
+            os.chmod(temporary, 0o600)
+            stream.write(MAGIC + struct.pack(">I", len(encoded)) + encoded)
+            media_assets = old_assets[:-1] if replacing_cover and old.get("cover") else old_assets
+            for asset in media_assets:
+                consume(source, asset, destination=stream)
+            if replacing_cover and old.get("cover"):
+                consume(source, old["cover"])
+            require(not source.read(1), "Trailing data in the source package")
+            if args.cover is not None:
+                with args.cover.open("rb") as artwork:
+                    consume(artwork, updated["cover"], destination=stream)
+                    require(not artwork.read(1), "Cover changed while packing")
+            stream.flush()
+            os.fsync(stream.fileno())
+        receipt = verify(temporary)
+        os.link(temporary, output)
+    print(json.dumps(receipt, ensure_ascii=False, indent=2))
+
+
 def doctor():
     import numpy
     import pdfplumber
@@ -517,7 +727,13 @@ def main():
     p.add_argument("--revision", default=1, type=int)
     p.add_argument("--credit")
     p.add_argument("--release-date", help="A confirmed release date or quarter, such as 2024Q3")
-    p.add_argument("--cover", type=Path, help="A verified local JPEG or PNG cover")
+    p.add_argument("--cover", type=Path, help="A JPEG or PNG confirmed by the creator")
+    p.add_argument("--output", required=True, type=Path)
+    p = commands.add_parser("select-cover", help="Record the creator's artwork selection in a plan or review")
+    p.add_argument("input", type=Path)
+    choice = p.add_mutually_exclusive_group(required=True)
+    choice.add_argument("--cover", type=Path, help="The confirmed artwork file")
+    choice.add_argument("--without-cover", action="store_true", help="The creator chose to omit artwork")
     p.add_argument("--output", required=True, type=Path)
     p = commands.add_parser("analyze")
     p.add_argument("plan", type=Path)
@@ -530,20 +746,40 @@ def main():
     p.add_argument("--lufs", type=float, default=-16.0)
     p.add_argument("--keep-music", action="store_true")
     p.add_argument("--balance-video", action="store_true")
-    p.add_argument("--video-quality", choices=("original", "ipad", "compact"), default="original")
+    p.add_argument("--video-quality", choices=("efficient", "original", "ipad", "compact"), default="efficient")
     p.add_argument("--video-max-height", type=int, help="Override the selected preset's height limit")
     p.add_argument("--video-bitrate-kbps", type=int, help="Override the selected preset's video bitrate")
-    p.add_argument("--video-codec", choices=("hevc", "h264"), help="HEVC by default for ipad and compact")
+    p.add_argument("--video-codec", choices=("hevc", "h264"), help="HEVC by default for encoded video")
     p = commands.add_parser("verify")
     p.add_argument("package", type=Path)
+    p = commands.add_parser("manifest", help="Extract a private editable copy of a package manifest")
+    p.add_argument("package", type=Path)
+    p.add_argument("--output", required=True, type=Path)
+    p = commands.add_parser("revise", help="Create a higher version using the verified original media bytes")
+    p.add_argument("package", type=Path)
+    p.add_argument("manifest", type=Path)
+    p.add_argument("--revision", required=True, type=int)
+    p.add_argument("--output-dir", required=True, type=Path)
+    cover_options = p.add_mutually_exclusive_group()
+    cover_options.add_argument("--cover", type=Path, help="Use an explicitly approved replacement cover")
+    cover_options.add_argument("--without-cover", action="store_true", help="Remove the previous cover")
+    p = commands.add_parser("submit", help="Create a clean batch with verified packages, QA images and fingerprints")
+    p.add_argument("packages", type=Path, nargs="+")
+    p.add_argument("--output-dir", required=True, type=Path)
+    p.add_argument("--batch-id")
+    p.add_argument("--font", type=Path, help="CJK font for the visual QA cards")
     args = parser.parse_args()
     try:
         if args.command == "doctor":
             doctor()
         elif args.command == "verify":
             print(json.dumps(verify(args.package), ensure_ascii=False, indent=2))
+        elif args.command == "submit":
+            from batch_submission import submit
+            submit(args)
         else:
-            {"plan": plan, "analyze": analyze, "build": package}[args.command](args)
+            {"plan": plan, "select-cover": select_cover, "analyze": analyze, "build": package,
+             "manifest": extract_manifest, "revise": revise}[args.command](args)
     except (ValueError, KeyError, TypeError, OSError, ImportError, subprocess.SubprocessError) as error:
         parser.exit(1, f"{error}\n")
 

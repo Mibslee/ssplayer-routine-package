@@ -54,7 +54,8 @@ def source_files(package, work):
     music_count = len(manifest["music"])
     others = iter(paths[music_count:])
     optional = {key: next(others) for key in ("video", "pdf", "cover") if manifest.get(key)}
-    return manifest, paths[:music_count], optional, full_digest.hexdigest(), hashlib.sha256(encoded).hexdigest()
+    return (manifest, paths[:music_count], optional, after.st_size,
+            full_digest.hexdigest(), hashlib.sha256(encoded).hexdigest())
 
 
 def decoded_window(path, start, seconds):
@@ -107,7 +108,7 @@ def inspect_tracks(manifest, paths, optional):
         try:
             loudness, peak = measure(path)
             duration, _ = probe(path, "audio")
-            measured.update(lufs=loudness, truePeakDBTP=peak, decoded=True,
+            measured.update(lufs=loudness, truePeakDBTP=peak, decoded=True, measuredDuration=duration,
                             durationMatches=abs(duration - song["duration"]) <= 0.25)
         except (ValueError, OSError, subprocess.SubprocessError):
             measured.update(decoded=False)
@@ -129,10 +130,12 @@ class Card:
         self.image = Image.new("RGB", SIZE, BACKGROUND)
         self.draw = ImageDraw.Draw(self.image)
         self.font_path = font_path
-        self.text(48, 36, "SSplayer   /   离线资源包质检", 25, ACCENT)
-        self.text(48, 83, header, 51)
-        self.draw.line((48, 153, 1152, 153), fill=PANEL, width=3)
-        self.text(48, 758, footer, 22, SECONDARY)
+        if header:
+            self.text(48, 36, "SSplayer   /   离线资源包质检", 25, ACCENT)
+            self.text(48, 83, header, 51)
+            self.draw.line((48, 153, 1152, 153), fill=PANEL, width=3)
+        if footer:
+            self.text(48, 758, footer, 22, SECONDARY)
 
     def font(self, size):
         return ImageFont.truetype(self.font_path, size) if self.font_path else ImageFont.load_default(size=size)
@@ -165,8 +168,103 @@ class Card:
 
 
 def clock(seconds):
-    whole = int(seconds)
-    return f"{whole // 60}:{whole % 60:02d}"
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
+
+
+def file_size(size):
+    for unit, scale in (("GB", 1_000_000_000), ("MB", 1_000_000), ("KB", 1_000)):
+        if size >= scale:
+            number = f"{size / scale:.2f}".rstrip("0").rstrip(".")
+            return f"{number} {unit}"
+    return f"{size} B"
+
+
+def subtitle_summary(picture):
+    tracks = picture["subtitleTracks"]
+    markers = [f"{tracks} 条内嵌字幕轨"] if tracks else []
+    if picture["closedCaptions"]:
+        markers.append("检测到闭路字幕")
+    return " · ".join(markers) if markers else "无独立字幕轨 · 画面字幕未核验"
+
+
+def routine_overview(card, title, manifest, files, report):
+    card.text(48, 36, "SSplayer   /   离线资源包质检", 25, ACCENT)
+    card.draw.line((48, 88, 1152, 88), fill=PANEL, width=2)
+    card.draw.rounded_rectangle((48, 117, 428, 551), 18, fill=PANEL)
+    cover_status = "未附封面"
+    if path := files.get("cover"):
+        try:
+            with Image.open(path) as source:
+                expected = "JPEG" if manifest["cover"]["ext"] == "jpg" else "PNG"
+                require(source.format == expected and all(1 <= value <= 8192 for value in source.size),
+                        "Cover content, extension or dimensions do not match the App format")
+                card.media(ImageOps.exif_transpose(source), (60, 129, 356, 410))
+                cover_status = None
+        except (ValueError, OSError, Image.DecompressionBombError):
+            report["blockingIssues"].append("封面无法解码，或图片格式、尺寸不符合 App 要求。")
+            cover_status = "封面需修正"
+    if cover_status:
+        card.draw.text((238, 334), cover_status, font=card.font(32), anchor="mm",
+                       fill=WARNING if "cover" in files else SECONDARY)
+
+    title_width = card.draw.textlength(title, font=card.font(78))
+    title_size = min(78, int(78 * 684 / max(title_width, 1)))
+    card.text(466, 127, title, title_size, limit=686)
+    released = report["releaseDate"]
+    release_label = f"发行 {released.replace('Q', ' Q')}" if released else "发行时间待核对"
+    meta = [release_label, f"包版本 {manifest['revision']}"]
+    picture = report.get("videoInfo")
+    if picture:
+        meta.append("视频 " + clock(picture["duration"]))
+    card.text(466, 214, " · ".join(meta), 27, SECONDARY, limit=686)
+
+    card.draw.rounded_rectangle((466, 271, 845, 392), 17, fill=PANEL)
+    card.text(488, 286, "资源包大小", 24, SECONDARY)
+    card.text(488, 321, file_size(report["bytes"]), 55, limit=335)
+    needs_review = bool(report["blockingIssues"])
+    status_color = WARNING if needs_review else ACCENT
+    status_background = "#3c2e24" if needs_review else "#183833"
+    card.draw.rounded_rectangle((861, 271, 1152, 392), 17, fill=status_background)
+    card.text(885, 286, "离线质检", 24, status_color)
+    card.text(885, 324, "需修正" if needs_review else "通过", 45, status_color)
+
+    if picture:
+        codec = {"hevc": "H.265", "h264": "H.264"}.get(picture["codec"], picture["codec"].upper())
+        video = f"{picture['width']}×{picture['height']} · {codec}"
+        details = f"{file_size(picture['bytes'])} · 平均 {picture['bitrateKbps']:,} kb/s"
+        subtitles = subtitle_summary(picture)
+    else:
+        video = "视频待核对" if "video" in files else "未附视频"
+        details = None
+        subtitles = "待核对" if "video" in files else "不适用"
+    card.text(466, 426, "视频", 26, ACCENT)
+    card.text(561, 421, video, 33, limit=591)
+    if details:
+        card.text(561, 463, details, 25, SECONDARY, limit=591)
+
+    tracks = report["tracks"]
+    music = [f"{len(tracks)} 首"]
+    if all(row["decoded"] for row in tracks):
+        music.append(clock(sum(row["measuredDuration"] for row in tracks)))
+    music.append(file_size(sum(song["asset"]["bytes"] for song in manifest["music"])))
+    original = "未附原谱"
+    if pdf := manifest.get("pdf"):
+        pages = report.get("pdfPageCount")
+        page_label = f"{pages} 页" if pages else "待核对"
+        original = f"{page_label} · {file_size(pdf['asset']['bytes'])}"
+    for y, label, value in ((519, "字幕", subtitles), (585, "音乐", " · ".join(music)),
+                            (651, "原谱", original)):
+        card.draw.line((466, y - 15, 1152, y - 15), fill=PANEL, width=2)
+        card.text(466, y + 2, label, 26, ACCENT)
+        card.text(561, y, value, 28, limit=591)
+
+    card.text(48, 578, "制作者", 23, SECONDARY)
+    card.text(48, 605, report["credit"] or "未署名", 30, limit=380)
+    card.text(48, 650, report["madeAtLabel"], 23, SECONDARY)
+    card.text(48, 676, report["madeAt"][:19].replace("T", " "), 28, limit=380)
+    card.draw.line((48, 729, 1152, 729), fill=PANEL, width=2)
 
 
 def opening_preview(path, page):
@@ -197,33 +295,13 @@ def screenshot_cards(manifest, files, report, font_path):
     def card(number, title):
         return Card(title, f"{number:02d} / 09     {art}     SHA-256 {marker}", font_path)
 
-    cover = card(1, art)
-    if "cover" in files:
-        try:
-            with Image.open(files["cover"]) as source:
-                expected = "JPEG" if manifest["cover"]["ext"] == "jpg" else "PNG"
-                require(source.format == expected and all(1 <= value <= 8192 for value in source.size),
-                        "Cover content, extension or dimensions do not match the App format")
-                cover.media(source, (676, 181, 466, 500))
-        except (ValueError, OSError, Image.DecompressionBombError):
-            issues.append("封面无法解码，或图片格式、尺寸不符合 App 要求。")
-            cover.text(720, 262, "封面需修正", 32, WARNING)
-    for i, (label, value) in enumerate([
-        ("制作者", report["credit"] or "未署名"), ("项目", manifest["program"]),
-        ("套路号", manifest["routine"]), ("版本号", manifest["revision"]),
-        ("发行时间", manifest.get("releaseDate", "未核对")),
-        (report["madeAtLabel"], report["madeAt"][:19].replace("T", " ")),
-    ]):
-        cover.text(48, 187 + 80 * i, label, 23, ACCENT)
-        cover.text(48, 216 + 80 * i, value, 34, limit=595)
-    yield "01-identity.png", cover.image
-
     counts = card(2, "包内资料")
     picture = report.get("videoInfo")
+    pages = report.get("pdfPageCount")
     video_format = (f"{picture['width']}×{picture['height']} · {picture['codec'].upper()} · {picture['bitrateKbps']:,} kb/s"
                     if picture else "待核对" if "video" in files else "缺失")
     counts.rows([("音乐", f"{len(tracks)} 首"), ("视频", video_format),
-                 ("原谱", f"{manifest['pdf']['pageCount']} 页" if "pdf" in files else "缺失"),
+                 ("原谱", f"{pages} 页" if pages else "待核对" if "pdf" in files else "缺失"),
                  ("封面", "已包含" if "cover" in files else "App 会用占位图"),
                  ("视频定位", f"{len(chapter_set)} 个 · 实测吻合 {measured} 个"),
                  ("原谱入口", f"{len(with_pages)} 个物理页入口"), ("动作", f"{with_cues} 条"),
@@ -267,15 +345,24 @@ def screenshot_cards(manifest, files, report, font_path):
 
     cues = card(6, "动作时间线")
     if cue_tracks:
-        song = max(cue_tracks, key=lambda entry: len(entry["cues"]))
-        cues.rows([(f"{song['section']}  {clock(cue['time'])}", cue["action"]) for cue in song["cues"]])
+        song = max(cue_tracks, key=lambda entry: (sum("block" in row for row in entry["cues"]), len(entry["cues"])))
+        rows = song["cues"]
+        first = max((index for index, row in enumerate(rows) if row.get("block") is not None), default=0)
+        lines = []
+        for row in rows[first:]:
+            label = f"{song['section']}  {clock(row['time'])}"
+            details = [f"Block {row['block']}" if row.get("block") is not None else None,
+                       row.get("counts"), row["action"]]
+            lines.append((label, " · ".join(value for value in details if value)))
+        cues.rows(lines)
+        cues.text(48, 722, f"包内已写入 {len(cue_tracks)} 首、{sum(len(item['cues']) for item in cue_tracks)} 个动作点", 22, SECONDARY)
     else:
         cues.rows([("原谱入口", f"{len(with_pages)} 处"), ("动作时钟", "本包未提交可跳转动作点"),
                    ("阅读方式", "打开该小节的原谱，查看原始动作和持续时长")])
     yield "06-action-timeline.png", cues.image
 
     pdf = card(7, "原谱打开页")
-    if "pdf" in files:
+    if pages:
         selection = []
         for index in (0, len(with_pages) // 2, len(with_pages) - 1):
             if with_pages and with_pages[index] not in selection:
@@ -283,15 +370,15 @@ def screenshot_cards(manifest, files, report, font_path):
         if not selection:
             selection = [{"section": "原谱", "pdfPage": 1}]
         try:
-            with pypdfium2.PdfDocument(files["pdf"]) as document:
-                require(len(document) == manifest["pdf"]["pageCount"], "Original PDF page count does not match")
             for index, row in enumerate(selection):
                 x = 48 + index * 365
                 pdf.media(opening_preview(files["pdf"], row["pdfPage"]), (x, 184, 342, 480))
                 pdf.text(x, 679, f"{row['section']}    物理页 {row['pdfPage']}", 25, limit=340)
         except (ValueError, OSError, pypdfium2.PdfiumError):
-            issues.append("原谱无法打开、页数不符，或抽查页无法渲染。")
+            issues.append("原谱抽查页无法渲染。")
             pdf.text(48, 185, "原谱需修正", 32, WARNING)
+    elif "pdf" in files:
+        pdf.text(48, 185, "原谱需修正", 32, WARNING)
     else:
         pdf.text(48, 185, "包中没有原谱")
     yield "07-source-pdf.png", pdf.image
@@ -300,6 +387,11 @@ def screenshot_cards(manifest, files, report, font_path):
     volume.rows([(row["section"], f"{row['lufs']:.2f} LUFS    {row['truePeakDBTP']:.2f} dBTP"
                   if row["decoded"] else "解码或测量需复核") for row in tracks])
     yield "08-loudness.png", volume.image
+
+    # Video frames and PDF previews can add issues during rendering.
+    overview = Card(None, f"01 / 09     {art}     SHA-256 {marker}", font_path)
+    routine_overview(overview, art, manifest, files, report)
+    yield "01-identity.png", overview.image
 
     gaps = card(9, "复核清单")
     track_notes = [(row["section"], " / ".join([reason for condition, reason in [
@@ -319,7 +411,7 @@ def generate(args):
     with tempfile.TemporaryDirectory(prefix="ssroutine-qa-") as staging, \
          tempfile.TemporaryDirectory(dir=root, prefix=".ssroutine-report-") as report_staging:
         work = Path(staging)
-        manifest, audio, optional, full_sha, manifest_sha = source_files(args.package, work)
+        manifest, audio, optional, package_bytes, full_sha, manifest_sha = source_files(args.package, work)
         name = f"{manifest['program']}_{manifest['routine']}_{manifest['revision']}.qa"
         destination = root / name
         require(not destination.exists(), f"Evidence directory already exists: {name}")
@@ -332,7 +424,7 @@ def generate(args):
                   "routine": manifest["routine"], "revision": manifest["revision"], "credit": credit,
                   "releaseDate": manifest.get("releaseDate"), "madeAt": date.isoformat(timespec="seconds"),
                   "madeAtLabel": "制作时间" if args.made_at else "质检时间",
-                  "bytes": args.package.stat().st_size, "sha256": full_sha, "manifestSHA256": manifest_sha,
+                  "bytes": package_bytes, "sha256": full_sha, "manifestSHA256": manifest_sha,
                   "sectionGaps": sorted(set(range(1, max(sections) + 1)) - sections),
                   "appImportVerified": False, "tracks": inspect_tracks(manifest, audio, optional),
                   "blockingIssues": []}
@@ -352,10 +444,18 @@ def generate(args):
                         "Video duration does not match")
             except (ValueError, OSError):
                 issues.append("视频流无法读取，或实际视频时长与清单不符。")
+        if "pdf" in optional:
+            try:
+                with pypdfium2.PdfDocument(optional["pdf"]) as document:
+                    require(len(document) == manifest["pdf"]["pageCount"], "Original PDF page count does not match")
+                    report["pdfPageCount"] = len(document)
+            except (ValueError, OSError, pypdfium2.PdfiumError):
+                issues.append("原谱无法打开，或实际页数与清单不符。")
         output = Path(report_staging) / "evidence"
         output.mkdir()
         contact = Image.new("RGB", (1832, 1250), BACKGROUND)
-        for index, (file, frame) in enumerate(screenshot_cards(manifest, optional, report, font_path)):
+        for file, frame in screenshot_cards(manifest, optional, report, font_path):
+            index = int(file[:2]) - 1
             frame.save(output / file)
             contact.paste(ImageOps.contain(frame, (596, 403), Image.Resampling.LANCZOS),
                           (14 + (index % 3) * 605, 14 + (index // 3) * 407))

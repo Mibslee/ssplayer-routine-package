@@ -59,6 +59,8 @@ def track_panel(track, song, has_video):
     rows = [("音乐时长", clock(track["duration"])),
             ("原谱入口", f"第 {track['pdfPage']} 个物理页" if track["pdfPage"] else "无指定页"),
             ("动作提示", f"{track['cueRows']} 条")]
+    if function := track.get("sectionFunction"):
+        rows.append(("小节功能", f"{function['name']} · 原谱第 {function['page']} 页"))
     if chapter := track["chapter"]:
         rows.append(("视频位置", f"{clock(chapter['start'])}–{clock(chapter['end'])}"))
     if track["windows"]:

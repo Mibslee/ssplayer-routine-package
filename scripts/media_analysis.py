@@ -578,25 +578,70 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
     return []
 
 
+def pdf_recording_variant(variant):
+    return {"alternate": "alternative", "45-minute": "combo45"}.get(variant, variant)
+
+
+def section_heading(words, width, alignment, parsed):
+    """Read the numbered function title on a choreography table page."""
+    if parsed is None and not alignment._has_cue_table_header(width, words):
+        return None
+    if alignment._has_modern_technique_and_coaching_heading(words):
+        return None
+    headings = []
+    for line in row_lines(word for word in words if 85 <= word["top"] <= 125):
+        numbered = [(index, match) for index, word in enumerate(line)
+                    if (match := alignment.PDF_TRACK_RE.fullmatch(word["text"])
+                        or alignment.PDF_INLINE_TRACK_RE.fullmatch(word["text"]))]
+        if len(numbered) != 1:
+            continue  # A combined 04A / 04B title needs manual review.
+        index, number = numbered[0]
+        if line[index]["x0"] >= width * 0.25:
+            continue
+        inline = number.groupdict().get("label")
+        title_words = ([inline] if inline else []) + [word["text"] for word in line[index + 1:]]
+        title = " ".join(" ".join(title_words).split())
+        if not title or not any(character.isalpha() for character in title) or re.search(r"\b\d{1,2}:\d{2}", title):
+            continue
+        headings.append((number, title))
+    if len(headings) != 1:
+        return None
+    number, title = headings[0]
+    variant, source = alignment._classify_pdf_variant_with_source(words, width)
+    if source == "structured" and variant == "alternate":
+        title = title.split(" - ", 1)[0]
+    title = re.sub(r"^(?:ALT\.?|ALTERNATE|BONUS|45[-–]MIN(?:UTE)?)[ :–-]+", "", title, flags=re.I)
+    title = re.sub(r"\s+(?:\(?CONTINUED\)?|\(?CONT\.\)?)$", "", title, flags=re.I)
+    title = re.sub(r"\s+\((?:ALT|ALTERNATE|BONUS)\)$", "", title, flags=re.I)
+    if not title or len(title) > 68 or len(title.encode("utf-8")) > 240:
+        return None
+    return (int(number["number"]), (number["segment"] or "").upper(), pdf_recording_variant(variant)), title
+
+
 def extract_cues(path, songs, ocr=False):
     import pdfplumber
     alignment = alignment_module()
     with pdfplumber.open(path) as pdf:
         words = {}
         found = []
+        headings = {}
         for index, page in enumerate(pdf.pages, 1):
             positioned = page.extract_words()
             if not positioned and ocr:
                 positioned = ocr_words(path, index, page.width)
             words[index] = positioned
-            if parsed := alignment.parse_cue_page_words(index, page.width, positioned):
+            parsed = alignment.parse_cue_page_words(index, page.width, positioned)
+            if parsed:
                 found.append(parsed)
+            if heading := section_heading(positioned, page.width, alignment, parsed):
+                headings[index] = heading
         timelines, warnings = alignment._build_pdf_timelines(found)
         result = []
         for song in songs:
             section = re.fullmatch(r"T(\d+)([A-Z]?)", song["section"])
-            candidates = [t for t in timelines if t.track_number == int(section[1])
-                          and (t.segment or "") == section[2] and t.variant == song["variant"]]
+            recording = int(section[1]), section[2], song["variant"]
+            candidates = [t for t in timelines if
+                          (t.track_number, t.segment or "", pdf_recording_variant(t.variant)) == recording]
             pages = song.get("pdfPages", candidates[0].pages if len(candidates) == 1 else [])
             rows = []
             definitions = {}
@@ -612,4 +657,12 @@ def extract_cues(path, songs, ocr=False):
                 status = "needsExpansion" if repeats else "review"
             result.append({"rows": rows, "pages": list(pages), "approved": False,
                            "status": status, "structuralRepeatTimes": repeats})
+            selected = set(song.get("pdfPages") or ())
+            if song.get("pdfPage"):
+                selected.add(song["pdfPage"])
+            proposed = [(page, title) for page, (identity, title) in headings.items()
+                        if identity == recording and (not selected or page in selected)]
+            if proposed and len({unicodedata.normalize("NFKC", title).casefold() for _, title in proposed}) == 1:
+                page, title = proposed[0]
+                result[-1]["sectionFunction"] = {"name": title, "page": page, "approved": False}
         return len(pdf.pages), result, warnings

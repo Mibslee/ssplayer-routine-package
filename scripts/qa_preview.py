@@ -37,7 +37,7 @@ STYLES = {
     "failed": ("需修正", "#ffa5a8", "#412730"),
 }
 CHECK_LABELS = {"contents": "包内资料", "audio": "音乐", "video": "视频定位", "subtitles": "字幕",
-                "timeline": "动作时间线", "pdf": "原版波形图"}
+                "timeline": "动作时间线", "pdf": "原版波形图", "structure": "小节功能"}
 TIMING_STATES = {"measured": "音画复测吻合", "review": "音画对位需复核", "unlocated": "未指定小节定位",
                  "approximate": "近似定位", "visuallyConfirmed": "按画面定位"}
 FONT_PATHS = [
@@ -119,7 +119,7 @@ def inspect_tracks(manifest, paths, optional):
         return {"section": song["section"], "variant": song["variant"], "title": song.get("title"),
                 "duration": song["duration"], "pdfPage": song.get("pdfPage")
                 or (song["cues"][0]["page"] if rows else None), "cueRows": rows,
-                "chapter": chapter, **measured, **timing}
+                "sectionFunction": song.get("sectionFunction"), "chapter": chapter, **measured, **timing}
 
     return map_recordings(inspect, zip(manifest["music"], paths))
 
@@ -465,16 +465,24 @@ def screenshot_cards(manifest, files, report, font_path):
                  ("原谱", f"{pages} 页" if pages else "待核对" if "pdf" in files else "未附原谱"),
                  ("封面", "已包含" if "cover" in files else "App 会用占位图"),
                  ("视频定位", f"{len(chapter_set)} 个 · 实测吻合 {measured} 个"),
-                 ("原谱入口", f"{len(with_pages)} 个物理页入口"), ("动作", f"{with_cues} 条"),
+                 ("原谱入口", f"{len(with_pages)} 个物理页入口"),
+                 ("小节功能", f"{sum(bool(row['sectionFunction']) for row in tracks)} / {len(tracks)} 首已有定义"),
+                 ("动作", f"{with_cues} 条"),
                  ("完整性", f"{report['bytes']:,} 字节 · 所有载荷 SHA-256 已核对")])
     decorate(counts, 85, "contents", "subtitles")
     yield "02-inventory.png", counts.image
 
     names = {"standard": "正曲", "alternative": "替换", "bonus": "加曲"}
-    music = card(3, "曲目、替换与分段")
-    music.rows([(f"{row['section']}  {names.get(row['variant'], row['variant'])}",
-                 f"{clock(row['duration'])}   {row['title'] or row['section']}") for row in tracks])
-    decorate(music, 85, "audio")
+    music = card(3, "曲目与小节功能")
+    music_rows = []
+    for row in tracks:
+        label = f"{row['section']}  {names.get(row['variant'], row['variant'])}"
+        detail = f"{clock(row['duration'])}   {row['title'] or row['section']}"
+        if function := row["sectionFunction"]:
+            detail = f"{function['name']} · 第 {function['page']} 页 · {detail}"
+        music_rows.append((label, detail))
+    music.rows(music_rows)
+    decorate(music, 85, "audio", "structure")
     yield "03-track-list.png", music.image
 
     video_pair, timeline_pair = select_preview_tracks(manifest["music"], tracks)
@@ -555,6 +563,11 @@ def generate(args, *, sealed_copy=None, overview_only=False):
         missing_chapters = [track for track in tracks if not track["chapter"]]
         uncertain_chapters = [track for track in tracks if track["status"] in {"approximate", "visuallyConfirmed"}]
         missing_cues = [track for track in tracks if not track["cueRows"]]
+        missing_functions = [track for track in tracks if not track["sectionFunction"]]
+        if missing_functions:
+            detail = ("本包未提供可核实的小节功能。" if len(missing_functions) == len(tracks)
+                      else f"{sections_for(missing_functions)} 未提供可核实的小节功能。")
+            add_condition(report, "structure", detail)
         if "video" not in optional:
             add_condition(report, "video", "本包未附视频。音乐可以播放和排课。")
         elif missing_chapters:

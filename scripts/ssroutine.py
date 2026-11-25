@@ -425,6 +425,8 @@ def analyze(args):
         page_count, cues, warnings = extract_cues(pdf, audio, ocr=args.ocr)
         review.update(pdf={"source": identity(pdf), "pageCount": page_count}, pdfWarnings=warnings)
         for record, rows in zip(review["tracks"], cues):
+            if function := rows.pop("sectionFunction", None):
+                record["sectionFunction"] = function
             record["cues"] = rows
     if config.get("video"):
         video = Path(config["video"]).resolve(strict=True)
@@ -448,6 +450,7 @@ def analyze(args):
                       "audioMatched": sum(bool((x.get("chapter") or {}).get("approved")) for x in review["tracks"]),
                       "chaptersProposed": sum(bool(x.get("chapter")) for x in review["tracks"]),
                       "cueRowsProposed": sum(len(x.get("cues", {}).get("rows", [])) for x in review["tracks"]),
+                      "sectionFunctionsProposed": sum("sectionFunction" in record for record in review["tracks"]),
                       "seconds": round(perf_counter() - started, 2)}))
 
 
@@ -507,6 +510,26 @@ def validate_confirmation(value):
                 "Confirm project and routine names and the credit choice with confirm-plan before analysis or build.")
     else:
         validate_display_metadata(value)  # Existing review files remain usable.
+
+
+def validate_section_function(function, pdf, section):
+    require(isinstance(function, dict) and set(function) == {"name", "page"},
+            f"Invalid section function for {section}")
+    name, page = function["name"], function["page"]
+    require(valid_text(name, 240, single_line=True) and 0 < len(name) <= 68 and name.strip() == name
+            and not any(unicodedata.category(character) in {"Zl", "Zp"} for character in name),
+            f"Use the printed single-line section function for {section}.")
+    require(pdf and type(page) is int and 1 <= page <= pdf["pageCount"],
+            f"Section function for {section} requires a physical page in the source PDF.")
+
+
+def approved_section_function(song, findings, pdf):
+    function = findings.get("sectionFunction")
+    if not isinstance(function, dict) or function.get("approved") is not True:
+        return None
+    value = {key: function[key] for key in ("name", "page") if key in function}
+    validate_section_function(value, pdf, song["section"])
+    return value
 
 
 def validate_slots(program, songs):
@@ -575,6 +598,8 @@ def validate_manifest(value):
         if (page := item.get("pdfPage")) is not None:
             require(pdf and type(page) is int and 1 <= page <= pdf["pageCount"],
                     f"Invalid original PDF opening page for {item['section']}")
+        if (function := item.get("sectionFunction")) is not None:
+            validate_section_function(function, pdf, item["section"])
         rows = item.get("cues")
         require(rows is None or (pdf and isinstance(rows, list) and 1 <= len(rows) <= 4096),
                 "Cues require a bounded source PDF")
@@ -622,6 +647,9 @@ def package(args):
         require(findings.get("selection", source_selection(song)) == source_selection(song),
                 f"Section, variant, catalogue slot or cue pages changed for {song['section']}. Run analyze again.")
     timelines = [approved_timeline(song, findings) for song, findings in zip(config["music"], review["tracks"])]
+    source_pdf = review.get("pdf") if config.get("pdf") else None
+    functions = [approved_section_function(song, findings, source_pdf)
+                 for song, findings in zip(config["music"], review["tracks"])]
     cover = selected_cover(config)
     if cover:
         require(review.get("cover") == cover, "Review no longer matches the confirmed cover image.")
@@ -649,7 +677,7 @@ def package(args):
         print(f"{name} · 检查与处理 {len(timelines)} 首音乐", file=sys.stderr, flush=True)
 
         def prepare_audio(item):
-            index, (song, findings, timeline) = item
+            index, (song, findings, timeline, function) = item
             path = same_source(song["file"], findings["source"])
             levels = None
             if not args.keep_music:
@@ -663,9 +691,12 @@ def package(args):
                     row["chapter"]["end"] = round(chapter["start"] + duration, 6)
             if timeline:
                 row["cues"] = timeline
+            if function:
+                row["sectionFunction"] = function
             return path, row, levels
 
-        for path, song, levels in map_recordings(prepare_audio, enumerate(zip(config["music"], review["tracks"], timelines))):
+        tracks = zip(config["music"], review["tracks"], timelines, functions)
+        for path, song, levels in map_recordings(prepare_audio, enumerate(tracks)):
             files.append(path)
             manifest["music"].append(song)
             if levels is not None:

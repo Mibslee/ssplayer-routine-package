@@ -6,7 +6,7 @@
 
 用能访问素材目录和输出目录的桌面或命令行 Agent。先确认当前 Agent 的终端能运行 Python 3.10 或更新版本、FFmpeg 和 ffprobe。新装工具后重开终端，检查 PATH。[FFmpeg 下载](https://ffmpeg.org/download.html)
 
-macOS 可通过 Homebrew 安装 FFmpeg。需要识别无文本层的 PDF 时，再装可选的 Poppler 和 Tesseract。
+macOS 可通过 Homebrew 安装 FFmpeg。可安装 Tesseract 做画面字幕抽查。识别无文本层的 PDF 时，再装 Poppler。
 
     brew install ffmpeg
     brew install poppler tesseract
@@ -107,6 +107,12 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 - `06-action-timeline.png` 展示实际动作、拍数、重复次数和高亮行。原谱有 Level 色条时随动作显示。整段重复只在 Block 标题标一次，展开后的动作照常显示。
 - `07-source-pdf.png` 优先打开所展示动作的原谱页，保留实际 PDF 页码。缺少动作时会提示可核对的原谱入口。
 
-严格质检会标出无法解码的音乐、清单时长与实物差异、声称已同步却复测失败的定位，以及原谱有可提取的动作表但包里漏写了时间线的曲目。单独运行离线预览会留下可读报告并以状态码 2 结束。未提供的可选素材会列为复核项。
+严格质检会阻止损坏或无法解码的文件、时长不符、声称贴合音乐却复测失败的定位。单独运行离线预览会保留报告并以状态码 2 结束。跳过未证实的位置，包内可用资料可以继续交付。
+
+### 字幕与条件通过
+
+- 首图核对成品有无独立字幕轨或闭路字幕，并抽查 24 帧。工具用已安装的 Tesseract 语言包查画面下方。需要中文识别时可安装简体中文语言包。抽样未检出会标明帧数。字幕可能出现在抽样时刻之外。
+- 引擎不可用或有疑似字幕时，打开独立质检生成的 `subtitle-samples.jpg` 实际查看。只在核对过这份成品的画面后，用 `qa_preview.py --screen-subtitles present` 或 `--screen-subtitles absent` 重绘。如需单套提交，在 `ssroutine.py submit` 复用同一参数。
+- 正常通过的栏目带绿色勾。缺视频、原谱、动作时间线或个别可靠定位时，质检图标明「条件通过」、具体受影响小节和可用资料。创作者已有明确理由时，可在 `plan` 使用 `--video-note`、`--timeline-note`，或在计划的 `qualityNotes` 写下说明。
 
 在本机用总览和可视报告核对曲目和对位，有 Pro 时再验证 App 导入和排课。报告 HTML 内嵌总览，可以单独打开。上传时使用 `submit` 整理过的批次目录，确需补充远程排查证据时再通过约定渠道提供。

@@ -5,6 +5,8 @@ from html import escape
 from io import BytesIO
 from PIL import Image
 
+from subtitle_check import subtitle_summary
+
 CSS = """
 :root{color-scheme:light;--page:#eef1f5;--ink:#152338;--muted:#526178;--line:#dce3eb;
 --paper:#fff;--primary:#19604c;--warn:#884006}
@@ -88,6 +90,8 @@ def write_html(folder, manifest, report):
     tracks = report["tracks"]
     panels = [track_panel(track, song, bool(manifest.get("video"))) for track, song in zip(tracks, manifest["music"])]
     alerts = "".join(f'<p class="note">{show(issue)}</p>' for issue in report["blockingIssues"])
+    alerts += "".join(f'<p class="note">条件通过 · {show(reason)}</p>'
+                      for check in report["checks"].values() for reason in check["conditions"])
     alerts += "".join(f'<p class="note">编号间隔 T{number} · 请对照原谱确认。</p>' for number in report["sectionGaps"])
     alerts += "".join(panel for problem, panel in panels if problem)
     alerts = alerts or '<p class="muted">当前测量没有触发复核项。</p>'
@@ -102,13 +106,23 @@ def write_html(folder, manifest, report):
                      card("原谱入口", sum(bool(track["pdfPage"]) for track in tracks)),
                      card("包内动作时间线", f"{sum(track['cueRows'] > 0 for track in tracks)}/{len(tracks)} 首")])
     picture = report.get("videoInfo")
+    subtitle_panel = ""
     if picture:
         video = f"{picture['width']}×{picture['height']} · {picture['codec'].upper()} · {picture['bitrateKbps']:,} kb/s"
         stats += card(f"视频 · {picture['bytes'] / (1024 * 1024):,.0f} MiB", video)
+        track_subtitles, screen_subtitles = subtitle_summary(picture, report["screenSubtitles"])
+        samples = folder / "subtitle-samples.jpg"
+        sample_image = ""
+        if samples.is_file():
+            encoded = b64encode(samples.read_bytes()).decode("ascii")
+            sample_image = f'<details><summary>查看有取样时间的画面</summary><img alt="字幕采样帧" src="data:image/jpeg;base64,{encoded}"></details>'
+        subtitle_panel = (f'<section class="panel"><h2>字幕</h2><p>{show(track_subtitles)}</p>'
+                          f'<p>{show(screen_subtitles)}</p>{sample_image}</section>')
     meta = " · ".join([report["credit"] or "未署名", f"版本 {report['revision']}",
                        report["releaseDate"] or "发行时间待核对",
                        f"{report['madeAtLabel']} {report['madeAt'][:19].replace('T', ' ')}"])
-    verification = "离线媒体核验通过" if report["offlineMediaPassed"] else "发现需修正的问题"
+    verification = {"passed": "离线媒体核验通过", "conditional": "离线媒体条件通过",
+                    "failed": "发现需修正的问题"}[report["qaStatus"]]
     html = f"""<!doctype html>
 <html lang="zh-Hans"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{show(identity)} · SSplayer 资源包质检</title><style>{CSS}</style>
@@ -116,6 +130,7 @@ def write_html(folder, manifest, report):
 <header><div class="kicker">SSplayer · 离线资源包质检</div><h1>{show(identity)}</h1>
 <p>{show(meta)}</p><div class="stats">{stats}</div><p style="margin-top:12px">{verification}</p></header>
 <section class="panel"><h2>九宫格总览</h2><img alt="九宫格质检图" src="data:image/jpeg;base64,{image}"></section>
+{subtitle_panel}
 <section class="panel"><h2>先核对这些项目</h2>{alerts}</section>
 <section class="panel"><h2>其他曲目</h2>{normal or '<p class="muted">曲目都已列在复核区。</p>'}</section>
 <footer><p>本页使用包内文件进行离线检查。App 导入、播放和排课结果由实际安装验收确认。</p>

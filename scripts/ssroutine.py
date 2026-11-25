@@ -249,6 +249,11 @@ def plan(args):
         value["credit"] = args.credit
     if args.release_date:
         value["releaseDate"] = args.release_date
+    note_fields = (("video", "video_note"), ("timeline", "timeline_note"))
+    notes = {name: note.strip() for name, field in note_fields if (note := getattr(args, field, None))}
+    if notes:
+        validate_quality_notes(notes)
+        value["qualityNotes"] = notes
     read_identity(value)
     recognized = {}
     assets = {"video": [], "pdf": []}
@@ -438,6 +443,12 @@ def validate_slots(program, songs):
             recordings.add(sha)
 
 
+def validate_quality_notes(notes):
+    require(isinstance(notes, dict) and set(notes) <= {"video", "timeline"}
+            and all(isinstance(text, str) and text.strip() and valid_text(text, 256, single_line=True)
+                    for text in notes.values()), "Invalid quality note")
+
+
 def validate_manifest(value):
     program, _, _ = read_identity(value)
     songs = value["music"]
@@ -445,6 +456,8 @@ def validate_manifest(value):
             and isinstance(songs, list) and 1 <= len(songs) <= 128, "Unsupported package manifest")
     if (credit := value.get("credit")) is not None:
         require(credit and valid_text(credit, 128, single_line=True), "Invalid contributor credit")
+    if "qualityNotes" in value:
+        validate_quality_notes(value["qualityNotes"])
     validate_slots(program, songs)
     video, pdf, cover = (value.get(k) for k in ("video", "pdf", "cover"))
     assets = [item["asset"] for item in songs]
@@ -539,7 +552,7 @@ def package(args):
     with tempfile.TemporaryDirectory(dir=destination, prefix=".ssroutine-") as directory:
         work = Path(directory)
         manifest = {"schemaVersion": 1, "program": program, "routine": routine, "revision": revision, "music": []}
-        for key in ("credit", "releaseDate"):
+        for key in ("credit", "releaseDate", "qualityNotes"):
             if key in config:
                 manifest[key] = config[key]
         files = []
@@ -759,7 +772,8 @@ def doctor():
     alignment_module()
     print(json.dumps({"python": sys.version.split()[0], "numpy": numpy.__version__,
                       "pdfplumber": pdfplumber.__version__,
-                      "ocr": all(shutil.which(name) for name in ("pdftoppm", "tesseract"))}))
+                      "ocr": all(shutil.which(name) for name in ("pdftoppm", "tesseract")),
+                      "screenSubtitleOCR": bool(shutil.which("tesseract"))}))
 
 
 def add_media_options(command):
@@ -808,6 +822,8 @@ def main():
     p.add_argument("--revision", default=1, type=int)
     p.add_argument("--credit")
     p.add_argument("--release-date", help="A confirmed release date or quarter, such as 2024Q3")
+    p.add_argument("--video-note", help="Known reason for intentionally missing or unlocated video")
+    p.add_argument("--timeline-note", help="Known reason for an omitted action timeline")
     p.add_argument("--cover", type=Path, help="A JPEG or PNG confirmed by the creator")
     p.add_argument("--output", required=True, type=Path)
     p = commands.add_parser("select-cover", help="Record the creator's artwork selection in a plan or review")
@@ -849,6 +865,8 @@ def main():
     p.add_argument("--output-dir", required=True, type=Path)
     p.add_argument("--batch-id")
     p.add_argument("--font", type=Path, help="CJK font for the visual QA cards")
+    p.add_argument("--screen-subtitles", choices=("present", "absent"),
+                   help="Visual judgment after examining the samples of a single exact package")
     args = parser.parse_args()
     try:
         if args.command == "doctor":

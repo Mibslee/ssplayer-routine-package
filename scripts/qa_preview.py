@@ -7,7 +7,6 @@ import argparse
 from contextlib import ExitStack
 from datetime import datetime
 import hashlib
-from io import BytesIO
 import json
 from pathlib import Path
 import subprocess
@@ -18,11 +17,12 @@ import pypdfium2
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from media_analysis import (SAMPLE_POSITIONS, alignment_module, extract_cues, map_recordings, measure,
-                            probe, run, timing_windows, video_info)
+                            probe, timing_windows, video_info)
 from qa_phone import (PhonePreview, clock, score_metadata, section_title, select_preview_tracks,
                       timeline_sample, video_position, wrapped_lines)
 from report_html import write_html
 from ssroutine import MAGIC, MAX_PACKAGE, consume, container_digest, read_manifest, require, validate_manifest
+from subtitle_check import inspect_screen_subtitles, read_frame, subtitle_summary
 
 SIZE = (1200, 810)
 BACKGROUND = "#0b1521"
@@ -31,6 +31,13 @@ PRIMARY = "#f4f6fb"
 SECONDARY = "#b6c5d5"
 ACCENT = "#75efc0"
 WARNING = "#ffcc93"
+STYLES = {
+    "passed": ("通过", ACCENT, "#183833"),
+    "conditional": ("条件通过", WARNING, "#3c2e24"),
+    "failed": ("需修正", "#ffa5a8", "#412730"),
+}
+CHECK_LABELS = {"contents": "包内资料", "audio": "音乐", "video": "视频定位", "subtitles": "字幕",
+                "timeline": "动作时间线", "pdf": "原版波形图"}
 TIMING_STATES = {"measured": "音画复测吻合", "review": "音画对位需复核", "unlocated": "未指定小节定位",
                  "approximate": "近似定位", "visuallyConfirmed": "按画面定位"}
 FONT_PATHS = [
@@ -39,6 +46,28 @@ FONT_PATHS = [
     "C:/Windows/Fonts/msyh.ttc",
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
 ]
+
+
+def add_issue(report, check, detail):
+    report["checks"][check]["issues"].append(detail)
+    report["blockingIssues"].append(detail)
+
+
+def add_condition(report, check, detail):
+    report["checks"][check]["conditions"].append(detail)
+
+
+def check_state(report, *keys):
+    checks = [report["checks"][key] for key in keys] if keys else report["checks"].values()
+    if any(check["issues"] for check in checks):
+        return "failed"
+    if any(check["conditions"] for check in checks):
+        return "conditional"
+    return "passed"
+
+
+def sections_for(tracks):
+    return "、".join(dict.fromkeys(section_title(track) for track in tracks))
 
 
 def source_files(package, work, sealed_copy=None):
@@ -117,6 +146,23 @@ class Card:
             value = value[:-2].rstrip() + "…"
         self.draw.text((x, y), value, font=font, fill=color)
 
+    def status(self, state, y, x=None, marker_only=False):
+        name, color, background = STYLES[state]
+        width = 58 if marker_only else int(self.draw.textlength(name, font=self.font(24))) + 62
+        x = 1152 - width if x is None else x
+        self.draw.rounded_rectangle((x, y, x + width, y + 43), 10, fill=background)
+        left, top = x + 15, y + 10
+        if state == "passed":
+            self.draw.line(((left, top + 12), (left + 7, top + 19), (left + 21, top + 4)), fill=color, width=4)
+        elif state == "conditional":
+            self.draw.line(((left + 10, top + 2), (left + 10, top + 12)), fill=color, width=4)
+            self.draw.ellipse((left + 8, top + 16, left + 12, top + 20), fill=color)
+        else:
+            self.draw.line(((left + 3, top + 4), (left + 19, top + 20)), fill=color, width=4)
+            self.draw.line(((left + 19, top + 4), (left + 3, top + 20)), fill=color, width=4)
+        if not marker_only:
+            self.text(x + 43, y + 7, name, 24, color)
+
     def rows(self, values):
         columns = 2 if len(values) > 10 else 1
         width = 520 if columns == 2 else 1070
@@ -145,14 +191,6 @@ def file_size(size):
     return f"{size} B"
 
 
-def subtitle_summary(picture):
-    tracks = picture["subtitleTracks"]
-    markers = [f"{tracks} 条内嵌字幕轨"] if tracks else []
-    if picture["closedCaptions"]:
-        markers.append("检测到闭路字幕")
-    return " · ".join(markers) if markers else "无独立字幕轨 · 画面字幕未核验"
-
-
 def routine_overview(card, title, manifest, files, report):
     card.text(48, 36, "SSplayer   /   离线资源包质检", 25, ACCENT)
     card.draw.line((48, 88, 1152, 88), fill=PANEL, width=2)
@@ -167,7 +205,7 @@ def routine_overview(card, title, manifest, files, report):
                 card.media(ImageOps.exif_transpose(source), (60, 129, 356, 410))
                 cover_status = None
         except (ValueError, OSError, Image.DecompressionBombError):
-            report["blockingIssues"].append("封面无法解码，或图片格式、尺寸不符合 App 要求。")
+            add_issue(report, "contents", "封面无法解码，或图片格式、尺寸不符合 App 要求。")
             cover_status = "封面需修正"
     if cover_status:
         card.draw.text((238, 334), cover_status, font=card.font(32), anchor="mm",
@@ -187,22 +225,23 @@ def routine_overview(card, title, manifest, files, report):
     card.draw.rounded_rectangle((466, 271, 845, 392), 17, fill=PANEL)
     card.text(488, 286, "资源包大小", 24, SECONDARY)
     card.text(488, 321, file_size(report["bytes"]), 55, limit=335)
-    needs_review = bool(report["blockingIssues"])
-    status_color = WARNING if needs_review else ACCENT
-    status_background = "#3c2e24" if needs_review else "#183833"
+    state = check_state(report)
+    status_label, status_color, status_background = STYLES[state]
     card.draw.rounded_rectangle((861, 271, 1152, 392), 17, fill=status_background)
     card.text(885, 286, "离线质检", 24, status_color)
-    card.text(885, 324, "需修正" if needs_review else "通过", 45, status_color)
+    card.status(state, 327, x=870, marker_only=True)
+    card.text(918, 325, status_label, 39, status_color, limit=223)
 
     if picture:
         codec = {"hevc": "H.265", "h264": "H.264"}.get(picture["codec"], picture["codec"].upper())
         video = f"{picture['width']}×{picture['height']} · {codec}"
         details = f"{file_size(picture['bytes'])} · 平均 {picture['bitrateKbps']:,} kb/s"
-        subtitles = subtitle_summary(picture)
+        subtitles, screen = subtitle_summary(picture, report["screenSubtitles"])
     else:
         video = "视频待核对" if "video" in files else "未附视频"
         details = None
-        subtitles = "待核对" if "video" in files else "不适用"
+        subtitles = "视频无法读取" if "video" in files else "未附视频，不适用"
+        screen = None
     card.text(466, 426, "视频", 26, ACCENT)
     card.text(561, 421, video, 33, limit=591)
     if details:
@@ -222,7 +261,9 @@ def routine_overview(card, title, manifest, files, report):
                             (651, "原谱", original)):
         card.draw.line((466, y - 15, 1152, y - 15), fill=PANEL, width=2)
         card.text(466, y + 2, label, 26, ACCENT)
-        card.text(561, y, value, 28, limit=591)
+        card.text(561, y, value, 26, limit=591)
+        if label == "字幕" and screen:
+            card.text(561, y + 28, screen, 22, SECONDARY, limit=591)
 
     card.text(48, 578, "制作者", 23, SECONDARY)
     card.text(48, 605, report["credit"] or "未署名", 30, limit=380)
@@ -258,13 +299,9 @@ def video_seek_card(card, routine, pair, files, report):
     if picture:
         position = video_position(song, track, picture["duration"])
         try:
-            raw = run("ffmpeg", "-nostdin", "-v", "error", "-ss", f"{position.source_seconds:.6f}",
-                      "-i", str(files["video"]), "-map", "0:V:0", "-frames:v", "1",
-                      "-vf", "scale=880:-2", "-f", "image2pipe", "-vcodec", "png", "-")
-            with Image.open(BytesIO(raw)) as image:
-                frame = image.convert("RGB")
+            frame = read_frame(files["video"], position.source_seconds, 880)
         except (ValueError, OSError):
-            report["blockingIssues"].append("包内视频的抽查帧无法解码。")
+            add_issue(report, "video", "包内视频的抽查帧无法解码。")
             absent = "视频帧解码需复查"
     phone = PhonePreview(card, routine, section_title(song) if song else None, "视频", 0,
                          frame=frame, unavailable_video=None if frame else absent)
@@ -281,7 +318,7 @@ def video_seek_card(card, routine, pair, files, report):
             phone.empty("缺少可用动作时间线")
         phone.transport(position.local_seconds, position.local_duration)
     else:
-        phone.empty("可核对包内音乐和原谱")
+        phone.empty("仍可播放音乐和排课")
         card.text(511, 160, absent, 41)
         return None
 
@@ -316,11 +353,12 @@ def video_seek_card(card, routine, pair, files, report):
 def action_timeline_card(card, routine, pair, video_pair, position, tracks):
     if not pair:
         phone = PhonePreview(card, routine, None, "音乐", 0)
-        phone.empty("缺少可用动作时间线")
-        card.text(511, 160, "无可跳转动作", 40)
+        phone.empty("本包未附动作时间线")
+        card.text(511, 160, "本包未提供动作时间线", 36)
+        card.text(511, 215, "音乐仍可按小节播放和排课。", 23, SECONDARY)
         pages = sum(bool(row["pdfPage"]) for row in tracks)
         if pages:
-            card.text(511, 234, f"{pages} 首可从「波形图」查看原谱", 27, SECONDARY)
+            card.text(511, 256, f"{pages} 首可从「波形图」查看原谱", 27, SECONDARY)
         return None
     song, _ = pair
     rows = song["cues"]
@@ -353,7 +391,7 @@ def action_timeline_card(card, routine, pair, video_pair, position, tracks):
     return at, cue["page"]
 
 
-def original_pdf_card(card, routine, timeline, cue_position, files, pages, with_pages, issues):
+def original_pdf_card(card, routine, timeline, cue_position, files, pages, with_pages, report):
     at, cue_page = cue_position or (0, None)
     preferred = {**timeline[1], "pdfPage": cue_page} if timeline and cue_page else None
     samples = []
@@ -380,7 +418,7 @@ def original_pdf_card(card, routine, timeline, cue_position, files, pages, with_
             card.media(opening_preview(files["pdf"], row["pdfPage"]), (x, 326, 190, 272))
             card.text(x, 626, f"{section_title(row)} · 第 {row['pdfPage']} 页", 22, limit=200)
     except (ValueError, OSError, pypdfium2.PdfiumError):
-        issues.append("原谱抽查页无法渲染。")
+        add_issue(report, "pdf", "原谱抽查页无法渲染。")
         phone.empty("原谱需修正")
         card.text(511, 160, "原谱需修正", 40, WARNING)
 
@@ -393,7 +431,13 @@ def screenshot_cards(manifest, files, report, font_path):
     with_pages = [entry for entry in tracks if entry["pdfPage"]]
     with_cues = sum(entry["cueRows"] for entry in tracks)
     marker = report["sha256"][:12]
-    issues = report["blockingIssues"]
+    def decorate(panel, y, *keys, reason_x=48):
+        state = check_state(report, *keys)
+        panel.status(state, y)
+        if state == "conditional":
+            notes = [reason for key in keys for reason in report["checks"][key]["conditions"]]
+            if notes:
+                panel.text(reason_x, 724, notes[0], 21, WARNING, 1152 - reason_x)
 
     def card(number, title):
         return Card(title, f"{number:02d} / 09     {art}     SHA-256 {marker}", font_path)
@@ -401,7 +445,6 @@ def screenshot_cards(manifest, files, report, font_path):
     def preview_card(number, title):
         preview = card(number, None)
         preview.text(48, 30, title, 48)
-        preview.text(878, 45, "SSplayer  /  离线预览", 23, ACCENT, 272)
         preview.draw.line((48, 96, 1152, 96), fill=PANEL, width=2)
         return preview
 
@@ -409,46 +452,58 @@ def screenshot_cards(manifest, files, report, font_path):
     picture = report.get("videoInfo")
     pages = report.get("pdfPageCount")
     video_format = (f"{picture['width']}×{picture['height']} · {picture['codec'].upper()} · {picture['bitrateKbps']:,} kb/s"
-                    if picture else "待核对" if "video" in files else "缺失")
-    counts.rows([("音乐", f"{len(tracks)} 首"), ("视频", video_format),
-                 ("原谱", f"{pages} 页" if pages else "待核对" if "pdf" in files else "缺失"),
+                    if picture else "待核对" if "video" in files else "未附视频")
+    caption = "未附视频，不适用"
+    if picture:
+        caption_parts = subtitle_summary(picture, report["screenSubtitles"])
+        caption = " · ".join(caption_parts)
+    counts.rows([("音乐", f"{len(tracks)} 首"), ("视频", video_format), ("字幕", caption),
+                 ("原谱", f"{pages} 页" if pages else "待核对" if "pdf" in files else "未附原谱"),
                  ("封面", "已包含" if "cover" in files else "App 会用占位图"),
                  ("视频定位", f"{len(chapter_set)} 个 · 实测吻合 {measured} 个"),
                  ("原谱入口", f"{len(with_pages)} 个物理页入口"), ("动作", f"{with_cues} 条"),
                  ("完整性", f"{report['bytes']:,} 字节 · 所有载荷 SHA-256 已核对")])
+    decorate(counts, 85, "contents", "subtitles")
     yield "02-inventory.png", counts.image
 
     names = {"standard": "正曲", "alternative": "替换", "bonus": "加曲"}
     music = card(3, "曲目、替换与分段")
     music.rows([(f"{row['section']}  {names.get(row['variant'], row['variant'])}",
                  f"{clock(row['duration'])}   {row['title'] or row['section']}") for row in tracks])
+    decorate(music, 85, "audio")
     yield "03-track-list.png", music.image
 
     video_pair, timeline_pair = select_preview_tracks(manifest["music"], tracks)
     video = preview_card(4, "视频定位")
     position = video_seek_card(video, art, video_pair, files, report)
+    decorate(video, 33, "video", reason_x=511)
     yield "04-video-seek.png", video.image
 
     timing = card(5, "音乐与视频时钟复测")
-    timing.text(48, 700, "前／中／尾三个窗口   •   数值为相对包内定位偏移（ms）", 23, SECONDARY)
+    if picture and measured:
+        timing.text(48, 695, "前／中／尾三个窗口 · 数值为相对包内定位偏移（ms）", 23, SECONDARY)
     timing_rows = []
-    for row in tracks:
+    for row in tracks if picture else ():
         values = " / ".join(f"{window['offsetMS']:+.1f}" for window in row["windows"])
-        timing_rows.append((section_title(row), f"{TIMING_STATES[row['status']]}   {values or '—'}"))
-    timing.rows(timing_rows)
+        timing_rows.append((section_title(row), values + " ms" if values else TIMING_STATES[row["status"]]))
+    timing.rows(timing_rows or [("时钟复测", "本包未提供可复测的视频。")])
+    decorate(timing, 85, "video")
     yield "05-timing.png", timing.image
 
     cues = preview_card(6, "动作时间线")
     cue_position = action_timeline_card(cues, art, timeline_pair, video_pair, position, tracks)
+    decorate(cues, 33, "timeline", reason_x=511)
     yield "06-action-timeline.png", cues.image
 
     pdf = preview_card(7, "原版波形图")
-    original_pdf_card(pdf, art, timeline_pair, cue_position, files, pages, with_pages, issues)
+    original_pdf_card(pdf, art, timeline_pair, cue_position, files, pages, with_pages, report)
+    decorate(pdf, 33, "pdf", reason_x=511)
     yield "07-source-pdf.png", pdf.image
 
     volume = card(8, "声音解码与峰值")
     volume.rows([(row["section"], f"{row['lufs']:.2f} LUFS    {row['truePeakDBTP']:.2f} dBTP"
                   if row["decoded"] else "解码或测量需复核") for row in tracks])
+    decorate(volume, 85, "audio")
     yield "08-loudness.png", volume.image
 
     # Video frames and PDF previews can add issues during rendering.
@@ -457,14 +512,11 @@ def screenshot_cards(manifest, files, report, font_path):
     yield "01-identity.png", overview.image
 
     gaps = card(9, "复核清单")
-    track_notes = [(row["section"], " / ".join([reason for condition, reason in [
-        (not row["decoded"], "音乐解码"), (row["status"] == "review", "对位"),
-        (row["status"] == "unlocated" and "video" in files, "无视频定位")] if condition]))
-              for row in tracks]
-    gaps.rows([*(("需修正", item) for item in issues),
-               ("App", "导入与排课结果以实际 App 验收为准"),
-               *(("编号间隔", f"T{number} · 对照原谱确认") for number in report["sectionGaps"]),
-               *(item for item in track_notes if item[1])])
+    notes = [(CHECK_LABELS[key], reason) for key, check in report["checks"].items()
+             for reason in [*check["issues"], *check["conditions"]]]
+    gaps.rows([*notes, *(("编号间隔", f"T{number} · 对照原谱确认") for number in report["sectionGaps"]),
+               ("App", "导入、播放与排课需在实际 App 中验收")])
+    gaps.status(check_state(report), 85)
     yield "09-review.png", gaps.image
 
 
@@ -490,23 +542,54 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                   "bytes": package_bytes, "sha256": full_sha, "manifestSHA256": manifest_sha,
                   "sectionGaps": sorted(set(range(1, max(sections) + 1)) - sections),
                   "appImportVerified": False, "tracks": inspect_tracks(manifest, audio, optional),
-                  "blockingIssues": []}
-        issues = report["blockingIssues"]
-        for song in report["tracks"]:
+                  "blockingIssues": [], "checks": {
+                      key: {"issues": [], "conditions": []} for key in CHECK_LABELS
+                  }}
+        output = Path(report_staging) / "evidence"
+        output.mkdir()
+        tracks = report["tracks"]
+        missing_chapters = [track for track in tracks if not track["chapter"]]
+        uncertain_chapters = [track for track in tracks if track["status"] in {"approximate", "visuallyConfirmed"}]
+        missing_cues = [track for track in tracks if not track["cueRows"]]
+        if "video" not in optional:
+            add_condition(report, "video", "本包未附视频。音乐可以播放和排课。")
+        elif missing_chapters:
+            add_condition(report, "video", f"{sections_for(missing_chapters)} 无可靠小节定位。可按整段视频观看。")
+        if uncertain_chapters:
+            add_condition(report, "video", f"{sections_for(uncertain_chapters)} 仅有近似或画面位置，音画时钟未对齐。")
+        if missing_cues:
+            text = ("本包未附动作时间线。" if len(missing_cues) == len(tracks)
+                    else f"{sections_for(missing_cues)} 未提供可用动作时间线。")
+            add_condition(report, "timeline", text + ("可直接查看原谱。" if "pdf" in optional else "音乐仍可播放和排课。"))
+        if "pdf" not in optional:
+            add_condition(report, "pdf", "本包未附原版波形图或教学讲义。")
+        elif missing_pages := [track for track in tracks if not track["pdfPage"]]:
+            add_condition(report, "pdf", f"{sections_for(missing_pages)} 无指定页入口。可浏览完整原谱。")
+        for song in tracks:
             slot = f"{song['section']} · {song['variant']}"
             if not song["decoded"]:
-                issues.append(f"{slot} 音乐无法解码或无可测声音。")
+                add_issue(report, "audio", f"{slot} 音乐无法解码或无可测声音。")
             elif not song["durationMatches"]:
-                issues.append(f"{slot} 实际音乐时长与清单不符。")
+                add_issue(report, "audio", f"{slot} 实际音乐时长与清单不符。")
             if song["status"] == "review":
-                issues.append(f"{slot} 声明为按音乐定位，但包内三段复测未通过。")
+                add_issue(report, "video", f"{slot} 声明为按音乐定位，但包内三段复测未通过。")
         if "video" in optional:
             try:
-                report["videoInfo"] = video_info(optional["video"])
-                require(abs(report["videoInfo"]["duration"] - manifest["video"]["duration"]) <= 0.25,
+                picture = video_info(optional["video"])
+                require(abs(picture["duration"] - manifest["video"]["duration"]) <= 0.25,
                         "Video duration does not match")
             except (ValueError, OSError):
-                issues.append("视频流无法读取，或实际视频时长与清单不符。")
+                add_issue(report, "video", "视频流无法读取，或实际视频时长与清单不符。")
+            else:
+                report["videoInfo"] = picture
+                screen = inspect_screen_subtitles(optional["video"], picture["duration"],
+                    None if overview_only else output / "subtitle-samples.jpg", getattr(args, "screen_subtitles", None))
+                report["screenSubtitles"] = screen
+                if screen["result"] in {"candidate", "review"}:
+                    explanation = ("抽查发现疑似画面字幕。请看采样帧确认字幕、课程标题或水印。"
+                                   if screen["result"] == "candidate" else
+                                   "抽样的画面字幕需看帧确认。OCR 不可用或未完成全部采样。")
+                    add_condition(report, "subtitles", explanation)
         if "pdf" in optional:
             try:
                 with pypdfium2.PdfDocument(optional["pdf"]) as document:
@@ -516,11 +599,12 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                 for song, source in zip(manifest["music"], proposals):
                     has_printed_timeline = source["rows"] and source["status"] != "unresolved"
                     if has_printed_timeline and not song.get("cues"):
-                        issues.append(f"{song['section']} 原谱有可读时间表，但资源包没有动作时间线。")
+                        add_condition(report, "timeline", f"{song['section']} 原谱有可读时间表，包内未提供对应的动作时间线。")
             except (ValueError, OSError, pypdfium2.PdfiumError):
-                issues.append("原谱无法打开，或实际页数与清单不符。")
-        output = Path(report_staging) / "evidence"
-        output.mkdir()
+                add_issue(report, "pdf", "原谱无法打开，或实际页数与清单不符。")
+        for key, reason in manifest.get("qualityNotes", {}).items():
+            if report["checks"][key]["conditions"]:
+                add_condition(report, key, "制作者说明 · " + reason)
         width, height = SIZE
         gap = 16
         contact = Image.new("RGB", (3 * width + 4 * gap, 3 * height + 4 * gap), BACKGROUND)
@@ -530,14 +614,16 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                 frame.save(output / file)
             contact.paste(frame, (gap + (index % 3) * (width + gap), gap + (index // 3) * (height + gap)))
         contact.save(output / "3x3-overview.png")
-        report["offlineMediaPassed"] = not issues
+        report["qaStatus"] = check_state(report)
+        report["offlineMediaPassed"] = report["qaStatus"] != "failed"
         if not overview_only:
             write_html(output, manifest, report)
         (output / "qa.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         output.rename(destination)
     print(json.dumps({"output": str(destination.resolve()), "screenshots": 9, "sha256": full_sha,
                       "measuredChapters": sum(row["status"] == "measured" for row in report["tracks"]),
-                      "offlineMediaPassed": report["offlineMediaPassed"], "blockingIssues": len(issues)}))
+                      "offlineMediaPassed": report["offlineMediaPassed"], "status": report["qaStatus"],
+                      "blockingIssues": len(report["blockingIssues"])}))
     return report["offlineMediaPassed"]
 
 
@@ -548,6 +634,8 @@ def main():
     parser.add_argument("--credit", help="Display credit for this evidence set")
     parser.add_argument("--made-at", help="Verified creation time in ISO 8601; omit to use evidence generation time")
     parser.add_argument("--font", type=Path, help="Optional font with Chinese glyphs")
+    parser.add_argument("--screen-subtitles", choices=("present", "absent"), metavar="RESULT",
+                        help="Visual judgment after reviewing samples from this exact package")
     parser.add_argument("--strict", action="store_true", help="Write full evidence but exit 2 for confirmed media issues")
     args = parser.parse_args()
     try:

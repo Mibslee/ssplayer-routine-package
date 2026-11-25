@@ -21,6 +21,9 @@ def submit(args):
     batch = args.batch_id or f"SSplayer-{datetime.now():%Y%m%d}-{uuid4().hex[:8]}"
     require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}", batch), "Invalid batch ID")
     require(1 <= len(args.packages) <= 256, "Select between 1 and 256 packages")
+    observation = getattr(args, "screen_subtitles", None)
+    require(observation is None or len(args.packages) == 1,
+            "An explicit subtitle observation applies to one inspected package")
     root = args.output_dir
     destination = root / batch
     root.mkdir(parents=True, exist_ok=True)
@@ -53,7 +56,8 @@ def submit(args):
             package = packages / name
             print(f"质检 {name}", file=sys.stderr, flush=True)
             with redirect_stdout(StringIO()):
-                passed = generate(Namespace(package=source, output_dir=work, credit=None, made_at=None, font=args.font),
+                passed = generate(Namespace(package=source, output_dir=work, credit=None, made_at=None,
+                                            font=args.font, screen_subtitles=observation),
                                   sealed_copy=package, overview_only=True)
             evidence = work / (stem + ".qa")
             report = read_json(evidence / "qa.json")
@@ -61,6 +65,8 @@ def submit(args):
                     f"Package identity changed during review: {source.name}")
             require(passed is True and report["offlineMediaPassed"] is True,
                     f"{name} 的质检有待修复\n" + "\n".join(report["blockingIssues"]))
+            if report["qaStatus"] == "conditional":
+                print(f"{name} · 条件通过。缺项与原因已列在质检图。", file=sys.stderr, flush=True)
             overview = evidence / "3x3-overview.png"
             require(overview.is_file(), f"Missing 3×3 QA image: {name}")
             fingerprint = {

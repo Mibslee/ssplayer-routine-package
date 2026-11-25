@@ -60,7 +60,12 @@ def track_panel(track, song, has_video):
             ("原谱入口", f"第 {track['pdfPage']} 个物理页" if track["pdfPage"] else "无指定页"),
             ("动作提示", f"{track['cueRows']} 条")]
     if function := track.get("sectionFunction"):
-        rows.append(("小节功能", f"{function['name']} · 原谱第 {function['page']} 页"))
+        status = track.get("sectionFunctionCheck")
+        evidence = f"{function['name']} · 原谱第 {function['page']} 页"
+        if status in {"manual", "contradiction"}:
+            needs_review = True
+            evidence += " · 待人工复核" if status == "manual" else " · 与原谱矛盾"
+        rows.append(("小节功能", evidence))
     if chapter := track["chapter"]:
         rows.append(("视频位置", f"{clock(chapter['start'])}–{clock(chapter['end'])}"))
     if track["windows"]:

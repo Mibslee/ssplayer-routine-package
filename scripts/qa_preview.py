@@ -479,7 +479,9 @@ def screenshot_cards(manifest, files, report, font_path):
         label = f"{row['section']}  {names.get(row['variant'], row['variant'])}"
         detail = f"{clock(row['duration'])}   {row['title'] or row['section']}"
         if function := row["sectionFunction"]:
-            detail = f"{function['name']} · 第 {function['page']} 页 · {detail}"
+            checked = row.get("sectionFunctionCheck")
+            status = " · 需人工复核" if checked == "manual" else " · 与原谱矛盾" if checked == "contradiction" else ""
+            detail = f"{function['name']} · 第 {function['page']} 页{status} · {detail}"
         music_rows.append((label, detail))
     music.rows(music_rows)
     decorate(music, 85, "audio", "structure")
@@ -613,7 +615,14 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                     require(len(document) == manifest["pdf"]["pageCount"], "Original PDF page count does not match")
                     report["pdfPageCount"] = len(document)
                 _, proposals, _ = extract_cues(optional["pdf"], manifest["music"])
-                for song, source in zip(manifest["music"], proposals):
+                for song, source, track in zip(manifest["music"], proposals, tracks):
+                    if checked := source.get("sectionFunctionCheck"):
+                        status, message = checked
+                        track["sectionFunctionCheck"] = status
+                        if status == "contradiction":
+                            add_issue(report, "structure", message)
+                        if status == "manual":
+                            add_condition(report, "structure", message)
                     has_printed_timeline = source["rows"] and source["status"] != "unresolved"
                     if has_printed_timeline and not song.get("cues"):
                         add_condition(report, "timeline", f"{song['section']} 原谱有可读时间表，包内未提供对应的动作时间线。")

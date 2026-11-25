@@ -21,7 +21,7 @@ from pathlib import Path
 from time import perf_counter
 
 from media_analysis import (alignment_module, audio_packet_hash, balance_audio, efficient_video, extract_cues,
-                            locate_chapters, map_recordings, optimize_video, probe, run, timing_windows,
+                            inspect_section_functions, locate_chapters, map_recordings, optimize_video, probe, run, timing_windows,
                             unresolved_repeat_times, video_info)
 
 
@@ -270,11 +270,11 @@ def confirm_plan(args):
     if args.credit is not None:
         config["credit"] = args.credit.strip() or None
     require("credit" in config, "Choose a credit or explicitly select --no-credit.")
-    values = confirmation_values(config)
     if args.cover or args.without_cover:
         set_cover_selection(config, args.cover)
+    require(config.get("coverSelection"), "Confirm the artwork or use --without-cover.")
     selected_cover(config)
-    config["identityConfirmation"] = values
+    config["identityConfirmation"] = confirmation_values(config)
     write_json(args.output, config)
     if args.remember_credit:
         save_default_credit(config["credit"] or "")
@@ -305,8 +305,6 @@ def plan(args):
     credit = args.credit if args.credit is not None else default_credit()
     if credit is not None:
         value["credit"] = credit.strip() or None
-    if args.project_name and args.routine_name and args.credit is not None:
-        value["identityConfirmation"] = confirmation_values(value)
     if args.release_date:
         value["releaseDate"] = args.release_date
     note_fields = (("video", "video_note"), ("timeline", "timeline_note"))
@@ -391,6 +389,8 @@ def plan(args):
         set_cover_selection(value, args.cover)
     else:
         value["coverCandidates"] = list_cover_candidates(cover_images, value["music"], embedded, args.output)
+    if args.project_name and args.routine_name and args.credit is not None and value.get("coverSelection"):
+        value["identityConfirmation"] = confirmation_values(value)
     value["reviewSources"] = review
     value["musicWarnings"] = warnings
     write_json(args.output, value)
@@ -501,7 +501,8 @@ def confirmation_values(value):
     read_identity(value)
     validate_display_metadata(value)
     require(value.get("projectName") and value.get("routineName"), "Confirm both display names.")
-    return {key: value[key] for key in ("program", "routine", "revision", "projectName", "routineName", "credit")}
+    fields = ("program", "routine", "revision", "projectName", "routineName", "credit", "releaseDate", "coverSelection")
+    return {key: value.get(key) for key in fields}
 
 
 def validate_confirmation(value):
@@ -647,9 +648,13 @@ def package(args):
         require(findings.get("selection", source_selection(song)) == source_selection(song),
                 f"Section, variant, catalogue slot or cue pages changed for {song['section']}. Run analyze again.")
     timelines = [approved_timeline(song, findings) for song, findings in zip(config["music"], review["tracks"])]
-    source_pdf = review.get("pdf") if config.get("pdf") else None
+    source_pdf = review["pdf"] if config.get("pdf") else None
     functions = [approved_section_function(song, findings, source_pdf)
                  for song, findings in zip(config["music"], review["tracks"])]
+    pdf_path = same_source(config["pdf"], source_pdf["source"]) if source_pdf else None
+    declared_sections = [{**song, "sectionFunction": function} for song, function in zip(config["music"], functions) if function]
+    checked_functions = inspect_section_functions(pdf_path, declared_sections)
+    manual_functions = require_matching_section_functions(checked_functions)
     cover = selected_cover(config)
     if cover:
         require(review.get("cover") == cover, "Review no longer matches the confirmed cover image.")
@@ -740,10 +745,9 @@ def package(args):
             manifest["video"] = {"asset": identity(path), "duration": round(encoded_picture["duration"], 6)}
             files.append(path)
         video_seconds = perf_counter() - started - audio_seconds
-        if config.get("pdf"):
-            path = same_source(config["pdf"], review["pdf"]["source"])
-            manifest["pdf"] = {"asset": identity(path), "pageCount": review["pdf"]["pageCount"]}
-            files.append(path)
+        if pdf_path:
+            manifest["pdf"] = {"asset": source_pdf["source"], "pageCount": source_pdf["pageCount"]}
+            files.append(pdf_path)
         if cover:
             path = same_source(config["cover"], cover)
             manifest["cover"] = cover
@@ -762,7 +766,7 @@ def package(args):
                     require(not source.read(1), f"Source grew while packing: {file.name}")
             stream.flush()
             os.fsync(stream.fileno())
-        receipt = verify(pending)
+        receipt = verify(pending, manual_functions=manual_functions)
         os.link(pending, output)
     receipt.update(output=str(output.resolve()), loudness=loudness, videoQuality=video_quality,
                    seconds=round(perf_counter() - started, 2), audioSeconds=round(audio_seconds, 2),
@@ -801,15 +805,27 @@ def container_digest(encoded):
     return hashlib.sha256(MAGIC + struct.pack(">I", len(encoded)) + encoded)
 
 
-def verify(path):
+def require_matching_section_functions(checks):
+    contradictions = [message for status, message in checks if status == "contradiction"]
+    require(not contradictions, "\n".join(contradictions))
+    return [message for status, message in checks if status == "manual"]
+
+
+def verify(path, *, manual_functions=None):
     before = path.stat()
     require(before.st_size <= MAX_PACKAGE, "Package too large")
-    with path.open("rb") as stream:
+    with path.open("rb") as stream, tempfile.SpooledTemporaryFile(max_size=4 * MIB) as pdf:
         encoded, manifest = read_manifest(stream)
         package_digest = container_digest(encoded)
-        for asset in validate_manifest(manifest):
-            consume(stream, asset, package_digest=package_digest)
+        assets = validate_manifest(manifest)
+        pdf_asset = (manifest["pdf"]["asset"] if manual_functions is None
+                     and any(item.get("sectionFunction") for item in manifest["music"]) else None)
+        for asset in assets:
+            consume(stream, asset, package_digest=package_digest, mirror=pdf if asset is pdf_asset else None)
         require(not stream.read(1), "Trailing data in package")
+        if pdf_asset is not None:
+            pdf.seek(0)
+            manual_functions = require_matching_section_functions(inspect_section_functions(pdf, manifest["music"]))
     after = path.stat()
     require((before.st_ino, before.st_size, before.st_mtime_ns) ==
             (after.st_ino, after.st_size, after.st_mtime_ns), "Package changed during verification")
@@ -819,7 +835,8 @@ def verify(path):
             "music": len(manifest["music"]), "video": bool(manifest.get("video")), "pdf": bool(manifest.get("pdf")),
             "cover": bool(manifest.get("cover")), "chapters": sum("chapter" in m for m in manifest["music"]),
             "pdfOpeningPages": sum(m.get("pdfPage") is not None for m in manifest["music"]),
-            "cueRows": sum(len(m.get("cues") or []) for m in manifest["music"])}
+            "cueRows": sum(len(m.get("cues") or []) for m in manifest["music"]),
+            "sectionFunctionManualReview": manual_functions or []}
 
 
 def extract_manifest(args):

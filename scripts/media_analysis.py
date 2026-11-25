@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from functools import lru_cache
 import json
 import math
@@ -582,6 +583,30 @@ def pdf_recording_variant(variant):
     return {"alternate": "alternative", "45-minute": "combo45"}.get(variant, variant)
 
 
+@dataclass(frozen=True)
+class SectionHeading:
+    number: int
+    segment: str
+    variant: str
+    variant_source: str
+    title: str
+
+    @property
+    def recording(self):
+        return self.number, self.segment, self.variant
+
+
+def recording_identity(song):
+    section = re.fullmatch(r"T(\d+)([A-Z]?)", song["section"])
+    return int(section[1]), section[2], song["variant"]
+
+
+def normalized_function_title(name):
+    value = unicodedata.normalize("NFKC", name).casefold()
+    value = re.sub(r"\s*[\u2010-\u2014\u2212-]\s*", "-", value)
+    return " ".join(value.split())
+
+
 def section_heading(words, width, alignment, parsed):
     """Read the numbered function title on a choreography table page."""
     if parsed is None and not alignment._has_cue_table_header(width, words):
@@ -608,6 +633,19 @@ def section_heading(words, width, alignment, parsed):
         return None
     number, title = headings[0]
     variant, source = alignment._classify_pdf_variant_with_source(words, width)
+    markers = {normalized_function_title(word["text"]).upper().strip("()[]") for word in words
+               if 60 <= word["top"] <= 125 and 0 <= word["x0"] < width * 0.65}
+    alternate = bool(markers & {"ALT", "ALT.", "ALTERNATE"})
+    bonus = "BONUS" in markers
+    express = any(marker.startswith("45-MIN") for marker in markers)
+    if alternate and bonus:
+        variant, source = "", "ambiguous"
+    elif express and (alternate or bonus):
+        variant, source = ("combo45Alternative" if alternate else "combo45Bonus"), "explicit"
+    elif alternate or bonus:
+        variant, source = ("alternate" if alternate else "bonus"), "explicit"
+    elif express:
+        variant, source = "45-minute", "explicit"
     if source == "structured" and variant == "alternate":
         title = title.split(" - ", 1)[0]
     title = re.sub(r"^(?:ALT\.?|ALTERNATE|BONUS|45[-–]MIN(?:UTE)?)[ :–-]+", "", title, flags=re.I)
@@ -615,7 +653,50 @@ def section_heading(words, width, alignment, parsed):
     title = re.sub(r"\s+\((?:ALT|ALTERNATE|BONUS)\)$", "", title, flags=re.I)
     if not title or len(title) > 68 or len(title.encode("utf-8")) > 240:
         return None
-    return (int(number["number"]), (number["segment"] or "").upper(), pdf_recording_variant(variant)), title
+    return SectionHeading(int(number["number"]), (number["segment"] or "").upper(),
+                          pdf_recording_variant(variant), source, title)
+
+
+def check_section_function(song, heading, conflicting=False):
+    function = song["sectionFunction"]
+    number, segment, variant = recording_identity(song)
+    location = f"{song['section']} ({variant}) 原谱第 {function['page']} 页"
+    if heading is None:
+        return "manual", f"{location} 的功能标题无法自动核对，需人工复核。"
+    if heading.number != number or (segment and heading.segment and segment != heading.segment):
+        return "contradiction", f"{location} 印有 T{heading.number}{heading.segment}，与所填小节不同。"
+    if heading.variant_source == "explicit" and heading.variant != variant:
+        return "contradiction", f"{location} 的明确版别是 {heading.variant}，与所填版别不同。"
+    if heading.segment != segment or heading.variant != variant or heading.variant_source == "ambiguous":
+        return "manual", f"{location} 的功能或录音对应需人工复核。"
+    declared = normalized_function_title(function["name"])
+    printed = normalized_function_title(heading.title)
+    if declared != printed:
+        possibly_partial = (declared.startswith(printed + " ") or printed.startswith(declared + " ")
+                            or declared in printed.split(" / "))
+        if not possibly_partial:
+            return "contradiction", f"{location} 印有「{heading.title}」，与所填功能「{function['name']}」不同。"
+    if conflicting:
+        return "manual", f"{location} 的同号原谱有不同标题，需人工复核。"
+    if declared != printed or heading.variant_source == "structured":
+        return "manual", f"{location} 的功能或录音对应需人工复核。"
+    return "matched", None
+
+
+def inspect_section_functions(path, songs):
+    claimed = [song for song in songs if song.get("sectionFunction")]
+    if not claimed:
+        return []
+    import pdfplumber
+    alignment = alignment_module()
+    with pdfplumber.open(path) as pdf:
+        headings = {}
+        for index in {song["sectionFunction"]["page"] for song in claimed}:
+            if index > len(pdf.pages):
+                raise ValueError(f"The actual PDF does not contain section function page {index}.")
+            page = pdf.pages[index - 1]
+            headings[index] = section_heading(page.extract_words(), page.width, alignment, None)
+        return [check_section_function(song, headings[song["sectionFunction"]["page"]]) for song in claimed]
 
 
 def extract_cues(path, songs, ocr=False):
@@ -636,10 +717,12 @@ def extract_cues(path, songs, ocr=False):
             if heading := section_heading(positioned, page.width, alignment, parsed):
                 headings[index] = heading
         timelines, warnings = alignment._build_pdf_timelines(found)
+        titles_by_recording = {}
+        for heading in headings.values():
+            titles_by_recording.setdefault(heading.recording, set()).add(normalized_function_title(heading.title))
         result = []
         for song in songs:
-            section = re.fullmatch(r"T(\d+)([A-Z]?)", song["section"])
-            recording = int(section[1]), section[2], song["variant"]
+            recording = recording_identity(song)
             candidates = [t for t in timelines if
                           (t.track_number, t.segment or "", pdf_recording_variant(t.variant)) == recording]
             pages = song.get("pdfPages", candidates[0].pages if len(candidates) == 1 else [])
@@ -660,9 +743,12 @@ def extract_cues(path, songs, ocr=False):
             selected = set(song.get("pdfPages") or ())
             if song.get("pdfPage"):
                 selected.add(song["pdfPage"])
-            proposed = [(page, title) for page, (identity, title) in headings.items()
-                        if identity == recording and (not selected or page in selected)]
-            if proposed and len({unicodedata.normalize("NFKC", title).casefold() for _, title in proposed}) == 1:
+            proposed = [(page, heading.title) for page, heading in headings.items()
+                        if heading.recording == recording and (not selected or page in selected)]
+            if proposed and len({normalized_function_title(title) for _, title in proposed}) == 1:
                 page, title = proposed[0]
                 result[-1]["sectionFunction"] = {"name": title, "page": page, "approved": False}
+            if function := song.get("sectionFunction"):
+                conflicting = len(titles_by_recording.get(recording, ())) > 1
+                result[-1]["sectionFunctionCheck"] = check_section_function(song, headings.get(function["page"]), conflicting)
         return len(pdf.pages), result, warnings

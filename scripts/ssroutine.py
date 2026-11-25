@@ -226,6 +226,60 @@ def select_cover(args):
     write_json(args.output, document)
 
 
+def attribution_path():
+    if directory := os.environ.get("SSPLAYER_CREATOR_CONFIG_DIR"):
+        return Path(directory).expanduser() / "attribution.json"
+    directory = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config")
+    return directory / "ssplayer_package_creator" / "attribution.json"
+
+
+def default_credit():
+    try:
+        credit = read_json(attribution_path())["credit"]
+        return credit if valid_text(credit, 128, single_line=True) and credit.strip() == credit else None
+    except (OSError, KeyError, TypeError, ValueError):
+        return None
+
+
+def save_default_credit(credit):
+    path = attribution_path()
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent, delete=False) as output:
+        temporary = Path(output.name)
+        try:
+            json.dump({"credit": credit}, output, ensure_ascii=False)
+            output.write("\n")
+            output.close()
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+
+
+def attribution(args):
+    if args.reset:
+        attribution_path().unlink(missing_ok=True)
+    credit = default_credit()
+    state = "name" if credit else "none" if credit == "" else "unset"
+    print(json.dumps({"state": state, "credit": credit or None}, ensure_ascii=False))
+
+
+def confirm_plan(args):
+    config = read_json(args.input)
+    config["projectName"] = args.project_name.strip()
+    config["routineName"] = args.routine_name.strip()
+    if args.credit is not None:
+        config["credit"] = args.credit.strip() or None
+    require("credit" in config, "Choose a credit or explicitly select --no-credit.")
+    values = confirmation_values(config)
+    if args.cover or args.without_cover:
+        set_cover_selection(config, args.cover)
+    selected_cover(config)
+    config["identityConfirmation"] = values
+    write_json(args.output, config)
+    if args.remember_credit:
+        save_default_credit(config["credit"] or "")
+
+
 def canonical_duplicate(items):
     paths = [Path(item["file"]) for item, _ in items]
     durations = [duration for _, duration in items]
@@ -244,9 +298,15 @@ def plan(args):
     require(root.is_dir(), "Select a source folder")
     require(not args.output.exists(), "Choose a new output path for the plan.")
     program, routine = author_identity(args.program, args.routine)
-    value = {"program": program, "routine": routine, "revision": args.revision, "music": []}
-    if args.credit:
-        value["credit"] = args.credit
+    value = {"program": program, "routine": routine, "revision": args.revision, "music": [],
+             "projectName": args.project_name or args.program.strip(),
+             "routineName": args.routine_name or f"{program} {routine}",
+             "identityConfirmation": None}
+    credit = args.credit if args.credit is not None else default_credit()
+    if credit is not None:
+        value["credit"] = credit.strip() or None
+    if args.project_name and args.routine_name and args.credit is not None:
+        value["identityConfirmation"] = confirmation_values(value)
     if args.release_date:
         value["releaseDate"] = args.release_date
     note_fields = (("video", "video_note"), ("timeline", "timeline_note"))
@@ -327,7 +387,7 @@ def plan(args):
             value[name] = paths[0]
         elif paths:
             review.extend(paths)
-    if args.cover:
+    if args.cover or args.without_cover:
         set_cover_selection(value, args.cover)
     else:
         value["coverCandidates"] = list_cover_candidates(cover_images, value["music"], embedded, args.output)
@@ -336,13 +396,16 @@ def plan(args):
     write_json(args.output, value)
     print(json.dumps({"musicProposed": len(value["music"]), "reviewSources": len(review),
                       "musicWarnings": len(warnings),
-                      "coverCandidates": len(value.get("coverCandidates", []))}, ensure_ascii=False))
+                      "coverCandidates": len(value.get("coverCandidates", [])),
+                      "projectName": value["projectName"], "routineName": value["routineName"],
+                      "credit": value.get("credit"), "hasCreditChoice": "credit" in value}, ensure_ascii=False))
 
 
 def analyze(args):
     started = perf_counter()
     config = read_json(args.plan)
     program, _, _ = read_identity(config)
+    validate_confirmation(config)
     cover = selected_cover(config)
     songs = config["music"]
     require(1 <= len(songs) <= 128, "Choose the music files in the plan")
@@ -421,6 +484,31 @@ def valid_text(value, limit, *, single_line=False):
                     or (not single_line and character in "\n\t") for character in value))
 
 
+def validate_display_metadata(value):
+    for key in ("projectName", "routineName"):
+        if (name := value.get(key)) is not None:
+            require(valid_text(name, 240, single_line=True) and 0 < len(name) <= 68
+                    and name.strip() == name and not any(unicodedata.category(character) in {"Zl", "Zp"} for character in name),
+                    f"Invalid {key}. Use a single line of up to 68 characters and 240 UTF-8 bytes.")
+    if (credit := value.get("credit")) is not None:
+        require(valid_text(credit, 128, single_line=True) and credit, "Invalid contributor credit")
+
+
+def confirmation_values(value):
+    read_identity(value)
+    validate_display_metadata(value)
+    require(value.get("projectName") and value.get("routineName"), "Confirm both display names.")
+    return {key: value[key] for key in ("program", "routine", "revision", "projectName", "routineName", "credit")}
+
+
+def validate_confirmation(value):
+    if "identityConfirmation" in value:
+        require(value["identityConfirmation"] is not None and value["identityConfirmation"] == confirmation_values(value),
+                "Confirm project and routine names and the credit choice with confirm-plan before analysis or build.")
+    else:
+        validate_display_metadata(value)  # Existing review files remain usable.
+
+
 def validate_slots(program, songs):
     program = PROGRAM_ALIASES.get(program, program)
     slots = set()
@@ -454,8 +542,7 @@ def validate_manifest(value):
     songs = value["music"]
     require(type(value["schemaVersion"]) is int and value["schemaVersion"] == 1
             and isinstance(songs, list) and 1 <= len(songs) <= 128, "Unsupported package manifest")
-    if (credit := value.get("credit")) is not None:
-        require(credit and valid_text(credit, 128, single_line=True), "Invalid contributor credit")
+    validate_display_metadata(value)
     if "qualityNotes" in value:
         validate_quality_notes(value["qualityNotes"])
     validate_slots(program, songs)
@@ -525,6 +612,7 @@ def package(args):
     program, routine, revision = read_identity(config)
     require((program, routine) == author_identity(program, routine),
             "Use canonical project and routine identifiers in the plan.")
+    validate_confirmation(config)
     require(-24 <= args.lufs <= -12, "Select a loudness target between -24 and -12 LUFS")
     require(len(config["music"]) == len(review["tracks"]), "Review does not cover every music file")
     validate_slots(program, config["music"])
@@ -552,8 +640,8 @@ def package(args):
     with tempfile.TemporaryDirectory(dir=destination, prefix=".ssroutine-") as directory:
         work = Path(directory)
         manifest = {"schemaVersion": 1, "program": program, "routine": routine, "revision": revision, "music": []}
-        for key in ("credit", "releaseDate", "qualityNotes"):
-            if key in config:
+        for key in ("projectName", "routineName", "credit", "releaseDate", "qualityNotes"):
+            if config.get(key) is not None:
                 manifest[key] = config[key]
         files = []
         loudness = []
@@ -820,12 +908,32 @@ def main():
     p.add_argument("--program", required=True)
     p.add_argument("--routine", required=True)
     p.add_argument("--revision", default=1, type=int)
-    p.add_argument("--credit")
+    p.add_argument("--project-name")
+    p.add_argument("--routine-name")
+    credit = p.add_mutually_exclusive_group()
+    credit.add_argument("--credit", help="Confirmed public creator name")
+    credit.add_argument("--no-credit", dest="credit", action="store_const", const="")
     p.add_argument("--release-date", help="A confirmed release date or quarter, such as 2024Q3")
     p.add_argument("--video-note", help="Known reason for intentionally missing or unlocated video")
     p.add_argument("--timeline-note", help="Known reason for an omitted action timeline")
-    p.add_argument("--cover", type=Path, help="A JPEG or PNG confirmed by the creator")
+    cover = p.add_mutually_exclusive_group()
+    cover.add_argument("--cover", type=Path, help="A JPEG or PNG confirmed by the creator")
+    cover.add_argument("--without-cover", action="store_true")
     p.add_argument("--output", required=True, type=Path)
+    p = commands.add_parser("confirm-plan", help="Record approved display names, attribution and artwork")
+    p.add_argument("input", type=Path)
+    p.add_argument("--project-name", required=True)
+    p.add_argument("--routine-name", required=True)
+    credit = p.add_mutually_exclusive_group()
+    credit.add_argument("--credit", help="Use this public creator name for this package")
+    credit.add_argument("--no-credit", dest="credit", action="store_const", const="")
+    p.add_argument("--remember-credit", action="store_true", help="Save this attribution choice as the local default")
+    cover = p.add_mutually_exclusive_group()
+    cover.add_argument("--cover", type=Path)
+    cover.add_argument("--without-cover", action="store_true")
+    p.add_argument("--output", required=True, type=Path)
+    p = commands.add_parser("attribution", help="Show or reset the local default attribution choice")
+    p.add_argument("--reset", action="store_true")
     p = commands.add_parser("select-cover", help="Record the creator's artwork selection in a plan or review")
     p.add_argument("input", type=Path)
     choice = p.add_mutually_exclusive_group(required=True)
@@ -877,7 +985,8 @@ def main():
             from batch_submission import submit
             submit(args)
         else:
-            {"plan": plan, "select-cover": select_cover, "analyze": analyze, "build": package,
+            {"plan": plan, "confirm-plan": confirm_plan, "attribution": attribution,
+             "select-cover": select_cover, "analyze": analyze, "build": package,
              "manifest": extract_manifest, "revise": revise, "finish": finish}[args.command](args)
     except (ValueError, KeyError, TypeError, OSError, ImportError, subprocess.SubprocessError) as error:
         parser.exit(1, f"{error}\n")

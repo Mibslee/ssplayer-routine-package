@@ -12,6 +12,7 @@ Manifest length is at most 4 MiB. The total file is at most 12 GiB. Each asset d
 | --- | --- |
 | schemaVersion | Integer 1 |
 | program, routine, revision | Package identity |
+| projectName, routineName | Optional display names confirmed by the creator. New custom projects and routines use them when available. |
 | credit | Optional contributor credit, at most 128 UTF-8 bytes |
 | releaseDate | Optional confirmed YYYY, YYYYQn, YYYY-MM or YYYY-MM-DD |
 | music | 1–128 entries containing section, variant, optional catalogTrackID and title, asset, and duration in seconds |
@@ -28,6 +29,8 @@ Music accepts AAC, AIFF, FLAC, M4A, MP3 and WAV. Video accepts MP4, M4V and MOV.
 - Optional cues contain the finished action timeline ordered by time on the current recording. Each row has time in seconds, 1-based physical page, and the actual action to display. Expand structural repeats and source-supported side changes during authoring. Optional music, counts, repetitions and coaching retain the associated printed information. Optional level has red, green and blue components in [0,1] from the printed PDF. PDF pages and cue times must exist in the associated assets.
 - A cue can declare `block`, an optional integer from 1 to 128 on the first timed row of a verified block. The marked block numbers and their clocks increase within the recording. Keep all actions sharing that opening clock in one row. A completed repeat can also declare `repeatsBlock` on this same row, pointing to an earlier marked block. The App shows the source once at the block header and reads the authored actions at their signed times. Older packages without these fields remain valid.
 - Optional pdfPage is the 1-based opening page for that recording, even when cues are unavailable. Use it for source tables containing interval durations and keep the original PDF intact. The App binds it to the exact PDF and recording and preserves a user's manual choice.
+
+Existing package files can omit display names. File names, catalogue matching and review approval continue to use the canonical identity. An existing local project or routine keeps its name. The saved local attribution preference is outside the package. Only the selected public credit can be included.
 
 The private plan and review files are editing inputs. plan.music items use file for the local source path, optional pdfPages for cue extraction, and optional pdfPage for a separately verified opening page. An empty pdfPages list suppresses cue extraction for that track. Approve cue rows after comparing the complete timed actions with the selected source pages. The generated package contains the portable manifest and selected assets.
 

@@ -211,16 +211,20 @@ def routine_overview(card, title, manifest, files, report):
         card.draw.text((238, 334), cover_status, font=card.font(32), anchor="mm",
                        fill=WARNING if "cover" in files else SECONDARY)
 
-    title_width = card.draw.textlength(title, font=card.font(78))
-    title_size = min(78, int(78 * 684 / max(title_width, 1)))
-    card.text(466, 127, title, title_size, limit=686)
+    display_name = manifest.get("routineName") or title
+    title_width = card.draw.textlength(display_name, font=card.font(78))
+    title_size = max(36, min(78, int(78 * 684 / max(title_width, 1))))
+    card.text(466, 127, display_name, title_size, limit=686)
+    project = manifest.get("projectName")
+    if project or display_name != title:
+        card.text(466, 202, " · ".join(dict.fromkeys(filter(None, (project, title)))), 25, SECONDARY, limit=686)
     released = report["releaseDate"]
     release_label = f"发行 {released.replace('Q', ' Q')}" if released else "发行时间待核对"
     meta = [release_label, f"包版本 {manifest['revision']}"]
     picture = report.get("videoInfo")
     if picture:
         meta.append("视频 " + clock(picture["duration"]))
-    card.text(466, 214, " · ".join(meta), 27, SECONDARY, limit=686)
+    card.text(466, 234 if project or display_name != title else 214, " · ".join(meta), 25, SECONDARY, limit=686)
 
     card.draw.rounded_rectangle((466, 271, 845, 392), 17, fill=PANEL)
     card.text(488, 286, "资源包大小", 24, SECONDARY)

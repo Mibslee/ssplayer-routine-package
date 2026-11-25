@@ -18,9 +18,11 @@ import tempfile
 import unicodedata
 from io import BytesIO
 from pathlib import Path
+from time import perf_counter
 
 from media_analysis import (alignment_module, audio_packet_hash, balance_audio, efficient_video, extract_cues,
-                            locate_chapters, optimize_video, probe, run, unresolved_repeat_times, video_info)
+                            locate_chapters, map_recordings, optimize_video, probe, run, timing_windows,
+                            unresolved_repeat_times, video_info)
 
 
 MAGIC = b"SSRT0001"
@@ -36,7 +38,8 @@ PROGRAM_ALBUMS = {
     "BC": "BC", "BJ": "BJ", "BP": "BP", "BA": "BA", "CORE": "CORE", "TONE": "TONE", "GRIT": "GRIT",
 }
 PROGRAM_ALIASES = {**PROGRAM_ALBUMS, **{f"LESMILLS{name}": code for name, code in PROGRAM_ALBUMS.items()},
-                   "莱美核心": "CORE", "莱美核心训练": "CORE", "莱美GRIT": "GRIT", "莱美TONE": "TONE"}
+                   "莱美核心": "CORE", "莱美核心训练": "CORE", "莱美GRIT": "GRIT", "莱美TONE": "TONE",
+                   "莱美有氧": "BA", "莱美有氧训练": "BA"}
 NATIVE_PROGRAMS = {"BC", "BJ", "BP", "RPM"}
 VIDEO_PROFILES = {"efficient": (None, None), "ipad": (1080, 1800), "compact": (720, 950)}
 
@@ -332,18 +335,20 @@ def plan(args):
 
 
 def analyze(args):
+    started = perf_counter()
     config = read_json(args.plan)
     program, _, _ = read_identity(config)
     cover = selected_cover(config)
     songs = config["music"]
     require(1 <= len(songs) <= 128, "Choose the music files in the plan")
     validate_slots(program, songs)
-    audio = []
-    for row in songs:
+    def inspect_audio(row):
         path = Path(row["file"]).resolve(strict=True)
         require(extension(path) in AUDIO, f"Unsupported audio: {path.name}")
         duration, _ = probe(path, "audio")
-        audio.append({**row, "file": path, "duration": duration, "source": identity(path)})
+        return {**row, "file": path, "duration": duration, "source": identity(path)}
+
+    audio = map_recordings(inspect_audio, songs)
     review = {"plan": config, "programRoutine": [config["program"], config["routine"]],
               "tracks": [{"source": row["source"], "duration": row["duration"], "selection": source_selection(row)}
                          for row in audio]}
@@ -359,6 +364,7 @@ def analyze(args):
         review["video"] = {"source": identity(video), "duration": duration}
         video_audio = next((s for s in metadata["streams"] if s["codec_type"] == "audio"), None)
         if video_audio and not args.skip_alignment:
+            print("正在核对各小节的音画定位", file=sys.stderr, flush=True)
             try:
                 audio_duration = float(video_audio.get("duration", duration))
             except (TypeError, ValueError):
@@ -370,8 +376,11 @@ def analyze(args):
     if cover:
         review["cover"] = cover
     write_json(args.output, review)
-    print(json.dumps({"music": len(audio), "chaptersProposed": sum(bool(x.get("chapter")) for x in review["tracks"]),
-                      "cueRowsProposed": sum(len(x.get("cues", {}).get("rows", [])) for x in review["tracks"])}))
+    print(json.dumps({"music": len(audio),
+                      "audioMatched": sum(bool((x.get("chapter") or {}).get("approved")) for x in review["tracks"]),
+                      "chaptersProposed": sum(bool(x.get("chapter")) for x in review["tracks"]),
+                      "cueRowsProposed": sum(len(x.get("cues", {}).get("rows", [])) for x in review["tracks"]),
+                      "seconds": round(perf_counter() - started, 2)}))
 
 
 def same_source(value, expected):
@@ -497,6 +506,7 @@ def validate_manifest(value):
 
 
 def package(args):
+    started = perf_counter()
     review = read_json(args.review)
     config = review["plan"]
     program, routine, revision = read_identity(config)
@@ -535,11 +545,14 @@ def package(args):
         files = []
         loudness = []
         video_quality = None
-        for index, (song, findings, timeline) in enumerate(zip(config["music"], review["tracks"], timelines)):
+        print(f"{name} · 检查与处理 {len(timelines)} 首音乐", file=sys.stderr, flush=True)
+
+        def prepare_audio(item):
+            index, (song, findings, timeline) = item
             path = same_source(song["file"], findings["source"])
+            levels = None
             if not args.keep_music:
                 path, levels = balance_audio(path, work / f"audio-{index}.m4a", args.lufs)
-                loudness.append({"section": song["section"], **levels})
             duration, _ = probe(path, "audio")
             row = {key: song[key] for key in ("section", "variant", "catalogTrackID", "title", "pdfPage") if key in song}
             row.update(asset=identity(path), duration=round(duration, 6))
@@ -549,24 +562,52 @@ def package(args):
                     row["chapter"]["end"] = round(chapter["start"] + duration, 6)
             if timeline:
                 row["cues"] = timeline
+            return path, row, levels
+
+        for path, song, levels in map_recordings(prepare_audio, enumerate(zip(config["music"], review["tracks"], timelines))):
             files.append(path)
-            manifest["music"].append(row)
+            manifest["music"].append(song)
+            if levels is not None:
+                loudness.append({"section": song["section"], **levels})
+        audio_seconds = perf_counter() - started
         if config.get("video"):
+            print(f"{name} · 处理视频（{args.video_quality}）", file=sys.stderr, flush=True)
             path = same_source(config["video"], review["video"]["source"])
             original_picture = video_info(path)
+            changed_matches = [(song, audio) for song, audio, finding in zip(manifest["music"], files, review["tracks"])
+                               if song.get("chapter", {}).get("evidence") == "audioMatched"
+                               and song["asset"] != finding["source"]]
+            if changed_matches:
+                alignment = alignment_module()
+
+                def verify_balanced_clock(item):
+                    song, audio = item
+                    evidence = timing_windows(song, audio, path, alignment)
+                    return None if evidence["status"] == "measured" else song["section"]
+
+                failed = [slot for slot in map_recordings(verify_balanced_clock, changed_matches) if slot]
+                require(not failed, f"{', '.join(failed)} · 音量处理后音画复测未通过。核对原始录音，或保留原音乐。")
             if args.balance_video:
                 path, levels = balance_audio(path, work / "video.mp4", args.lufs, video=True)
                 loudness.append({"section": "video", **levels})
             if args.video_quality != "original":
                 height, bitrate = VIDEO_PROFILES[args.video_quality]
                 encode = efficient_video if args.video_quality == "efficient" else optimize_video
+                codec = args.video_codec or "hevc"
                 path, encoded_picture = encode(path, work / "encoded.mp4",
-                    args.video_max_height or height, args.video_bitrate_kbps or bitrate, args.video_codec or "hevc")
+                    args.video_max_height or height, args.video_bitrate_kbps or bitrate, codec)
+                if encoded_picture["codec"] != codec:
+                    name_for_codec = "H.265 (HEVC)" if codec == "hevc" else "H.264"
+                    reason = encoded_picture.get("reason", "Output codec did not match.")
+                    raise ValueError(f"Could not package {name_for_codec} video. {reason} "
+                                     "Choose an iPad or compact profile to adjust the encode, "
+                                     "or explicitly choose original quality to keep the source codec.")
             else:
                 encoded_picture = video_info(path)
             video_quality = {"preset": args.video_quality, "source": original_picture, "output": encoded_picture}
             manifest["video"] = {"asset": identity(path), "duration": round(encoded_picture["duration"], 6)}
             files.append(path)
+        video_seconds = perf_counter() - started - audio_seconds
         if config.get("pdf"):
             path = same_source(config["pdf"], review["pdf"]["source"])
             manifest["pdf"] = {"asset": identity(path), "pageCount": review["pdf"]["pageCount"]}
@@ -591,11 +632,14 @@ def package(args):
             os.fsync(stream.fileno())
         receipt = verify(pending)
         os.link(pending, output)
-    receipt.update(output=str(output.resolve()), loudness=loudness, videoQuality=video_quality)
+    receipt.update(output=str(output.resolve()), loudness=loudness, videoQuality=video_quality,
+                   seconds=round(perf_counter() - started, 2), audioSeconds=round(audio_seconds, 2),
+                   videoSeconds=round(video_seconds, 2))
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
+    return output
 
 
-def consume(stream, asset, destination=None, package_digest=None):
+def consume(stream, asset, destination=None, package_digest=None, mirror=None):
     remaining = asset["bytes"]
     observed = hashlib.sha256()
     while remaining:
@@ -606,6 +650,8 @@ def consume(stream, asset, destination=None, package_digest=None):
             package_digest.update(chunk)
         if destination is not None:
             destination.write(chunk)
+        if mirror is not None:
+            mirror.write(chunk)
         remaining -= len(chunk)
     require(observed.hexdigest() == asset["sha256"], "Media payload digest mismatch")
 
@@ -716,6 +762,41 @@ def doctor():
                       "ocr": all(shutil.which(name) for name in ("pdftoppm", "tesseract"))}))
 
 
+def add_media_options(command):
+    command.add_argument("--lufs", type=float, default=-16.0)
+    command.add_argument("--keep-music", action="store_true")
+    command.add_argument("--balance-video", action="store_true")
+    command.add_argument("--video-quality", choices=("efficient", "original", "ipad", "compact"), default="efficient")
+    command.add_argument("--video-max-height", type=int, help="Override the selected preset's height limit")
+    command.add_argument("--video-bitrate-kbps", type=int, help="Override the selected preset's video bitrate")
+    command.add_argument("--video-codec", choices=("hevc", "h264"), help="Require this codec when encoding (default: HEVC)")
+
+
+def finish(args):
+    from batch_submission import submit
+
+    started = perf_counter()
+    require(1 <= len(args.reviews) <= 256, "Select between 1 and 256 reviewed routines")
+    work = Path(tempfile.mkdtemp(prefix="ssroutine-production-"))
+    outputs = []
+    try:
+        for review in args.reviews:
+            options = argparse.Namespace(**vars(args))
+            options.review = review
+            options.output_dir = work
+            outputs.append(package(options))
+        args.packages = outputs
+        submit(args)
+    except BaseException:
+        if outputs:
+            print(f"已完成的资源包保存在 {work}；可检查后用 submit 继续交付。", file=sys.stderr)
+        else:
+            work.rmdir()
+        raise
+    shutil.rmtree(work)
+    print(f"制作与质检合计 {perf_counter() - started:.1f}s", file=sys.stderr)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -743,13 +824,13 @@ def main():
     p = commands.add_parser("build")
     p.add_argument("review", type=Path)
     p.add_argument("--output-dir", required=True, type=Path)
-    p.add_argument("--lufs", type=float, default=-16.0)
-    p.add_argument("--keep-music", action="store_true")
-    p.add_argument("--balance-video", action="store_true")
-    p.add_argument("--video-quality", choices=("efficient", "original", "ipad", "compact"), default="efficient")
-    p.add_argument("--video-max-height", type=int, help="Override the selected preset's height limit")
-    p.add_argument("--video-bitrate-kbps", type=int, help="Override the selected preset's video bitrate")
-    p.add_argument("--video-codec", choices=("hevc", "h264"), help="HEVC by default for encoded video")
+    add_media_options(p)
+    p = commands.add_parser("finish", help="Build reviewed routines and seal one verified submission in a single run")
+    p.add_argument("reviews", type=Path, nargs="+")
+    p.add_argument("--output-dir", required=True, type=Path)
+    p.add_argument("--batch-id")
+    p.add_argument("--font", type=Path, help="CJK font for the visual QA cards")
+    add_media_options(p)
     p = commands.add_parser("verify")
     p.add_argument("package", type=Path)
     p = commands.add_parser("manifest", help="Extract a private editable copy of a package manifest")
@@ -779,7 +860,7 @@ def main():
             submit(args)
         else:
             {"plan": plan, "select-cover": select_cover, "analyze": analyze, "build": package,
-             "manifest": extract_manifest, "revise": revise}[args.command](args)
+             "manifest": extract_manifest, "revise": revise, "finish": finish}[args.command](args)
     except (ValueError, KeyError, TypeError, OSError, ImportError, subprocess.SubprocessError) as error:
         parser.exit(1, f"{error}\n")
 

@@ -61,31 +61,30 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
     python scripts/ssroutine.py plan "/资料/TONE 26" --program TONE --routine 26 --release-date 2024Q3 --output plan.json
     python scripts/ssroutine.py select-cover plan.json --cover "/工作区/已确认.jpg" --output confirmed-plan.json
     python scripts/ssroutine.py analyze confirmed-plan.json --output review.json
-    python scripts/ssroutine.py build review.json --output-dir "/本机工作区/成品"
-    python scripts/ssroutine.py verify "/本机工作区/成品/TONE_26_1.ssroutine"
+    python scripts/ssroutine.py finish review.json --output-dir "/交付目录"
 
-先核对 `plan.json` 中的资料和归属，再运行 `analyze`。只有查过正确录音、原谱与时间的章节和动作才在 `review.json` 中设置 `approved: true`。见[制作和质检](quality-check.md)。
+先核对 `plan.json` 中的资料和归属，再运行 `analyze`。通过音画复测的小节会自动确认同步定位。对需要复核的章节和 PDF 动作，比较原始资料后再批准。能点选的智能体可用「按默认制作」「修改选项」「补充要求」。也可以直接回复想用的画质、响度、署名或某一套的例外。见[制作和质检](quality-check.md)。
 
 修改小节、曲目版本、目录槽位或动作提取页后，更新计划并重新分析。独立的原谱打开页可在核对后填写。同名文件内容不一致时使用新修订号。
 
 ## 提交一批
 
-确认成品后，从本机工作区选择要提交的包。可以只交一套，也可以合并多套。
+用 `finish` 处理一套或多套已核对的方案。进度会显示音乐、视频和质检阶段；完成后可以看到各阶段耗时。已有成品可从本机工作区选出并直接提交。
 
     python scripts/ssroutine.py submit "/本机工作区/成品/TONE_26_1.ssroutine" "/本机工作区/成品/CORE_63_3.ssroutine" --output-dir "/交付目录"
 
-上传生成的整个批次目录，里面有「套路资源包」「质检图」和一份指纹文件。发给审校人的内容是网盘链接。若要核对网盘副本，从网盘读回包执行 `verify`，把输出里的完整 SHA-256 与批次指纹比较。审校人签回的 `.ssapproval` 可以和对应的资源包一起分发。
+上传生成的整个批次目录。每套成品对应一张同名九宫格 PNG，整批只需要一份指纹文件。发给审校人的内容是网盘链接。若要核对网盘副本，从网盘读回包执行 `verify`，把输出里的完整 SHA-256 与批次指纹比较。审校人签回的 `.ssapproval` 可以和对应的资源包一起分发。
 
 ## 选择视频质量
 
 | 选项 | 视频规格 |
 | --- | --- |
-| `--video-quality efficient` | 默认尝试高画质 HEVC，保留输入分辨率和画面时钟，核验通过后选用较小成品 |
+| `--video-quality efficient` | 默认高画质 H.265（HEVC），保留输入分辨率和画面时钟，核验通过后选用较小成品 |
 | `--video-quality original` | 沿用输入视频编码与分辨率 |
 | `--video-quality ipad` | HEVC，最高 1080p，视频目标码率 1800 kb/s |
 | `--video-quality compact` | HEVC，最高 720p，视频目标码率 950 kb/s |
 
-按素材细节调整 `--video-max-height` 和 `--video-bitrate-kbps`。需要指定 H.264 时可选 iPad 或轻量档并加 `--video-codec h264`。降低分辨率时保持比例，已低于上限的画面沿用原分辨率或向下取偶。输入已是 HEVC 时，默认档参照原画面码率试压。默认档要求视频体积至少减少 10%，头、中、尾三个画面样本的平均 SSIM 均达到 0.96。遇到不适合转码的素材，或任何核验未通过，成品沿用输入视频，原因随制作回执记录。
+按素材细节调整 `--video-max-height` 和 `--video-bitrate-kbps`。需要指定 H.264 时可选 iPad 或轻量档并加 `--video-codec h264`。降低分辨率时保持比例，已低于上限的画面沿用原分辨率或向下取偶。默认 H.265 档有源画面码率时会据此试压，避免低码率素材转码后反而变大。默认压缩档要求视频体积至少减少 10%，头、中、尾三个画面样本的平均 SSIM 均达到 0.96。默认档未通过时，只有源视频与要求的编码一致才会沿用源文件。源编码不同时会提示原因，可改用 iPad 或轻量档重做，或明确选择原画。质检首图显示实际打包的编码。
 
     python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality ipad
     python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality compact --video-max-height 540 --video-bitrate-kbps 750
@@ -102,6 +101,12 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 首图沿用电影条目的阅读顺序，大封面旁是标题、发行时间和时长，下方突出包体积与离线质检结果。质检结果包含抽查视频帧和原谱打开页时发现的问题。
 
-严格质检发现音乐无法解码、清单时长与实物不符、标为按音乐定位却复测失败，或已附的封面和原谱打不开时，会留下可读报告，命令以状态码 2 结束。没附的素材和未声明定位会列为复核项，允许交付已核实的内容。
+三张手机备课页预览都标记为「离线预览」。
+
+- `04-video-seek.png` 从包内整课视频提取实帧，同时显示小节内时间、整课取帧时间和前中尾对位偏差。复测吻合后才按同一小节时间高亮动作。近似定位和画面定位显示视频章内时间。
+- `06-action-timeline.png` 展示实际动作、拍数、重复次数和高亮行。原谱有 Level 色条时随动作显示。整段重复只在 Block 标题标一次，展开后的动作照常显示。
+- `07-source-pdf.png` 优先打开所展示动作的原谱页，保留实际 PDF 页码。缺少动作时会提示可核对的原谱入口。
+
+严格质检会标出无法解码的音乐、清单时长与实物差异、声称已同步却复测失败的定位，以及原谱有可提取的动作表但包里漏写了时间线的曲目。单独运行离线预览会留下可读报告并以状态码 2 结束。未提供的可选素材会列为复核项。
 
 在本机用总览和可视报告核对曲目和对位，有 Pro 时再验证 App 导入和排课。报告 HTML 内嵌总览，可以单独打开。上传时使用 `submit` 整理过的批次目录，确需补充远程排查证据时再通过约定渠道提供。

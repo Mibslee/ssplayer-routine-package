@@ -3,18 +3,24 @@
 from __future__ import annotations
 
 import importlib.util
+from concurrent.futures import ThreadPoolExecutor
+from functools import lru_cache
 import json
 import math
+import os
 import re
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 
+SAMPLE_POSITIONS = ((0.14, "前段"), (0.48, "中段"), (0.80, "尾段"))
+
 STRUCTURAL_REPEAT = re.compile(
-    r"\b(?:REPEAT|RPT)\s+(?:(?:THE\s+)?(?:BLOCKS?|SEQUENCES?|COMBOS?|SECTIONS?)\s+"
-    r"(?:\d+|[A-Z][0-9]*)(?!\w)|[A-Z][0-9]*\s*(?:[-–—&+]|AND|TO)\s*[A-Z][0-9]*\b)",
+    r"\b(?:REPEAT|RPT)\s+(?:(?:THE\s+|LUNGE\s+)?(?:BLOCKS?|SEQUENCES?|COMBOS?|SECTIONS?)\s+"
+    r"(?:\d+|[A-Z][0-9¹²³⁴⁵⁶⁷⁸⁹⁰]*)(?!\w)|[A-Z][0-9]*\s*(?:[-–—&+]|AND|TO)\s*[A-Z][0-9]*\b)",
     re.IGNORECASE,
 )
 
@@ -34,6 +40,34 @@ def run(*args):
     return completed.stdout
 
 
+def encode_with_progress(arguments, encoder, duration):
+    print(f"视频编码 · {encoder}", file=sys.stderr, flush=True)
+    command = [arguments[0], "-progress", "pipe:1", "-stats_period", "15", "-nostats", *arguments[1:]]
+    with tempfile.TemporaryFile() as errors:
+        with subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              stderr=errors, text=True) as process:
+            last_progress = 0
+            try:
+                for line in process.stdout:
+                    key, _, value = line.strip().partition("=")
+                    if key != "out_time_us" or not value.lstrip("-").isdigit():
+                        continue
+                    progress = min(100, int(int(value) / (duration * 10_000)))
+                    if progress > last_progress:
+                        print(f"视频已编码 {progress}%", file=sys.stderr, flush=True)
+                        last_progress = progress
+                status = process.wait()
+            except BaseException:
+                process.terminate()
+                raise
+        if status:
+            errors.seek(0)
+            details = errors.read().decode(errors="replace").strip().splitlines()
+            reason = details[0] if details else str(status)
+            raise ValueError(f"{encoder}: {reason}")
+
+
+@lru_cache(maxsize=1)
 def alignment_module():
     local = Path(__file__).with_name("rehearsal_alignment.py")
     parents = Path(__file__).resolve().parents
@@ -66,15 +100,16 @@ def audio_packet_hash(path):
 
 
 def measure(path):
-    result = subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-xerror",
-                             "-i", str(path), "-map", "0:a:0", "-af",
-                             "loudnorm=I=-16:TP=-1.5:LRA=11:print_format=json", "-f", "null", "-"],
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True)
-    match = re.search(r'\{\s*"input_i"\s*:.*?\}', result.stderr.decode(errors="replace"), re.S)
+    result = subprocess.run(
+        ["ffmpeg", "-nostdin", "-hide_banner", "-nostats", "-v", "info", "-xerror",
+         "-i", str(path), "-map", "0:a:0", "-af", "ebur128=peak=true:framelog=verbose", "-f", "null", "-"],
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, check=True,
+    )
+    summary = result.stderr.decode(errors="replace").rsplit("Integrated loudness:", 1)[-1]
+    match = re.search(r"\bI:\s+(\S+) LUFS.*?True peak:\s+Peak:\s+(\S+) dBFS", summary, re.S)
     if not match:
         raise ValueError(f"No R128 measurement for {path.name}")
-    values = json.loads(match[0])
-    integrated, peak = float(values["input_i"]), float(values["input_tp"])
+    integrated, peak = float(match[1]), float(match[2])
     if not math.isfinite(integrated) or not math.isfinite(peak):
         raise ValueError(f"No measurable audio in {path.name}")
     return integrated, peak
@@ -85,7 +120,7 @@ def balance_audio(source, destination, target, video=False):
     integrated, peak = measure(source)
     # This extra headroom leaves room for the encoder's reconstructed peaks.
     gain = min(target - integrated, -2.0 - peak, 12.0)
-    if abs(gain) < 0.05 and peak <= -1.5:
+    if abs(gain) <= 0.5 and peak <= -1.5:
         return source, {"inputLUFS": integrated, "outputLUFS": integrated, "truePeakDBTP": peak, "gainDB": 0}
     if video:
         duration, media = probe(source, "video")
@@ -95,8 +130,11 @@ def balance_audio(source, destination, target, video=False):
         args = ["-map", "0", "-c", "copy", "-c:a:0", "aac", "-b:a:0", "256k",
                 "-filter:a:0", f"volume={gain:.6f}dB"]
     else:
-        duration, _ = probe(source, "audio")
-        args = ["-map", "0:a:0", "-map_metadata", "0", "-c:a", "alac", "-af", f"volume={gain:.6f}dB"]
+        duration, media = probe(source, "audio")
+        source_codec = next(s["codec_name"] for s in media["streams"] if s["codec_type"] == "audio")
+        lossless = source_codec in {"alac", "flac", "wavpack"} or source_codec.startswith("pcm_")
+        audio_encoder = ["-c:a", "alac"] if lossless else ["-c:a", "aac", "-b:a", "256k"]
+        args = ["-map", "0:a:0", "-map_metadata", "0", *audio_encoder, "-af", f"volume={gain:.6f}dB"]
     run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-i", str(source), *args, str(destination))
     final_duration, final = probe(destination, "video" if video else "audio")
     if abs(final_duration - duration) > 0.20:
@@ -130,7 +168,8 @@ def video_info(path):
     picture = picture_stream(media)
     size = path.stat().st_size
     bit_rate = str(picture.get("bit_rate", ""))
-    return {"codec": picture["codec_name"], "width": picture["width"], "height": picture["height"],
+    return {"codec": picture["codec_name"], "codecTag": picture.get("codec_tag_string"),
+            "width": picture["width"], "height": picture["height"],
             "bytes": size, "duration": duration, "bitrateKbps": round(size * 8 / duration / 1000),
             "pictureBitrateKbps": round(int(bit_rate) / 1000) if bit_rate.isdecimal() else None,
             "subtitleTracks": sum(stream["codec_type"] == "subtitle" for stream in media["streams"]),
@@ -171,7 +210,10 @@ def video_quality_samples(source, encoded, duration, width, height):
 def efficient_video(source, destination, maximum_height, bitrate_kbps, codec):
     """Keep the smaller candidate only when its playback and sampled picture pass."""
     original = video_info(source)
-    if bitrate_kbps is None and codec == original["codec"] == "hevc":
+    compatible = original["codec"] == codec and (codec != "hevc" or original.get("codecTag") == "hvc1")
+    if maximum_height is None and bitrate_kbps is None and compatible:
+        return source, {**original, "compression": "alreadyEfficient"}
+    if bitrate_kbps is None and codec == "hevc":
         if existing_rate := original["pictureBitrateKbps"]:
             bitrate_kbps = max(250, round(existing_rate * 0.85))
     scores = []
@@ -214,7 +256,8 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
     encoders = run("ffmpeg", "-hide_banner", "-encoders").decode(errors="replace")
     filter_graph = "format=yuv420p"
     if maximum_height is not None:
-        filter_graph = f"scale=-2:'trunc(min(ih,{maximum_height})/2)*2',{filter_graph}"
+        if picture["height"] > maximum_height or picture["height"] % 2:
+            filter_graph = f"scale=-2:'trunc(min(ih,{maximum_height})/2)*2',{filter_graph}"
     arguments = ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-copyts", "-i", str(source),
                  "-map", "0:V:0", "-map", "0:a?", "-map", "0:s?", "-map_metadata", "0", "-map_chapters", "0",
                  "-c:a", "copy", "-c:s", "copy", "-vf", filter_graph, "-fps_mode", "passthrough",
@@ -241,12 +284,13 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
         raise ValueError(f"Install an FFmpeg build with a {codec} encoder or select original quality.")
     for encoder, settings in remaining:
         try:
-            run(*arguments, "-c:v", encoder, *settings, str(destination))
+            encode_with_progress([*arguments, "-c:v", encoder, *settings, str(destination)], encoder, duration)
             break
-        except ValueError:
+        except ValueError as error:
             destination.unlink(missing_ok=True)
             if encoder == remaining[-1][0]:
                 raise
+            print(f"{error}\n将尝试软件编码", file=sys.stderr, flush=True)
 
     final_duration, after = probe(destination, "video")
     old_pts, new_pts = video_timestamps(source), video_timestamps(destination)
@@ -273,6 +317,75 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
         if old_streams and stream_hashes(source, stream) != stream_hashes(destination, stream):
             raise ValueError(f"Compression changed the original {kind} packets.")
     return destination, {**video_info(destination), "encoder": encoder, "framesVerified": len(old_pts)}
+
+
+def map_recordings(function, recordings):
+    # Bound FFmpeg concurrency independently of batch size and preserve slot order.
+    with ThreadPoolExecutor(max_workers=min(3, os.cpu_count() or 1)) as pool:
+        return list(pool.map(function, recordings))
+
+
+def decoded_window(path, start, seconds):
+    import numpy as np
+
+    data = run("ffmpeg", "-nostdin", "-v", "error", "-ss", f"{start:.6f}", "-i", str(path),
+               "-t", f"{seconds:.6f}", "-map", "0:a:0", "-ac", "1", "-ar", "4000", "-af",
+               "highpass=f=170,lowpass=f=1650", "-f", "f32le", "-")
+    return np.frombuffer(data, dtype="<f4").astype(np.float64)
+
+
+def timing_windows(song, audio, video, alignment):
+    chapter = song.get("chapter")
+    if not chapter or chapter["evidence"] != "audioMatched":
+        return {"status": chapter["evidence"] if chapter else "unlocated", "windows": []}
+    start, length = chapter["start"], song["duration"]
+    width = min(5.0, length * 0.16)
+    # Searching only near the claimed timestamp can lock onto a nearby beat
+    # even when the same recording has a stronger match one or two beats away.
+    margin = 2.5
+    def measure_positions(positions):
+        windows = []
+        for part in positions:
+            inside = length * part
+            actual_margin = min(margin, start + inside)
+            a = decoded_window(audio, inside, width)
+            b = decoded_window(video, start + inside - actual_margin, width + 2 * actual_margin)
+            if len(a) < 600 or len(b) < len(a):
+                continue
+            try:
+                scores = alignment.normalized_waveform_correlation(b, a)
+            except alignment.AlignmentError:
+                continue
+            peak = alignment.best_alignment_peak(scores, exclusion_frames=600)
+            windows.append({"position": part,
+                            "offsetMS": round((peak.offset_frames / 4000 - actual_margin) * 1000, 1),
+                            "correlation": round(peak.score, 4),
+                            "runnerUpGap": round(peak.score_gap or 0, 4)})
+        return windows
+
+    def passes(windows):
+        if len(windows) != 3:
+            return False
+        offsets = [window["offsetMS"] for window in windows]
+        error = max(abs(value) for value in offsets)
+        drift = max(offsets) - min(offsets)
+        scores = [window["correlation"] for window in windows]
+        gaps = sorted(window["runnerUpGap"] for window in windows)
+        standard = error <= 150 and drift <= 120 and min(scores) >= 0.10 and max(scores) >= 0.22
+        # Voice-over lowers correlation. Require much tighter agreement before
+        # accepting three distinct, lower-amplitude matches on the same clock.
+        voiceover = error <= 25 and drift <= 12 and min(scores) >= 0.06 and max(scores) >= 0.13
+        return gaps[1] >= 0.035 and (standard or voiceover)
+
+    windows = measure_positions(part for part, _ in SAMPLE_POSITIONS)
+    if passes(windows):
+        return {"status": "measured", "windows": windows}
+    # A song's chorus can create runner-up peaks one beat or phrase away.
+    # Recheck fixed, non-overlapping positions across the whole recording.
+    alternate = measure_positions((0.08, 0.36, 0.73))
+    if passes(alternate):
+        return {"status": "measured", "windows": alternate}
+    return {"status": "review", "windows": windows}
 
 
 def locate_chapters(video, rows, duration, audio_duration):
@@ -317,6 +430,22 @@ def locate_chapters(video, rows, duration, audio_duration):
             "runnerUpGap": round(result.spectral_peak.score_gap or 0, 4),
             "confidence": result.confidence, "status": result.status,
         } if 0 <= start < min(duration, end) else None
+    candidates = [(index, chapter) for index, chapter in enumerate(chapters)
+                  if chapter is not None and chapter["evidence"] == "audioMatched"]
+
+    def verify_candidate(candidate):
+        index, chapter = candidate
+        track = rows[index]
+        evidence = timing_windows({**track, "chapter": chapter}, track["file"], video, alignment)
+        return index, evidence
+
+    for index, evidence in map_recordings(verify_candidate, candidates):
+        chapter = chapters[index]
+        chapter["windows"] = evidence["windows"]
+        chapter["approved"] = evidence["status"] == "measured"
+        if not chapter["approved"]:
+            chapter["evidence"] = "approximate"
+            warnings.append(f"{rows[index]['section']} did not pass the three-window audio clock check.")
     return chapters, warnings
 
 
@@ -357,9 +486,43 @@ def visible_level(page, position, top):
     return None
 
 
-def read_page_rows(page, words, page_number, parse_time):
+SEQUENCE_CODE = r"[A-Z][0-9¹²³⁴⁵⁶⁷⁸⁹⁰]{0,2}"
+SEQUENCE_ITEM = re.compile(rf"({SEQUENCE_CODE})(?:\s*\((\d+\s*[x×])\))?")
+SEQUENCE_REPEAT = re.compile(r"^(?:REPEAT|RPT)\s+(?:LUNGE\s+)?SEQUENCES?\s+(.+)$", re.S)
+
+
+def expand_sequence(action, definitions):
+    match = SEQUENCE_REPEAT.fullmatch(action)
+    if not match:
+        return None
+    expression = " ".join(match[1].split())
+    detail = re.search(r"[.,]\s*([LR] foot B|Leading [LR] hand first)\s*\.?$", expression, re.I)
+    modifier = detail[1] if detail else ""
+    identifiers = expression[:detail.start()] if detail else expression.rstrip(".")
+    references = [SEQUENCE_ITEM.fullmatch(item.strip()) for item in identifiers.split(",")]
+    if not all(references):
+        return None
+    result = []
+    for item in references:
+        source = definitions.get(unicodedata.normalize("NFKC", item[1]))
+        if not source or unresolved_repeat_times([{"time": 0, "action": source}]):
+            return None
+        if modifier.lower().startswith("leading "):
+            side = modifier.split()[1]
+            source = re.sub(r"\bLeading [LR] hand\b", f"Leading {side} hand", source, flags=re.I)
+        result.append(f"{source} ({item[2]})" if item[2] else source)
+    return "\n".join(result), modifier
+
+
+def read_page_rows(page, words, page_number, parse_time, definitions=None):
+    if definitions is None:
+        definitions = {}
     for line in row_lines(words):
-        headers = {word["text"].upper(): word for word in line}
+        headers = {}
+        for word in line:
+            labels = re.split(r"[/|]", word["text"].upper())
+            for label in labels:
+                headers[label] = word
         if "MUSIC" not in headers or "EXERCISE" not in headers:
             continue
         if not any(h in headers for h in ("CTS", "REPS", "LEVEL")):
@@ -367,6 +530,9 @@ def read_page_rows(page, words, page_number, parse_time):
         def leading(key):
             return headers[key]["x0"] - 4 if key in headers else page.width
         music, exercise = leading("MUSIC"), leading("EXERCISE")
+        sequence = headers.get("SEQUENCE")
+        sequence_left = (min(sequence["x0"] - 4, exercise - 44)
+                         if sequence is not None else exercise)
         counts, reps, level = (leading(key) for key in ("CTS", "REPS", "LEVEL"))
         if "CTS" in headers and "REPS" in headers and exercise < counts < reps:
             # Entries like AMRAP may be centered and extend left of the REPS label.
@@ -382,15 +548,29 @@ def read_page_rows(page, words, page_number, parse_time):
         for i, (top, time) in enumerate(marks):
             limit = marks[i + 1][0] - 3 if i + 1 < len(marks) else page.height * 0.92
             body = [w for w in words if top - 3 <= w["top"] < limit]
-            def column(begin, end):
+            def column(begin, end, top_bound=None, bottom_bound=None):
                 return "\n".join(" ".join(w["text"] for w in line)
-                                 for line in row_lines([w for w in body if begin <= w["x0"] < end]))
-            action = column(exercise, min((x for x in (counts, reps, level) if x > exercise), default=page.width))
+                                 for line in row_lines([w for w in body if begin <= w["x0"] < end
+                                     and (top_bound is None or w["top"] >= top_bound)
+                                     and (bottom_bound is None or w["top"] < bottom_bound)]))
+            action_end = min((x for x in (counts, reps, level) if x > exercise), default=page.width)
+            action = column(exercise, action_end)
             if action:
+                codes = sorted((w for w in body if sequence_left <= w["x0"] < exercise
+                                and re.fullmatch(SEQUENCE_CODE, w["text"])), key=lambda w: w["top"])
+                for j, code in enumerate(codes):
+                    start = code["top"] - 3
+                    end = codes[j + 1]["top"] - 3 if j + 1 < len(codes) else limit
+                    if text := column(exercise, action_end, start, end):
+                        definitions[unicodedata.normalize("NFKC", code["text"])] = text
                 cue = {"time": time, "page": page_number, "action": action,
-                       "music": column(music, min(exercise, counts)),
+                       "music": column(music, min(sequence_left, counts)),
                        "counts": column(counts, exercise if counts < exercise else min(reps, level)),
                        "repetitions": column(reps, level)}
+                if expanded := expand_sequence(action, definitions):
+                    cue["action"], qualifier = expanded
+                    if qualifier:
+                        cue["coaching"] = qualifier
                 if color := visible_level(page, level + 6, top + 3):
                     cue["level"] = color
                 rows.append(cue)
@@ -419,10 +599,11 @@ def extract_cues(path, songs, ocr=False):
                           and (t.segment or "") == section[2] and t.variant == song["variant"]]
             pages = song.get("pdfPages", candidates[0].pages if len(candidates) == 1 else [])
             rows = []
+            definitions = {}
             for n in pages:
                 if type(n) is not int or n not in words:
                     raise ValueError(f"Invalid PDF page {n} for {song['section']}")
-                rows.extend(read_page_rows(pdf.pages[n - 1], words[n], n, alignment.parse_timestamp))
+                rows.extend(read_page_rows(pdf.pages[n - 1], words[n], n, alignment.parse_timestamp, definitions))
             valid = all(0 <= row["time"] <= song["duration"] for row in rows)
             valid = valid and all(a["time"] <= b["time"] for a, b in zip(rows, rows[1:]))
             repeats = unresolved_repeat_times(rows)

@@ -8,7 +8,6 @@ from pathlib import Path
 from uuid import uuid4
 import hashlib
 import re
-import shutil
 import sys
 import tempfile
 
@@ -52,10 +51,10 @@ def submit(args):
             require(name not in names, f"Duplicate routine revision: {name}")
             names.add(name)
             package = packages / name
-            shutil.copyfile(source, package)
-            print(f"质检 {name}", file=sys.stderr)
+            print(f"质检 {name}", file=sys.stderr, flush=True)
             with redirect_stdout(StringIO()):
-                passed = generate(Namespace(package=package, output_dir=work, credit=None, made_at=None, font=args.font))
+                passed = generate(Namespace(package=source, output_dir=work, credit=None, made_at=None, font=args.font),
+                                  sealed_copy=package, overview_only=True)
             evidence = work / (stem + ".qa")
             report = read_json(evidence / "qa.json")
             require(report["manifestSHA256"] == hashlib.sha256(encoded).hexdigest(),
@@ -63,18 +62,14 @@ def submit(args):
             require(passed is True and report["offlineMediaPassed"] is True,
                     f"{name} 的质检有待修复\n" + "\n".join(report["blockingIssues"]))
             overview = evidence / "3x3-overview.png"
-            cards = sorted(evidence.glob("*.png"))
-            require(overview in cards and len(cards) == 10, f"Incomplete QA images: {name}")
+            require(overview.is_file(), f"Missing 3×3 QA image: {name}")
             fingerprint = {
                 "program": program, "routine": routine, "revision": revision, "filename": name,
                 "bytes": report["bytes"], "sha256": report["sha256"],
                 "manifestSHA256": report["manifestSHA256"], "overviewSHA256": digest(overview),
             }
             fingerprints.append(fingerprint)
-            image_folder = images / stem
-            image_folder.mkdir()
-            for card in cards:
-                card.rename(image_folder / card.name)
+            overview.rename(images / f"{stem}.png")
         fingerprint_name = batch + ".ssfingerprints.json"
         write_json(submission / fingerprint_name, {
             "schemaVersion": 1, "batchID": batch,

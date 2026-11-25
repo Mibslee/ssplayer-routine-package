@@ -4,21 +4,25 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import ExitStack
 from datetime import datetime
 import hashlib
 from io import BytesIO
 import json
 from pathlib import Path
 import subprocess
+import struct
 import tempfile
 
-import numpy as np
 import pypdfium2
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
-from media_analysis import alignment_module, measure, probe, run, video_info
+from media_analysis import (SAMPLE_POSITIONS, alignment_module, extract_cues, map_recordings, measure,
+                            probe, run, timing_windows, video_info)
+from qa_phone import (PhonePreview, clock, score_metadata, section_title, select_preview_tracks,
+                      timeline_sample, video_position, wrapped_lines)
 from report_html import write_html
-from ssroutine import MAX_PACKAGE, consume, container_digest, read_manifest, require, validate_manifest
+from ssroutine import MAGIC, MAX_PACKAGE, consume, container_digest, read_manifest, require, validate_manifest
 
 SIZE = (1200, 810)
 BACKGROUND = "#0b1521"
@@ -27,6 +31,8 @@ PRIMARY = "#f4f6fb"
 SECONDARY = "#b6c5d5"
 ACCENT = "#75efc0"
 WARNING = "#ffcc93"
+TIMING_STATES = {"measured": "音画复测吻合", "review": "音画对位需复核", "unlocated": "未指定小节定位",
+                 "approximate": "近似定位", "visuallyConfirmed": "按画面定位"}
 FONT_PATHS = [
     "/System/Library/Fonts/STHeiti Medium.ttc",
     "/System/Library/Fonts/STHeiti Light.ttc",
@@ -35,17 +41,21 @@ FONT_PATHS = [
 ]
 
 
-def source_files(package, work):
+def source_files(package, work, sealed_copy=None):
     before = package.stat()
     require(before.st_size <= MAX_PACKAGE, "Package too large")
-    with package.open("rb") as stream:
+    with ExitStack() as stack:
+        stream = stack.enter_context(package.open("rb"))
         encoded, manifest = read_manifest(stream)
+        mirror = stack.enter_context(sealed_copy.open("xb")) if sealed_copy else None
+        if mirror:
+            mirror.write(MAGIC + struct.pack(">I", len(encoded)) + encoded)
         full_digest = container_digest(encoded)
         paths = []
         for index, asset in enumerate(validate_manifest(manifest)):
             path = work / f"{index}.{asset['ext']}"
             with path.open("xb") as destination:
-                consume(stream, asset, destination=destination, package_digest=full_digest)
+                consume(stream, asset, destination=destination, package_digest=full_digest, mirror=mirror)
             paths.append(path)
         require(not stream.read(1), "Trailing data in package")
     after = package.stat()
@@ -58,52 +68,11 @@ def source_files(package, work):
             full_digest.hexdigest(), hashlib.sha256(encoded).hexdigest())
 
 
-def decoded_window(path, start, seconds):
-    data = run("ffmpeg", "-nostdin", "-v", "error", "-ss", f"{start:.6f}", "-i", str(path),
-               "-t", f"{seconds:.6f}", "-map", "0:a:0", "-ac", "1", "-ar", "4000", "-af",
-               "highpass=f=170,lowpass=f=1650", "-f", "f32le", "-")
-    return np.frombuffer(data, dtype="<f4").astype(np.float64)
-
-
-def timing_windows(song, audio, video, alignment):
-    chapter = song.get("chapter")
-    if not chapter or chapter["evidence"] != "audioMatched":
-        return {"status": chapter["evidence"] if chapter else "unlocated", "windows": []}
-    start, length = chapter["start"], song["duration"]
-    width = min(5.0, length * 0.16)
-    # Searching only near the claimed timestamp can lock onto a nearby beat
-    # even when the same recording has a stronger match one or two beats away.
-    margin = 2.5
-    windows = []
-    for part in (0.14, 0.48, 0.80):
-        inside = length * part
-        actual_margin = min(margin, start + inside)
-        a = decoded_window(audio, inside, width)
-        b = decoded_window(video, start + inside - actual_margin, width + 2 * actual_margin)
-        if len(a) < 600 or len(b) < len(a):
-            continue
-        try:
-            scores = alignment.normalized_waveform_correlation(b, a)
-        except alignment.AlignmentError:
-            continue
-        peak = alignment.best_alignment_peak(scores, exclusion_frames=600)
-        windows.append({"position": part,
-                        "offsetMS": round((peak.offset_frames / 4000 - actual_margin) * 1000, 1),
-                        "correlation": round(peak.score, 4),
-                        "runnerUpGap": round(peak.score_gap or 0, 4)})
-    offsets = [window["offsetMS"] for window in windows]
-    matches = (len(windows) == 3 and max(abs(value) for value in offsets) <= 150
-               and max(offsets) - min(offsets) <= 120
-               and min(window["correlation"] for window in windows) >= 0.10
-               and max(window["correlation"] for window in windows) >= 0.22
-               and sum(window["runnerUpGap"] >= 0.035 for window in windows) >= 2)
-    return {"status": "measured" if matches else "review", "windows": windows}
-
-
 def inspect_tracks(manifest, paths, optional):
-    result = []
     alignment = alignment_module() if optional.get("video") else None
-    for song, path in zip(manifest["music"], paths):
+
+    def inspect(item):
+        song, path = item
         measured = {}
         try:
             loudness, peak = measure(path)
@@ -118,11 +87,12 @@ def inspect_tracks(manifest, paths, optional):
         except (ValueError, OSError):
             timing = {"status": "review", "windows": []}
         rows = len(song.get("cues") or [])
-        result.append({"section": song["section"], "variant": song["variant"], "title": song.get("title"),
-                       "duration": song["duration"], "pdfPage": song.get("pdfPage")
-                       or (song["cues"][0]["page"] if rows else None), "cueRows": rows,
-                       "chapter": chapter, **measured, **timing})
-    return result
+        return {"section": song["section"], "variant": song["variant"], "title": song.get("title"),
+                "duration": song["duration"], "pdfPage": song.get("pdfPage")
+                or (song["cues"][0]["page"] if rows else None), "cueRows": rows,
+                "chapter": chapter, **measured, **timing}
+
+    return map_recordings(inspect, zip(manifest["music"], paths))
 
 
 class Card:
@@ -165,12 +135,6 @@ class Card:
             x, y, width, height = box
             fitted = ImageOps.contain(image.convert("RGB"), (width, height), Image.Resampling.LANCZOS)
             self.image.paste(fitted, (x + (width - fitted.width) // 2, y + (height - fitted.height) // 2))
-
-
-def clock(seconds):
-    minutes, seconds = divmod(int(seconds), 60)
-    hours, minutes = divmod(minutes, 60)
-    return f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}"
 
 
 def file_size(size):
@@ -281,19 +245,165 @@ def opening_preview(path, page):
             source.close()
 
 
+def measured_offsets(track):
+    return {sample["position"]: sample["offsetMS"] for sample in track["windows"]}
+
+
+def video_seek_card(card, routine, pair, files, report):
+    picture = report.get("videoInfo")
+    song, track = pair or (None, None)
+    position = None
+    frame = None
+    absent = "包中没有视频" if "video" not in files else "视频信息无法读取"
+    if picture:
+        position = video_position(song, track, picture["duration"])
+        try:
+            raw = run("ffmpeg", "-nostdin", "-v", "error", "-ss", f"{position.source_seconds:.6f}",
+                      "-i", str(files["video"]), "-map", "0:V:0", "-frames:v", "1",
+                      "-vf", "scale=880:-2", "-f", "image2pipe", "-vcodec", "png", "-")
+            with Image.open(BytesIO(raw)) as image:
+                frame = image.convert("RGB")
+        except (ValueError, OSError):
+            report["blockingIssues"].append("包内视频的抽查帧无法解码。")
+            absent = "视频帧解码需复查"
+    phone = PhonePreview(card, routine, section_title(song) if song else None, "视频", 0,
+                         frame=frame, unavailable_video=None if frame else absent)
+    if frame and position:
+        if position.uses_music_clock and song.get("cues"):
+            phone.timeline(song["cues"], position.local_seconds)
+        elif track and track["status"] == "review":
+            phone.empty("音画对位需复核", "画面取自包内声明的章节")
+        elif not track:
+            phone.empty("整课视频", "包内没有指定小节入口")
+        elif not position.uses_music_clock:
+            phone.empty("按视频章内时间预览")
+        else:
+            phone.empty("缺少可用动作时间线")
+        phone.transport(position.local_seconds, position.local_duration)
+    else:
+        phone.empty("可核对包内音乐和原谱")
+        card.text(511, 160, absent, 41)
+        return None
+
+    card.text(511, 143, section_title(song) if song else "整课视频", 24, ACCENT)
+    title = (song.get("title") or song["section"]) if song else routine
+    card.text(511, 181, title, 40, limit=620)
+    state = track["status"] if track else "unlocated"
+    card.text(511, 247, TIMING_STATES[state], 26, WARNING if state == "review" else SECONDARY)
+    label = "小节内时间" if position.uses_music_clock else "视频章内时间" if track else "全片时间"
+    for x, title, value in ((511, label, clock(position.local_seconds)),
+                            (835, "整课取帧时间", clock(position.source_seconds))):
+        card.draw.rounded_rectangle((x, 303, x + 300, 420), 15, fill=PANEL)
+        card.text(x + 20, 319, title, 23, SECONDARY)
+        card.text(x + 20, 353, value, 42)
+    if track:
+        chapter = track["chapter"]
+        card.text(511, 445, f"整课章节  {clock(chapter['start'])} – {clock(chapter['end'])}", 26)
+        windows = measured_offsets(track)
+        if state in {"measured", "review"}:
+            card.text(511, 516, "音画偏差（毫秒）", 25, SECONDARY)
+            positions = sorted(windows) if len(windows) == 3 else [part for part, _ in SAMPLE_POSITIONS]
+            for index, (fraction, (_, name)) in enumerate(zip(positions, SAMPLE_POSITIONS)):
+                x = 511 + index * 210
+                card.draw.line((x, 562, x + 177, 562), fill="#304458", width=2)
+                card.text(x, 578, f"{name} {fraction:.0%}", 22, SECONDARY)
+                deviation = windows.get(fraction)
+                card.text(x, 610, f"{deviation:+.1f}" if deviation is not None else "未测得", 29,
+                          ACCENT if state == "measured" else WARNING)
+    return position
+
+
+def action_timeline_card(card, routine, pair, video_pair, position, tracks):
+    if not pair:
+        phone = PhonePreview(card, routine, None, "音乐", 0)
+        phone.empty("缺少可用动作时间线")
+        card.text(511, 160, "无可跳转动作", 40)
+        pages = sum(bool(row["pdfPage"]) for row in tracks)
+        if pages:
+            card.text(511, 234, f"{pages} 首可从「波形图」查看原谱", 27, SECONDARY)
+        return None
+    song, _ = pair
+    rows = song["cues"]
+    linked = pair == video_pair and position is not None and position.uses_music_clock
+    at = position.local_seconds if linked else timeline_sample(song)
+    phone = PhonePreview(card, routine, section_title(song), "音乐", 0)
+    focus = phone.timeline(rows, at)
+    phone.transport(at, song["duration"])
+    cue = rows[focus] if focus is not None else rows[0]
+    card.text(511, 143, section_title(song), 24, ACCENT)
+    card.text(511, 181, song.get("title") or song["section"], 40, limit=620)
+    card.text(511, 253, f"小节内 {clock(at)}  /  {clock(song['duration'])}", 28)
+    if linked:
+        card.text(511, 295, "与视频定位预览为同一时点", 23, SECONDARY)
+    card.draw.rounded_rectangle((511, 353, 1135, 663), 15, fill=PANEL)
+    caption = "当前动作" if focus is not None else "首个动作"
+    card.text(535, 374, f"{caption}   {clock(cue['time'])}", 26, ACCENT)
+    y = 432
+    for line in wrapped_lines(card.draw, cue["action"], card.font(26), 573, 5):
+        card.text(535, y, line, 26, limit=573)
+        y += 33
+    details = [f"原谱第 {cue['page']} 页"]
+    if counts := score_metadata(cue.get("counts")):
+        details.append(f"{counts} 拍")
+    if repetitions := score_metadata(cue.get("repetitions")):
+        details.append(f"REPS {repetitions}")
+    card.text(535, 620, "  ·  ".join(details), 23, SECONDARY, 573)
+    card.text(511, 693, f"{sum(row['cueRows'] > 0 for row in tracks)} 首 · 共 {sum(row['cueRows'] for row in tracks)} 条动作",
+              24, SECONDARY)
+    return at, cue["page"]
+
+
+def original_pdf_card(card, routine, timeline, cue_position, files, pages, with_pages, issues):
+    at, cue_page = cue_position or (0, None)
+    preferred = {**timeline[1], "pdfPage": cue_page} if timeline and cue_page else None
+    samples = []
+    for row in (preferred, *[with_pages[index] for index in (0, len(with_pages) // 2, -1) if with_pages]):
+        if row and all(row["pdfPage"] != item["pdfPage"] for item in samples):
+            samples.append(row)
+    lead = samples[0] if samples else None
+    page = lead["pdfPage"] if lead else 1
+    phone = PhonePreview(card, routine, section_title(lead) if lead else None, "音乐", 1)
+    if not pages:
+        detail = "原谱需复查" if "pdf" in files else "包中没有原谱"
+        phone.empty(detail)
+        card.text(511, 160, detail, 40)
+        return
+    try:
+        phone.pdf(opening_preview(files["pdf"], page), page, pages)
+        if lead:
+            phone.transport(at, lead["duration"])
+        card.text(511, 143, section_title(lead) if lead else "原谱", 24, ACCENT)
+        card.text(511, 181, f"第 {page} 页  /  共 {pages} 页", 40)
+        card.text(511, 251, f"包内已标注 {len(with_pages)} 个小节入口", 24, SECONDARY)
+        for index, row in enumerate(samples[1:]):
+            x = 511 + index * 210
+            card.media(opening_preview(files["pdf"], row["pdfPage"]), (x, 326, 190, 272))
+            card.text(x, 626, f"{section_title(row)} · 第 {row['pdfPage']} 页", 22, limit=200)
+    except (ValueError, OSError, pypdfium2.PdfiumError):
+        issues.append("原谱抽查页无法渲染。")
+        phone.empty("原谱需修正")
+        card.text(511, 160, "原谱需修正", 40, WARNING)
+
+
 def screenshot_cards(manifest, files, report, font_path):
     tracks = report["tracks"]
     art = f"{manifest['program']} {manifest['routine']}"
     chapter_set = [entry for entry in tracks if entry["chapter"]]
     measured = sum(entry["status"] == "measured" for entry in tracks)
     with_pages = [entry for entry in tracks if entry["pdfPage"]]
-    cue_tracks = [song for song in manifest["music"] if song.get("cues")]
     with_cues = sum(entry["cueRows"] for entry in tracks)
     marker = report["sha256"][:12]
     issues = report["blockingIssues"]
 
     def card(number, title):
         return Card(title, f"{number:02d} / 09     {art}     SHA-256 {marker}", font_path)
+
+    def preview_card(number, title):
+        preview = card(number, None)
+        preview.text(48, 30, title, 48)
+        preview.text(878, 45, "SSplayer  /  离线预览", 23, ACCENT, 272)
+        preview.draw.line((48, 96, 1152, 96), fill=PANEL, width=2)
+        return preview
 
     counts = card(2, "包内资料")
     picture = report.get("videoInfo")
@@ -314,73 +424,26 @@ def screenshot_cards(manifest, files, report, font_path):
                  f"{clock(row['duration'])}   {row['title'] or row['section']}") for row in tracks])
     yield "03-track-list.png", music.image
 
-    video = card(4, "视频画面与定位")
-    if "video" in files and picture:
-        entry = next((row for row in chapter_set if row["status"] == "measured"), next(iter(chapter_set), None))
-        chapter = entry["chapter"] if entry else None
-        point = (chapter["start"] + min(12, (chapter["end"] - chapter["start"]) / 2)
-                 if chapter else min(3, picture["duration"] / 2))
-        try:
-            image = run("ffmpeg", "-nostdin", "-v", "error", "-ss", str(point), "-i", str(files["video"]),
-                        "-map", "0:V:0", "-frames:v", "1", "-vf", "scale=880:-2", "-f", "image2pipe", "-vcodec", "png", "-")
-            with Image.open(BytesIO(image)) as frame:
-                video.media(frame, (48, 181, 1104, 478))
-            label = (f"{entry['section']}    画面取自 {clock(point)}    章 {clock(chapter['start'])}–{clock(chapter['end'])}"
-                     if chapter else f"画面取自 {clock(point)}    当前未声明小节定位")
-            video.text(48, 680, label, 27)
-        except (ValueError, OSError):
-            issues.append("包内视频的抽查帧无法解码。")
-            video.text(48, 185, "视频帧解码需复查", 34, WARNING)
-    else:
-        video.text(48, 185, "视频信息无法读取" if "video" in files else "包中没有视频")
+    video_pair, timeline_pair = select_preview_tracks(manifest["music"], tracks)
+    video = preview_card(4, "视频定位")
+    position = video_seek_card(video, art, video_pair, files, report)
     yield "04-video-seek.png", video.image
 
     timing = card(5, "音乐与视频时钟复测")
     timing.text(48, 700, "前／中／尾三个窗口   •   数值为相对包内定位偏移（ms）", 23, SECONDARY)
-    states = {"measured": "吻合", "review": "需复核", "unlocated": "无定位",
-              "approximate": "近似", "visuallyConfirmed": "按画面"}
-    timing.rows([(row["section"], states[row["status"]] + "    " +
-                 " / ".join(f"{point['offsetMS']:+.0f}" for point in row["windows"])) for row in tracks])
+    timing_rows = []
+    for row in tracks:
+        values = " / ".join(f"{window['offsetMS']:+.1f}" for window in row["windows"])
+        timing_rows.append((section_title(row), f"{TIMING_STATES[row['status']]}   {values or '—'}"))
+    timing.rows(timing_rows)
     yield "05-timing.png", timing.image
 
-    cues = card(6, "动作时间线")
-    if cue_tracks:
-        song = max(cue_tracks, key=lambda entry: (sum("block" in row for row in entry["cues"]), len(entry["cues"])))
-        rows = song["cues"]
-        first = max((index for index, row in enumerate(rows) if row.get("block") is not None), default=0)
-        lines = []
-        for row in rows[first:]:
-            label = f"{song['section']}  {clock(row['time'])}"
-            details = [f"Block {row['block']}" if row.get("block") is not None else None,
-                       row.get("counts"), row["action"]]
-            lines.append((label, " · ".join(value for value in details if value)))
-        cues.rows(lines)
-        cues.text(48, 722, f"包内已写入 {len(cue_tracks)} 首、{sum(len(item['cues']) for item in cue_tracks)} 个动作点", 22, SECONDARY)
-    else:
-        cues.rows([("原谱入口", f"{len(with_pages)} 处"), ("动作时钟", "本包未提交可跳转动作点"),
-                   ("阅读方式", "打开该小节的原谱，查看原始动作和持续时长")])
+    cues = preview_card(6, "动作时间线")
+    cue_position = action_timeline_card(cues, art, timeline_pair, video_pair, position, tracks)
     yield "06-action-timeline.png", cues.image
 
-    pdf = card(7, "原谱打开页")
-    if pages:
-        selection = []
-        for index in (0, len(with_pages) // 2, len(with_pages) - 1):
-            if with_pages and with_pages[index] not in selection:
-                selection.append(with_pages[index])
-        if not selection:
-            selection = [{"section": "原谱", "pdfPage": 1}]
-        try:
-            for index, row in enumerate(selection):
-                x = 48 + index * 365
-                pdf.media(opening_preview(files["pdf"], row["pdfPage"]), (x, 184, 342, 480))
-                pdf.text(x, 679, f"{row['section']}    物理页 {row['pdfPage']}", 25, limit=340)
-        except (ValueError, OSError, pypdfium2.PdfiumError):
-            issues.append("原谱抽查页无法渲染。")
-            pdf.text(48, 185, "原谱需修正", 32, WARNING)
-    elif "pdf" in files:
-        pdf.text(48, 185, "原谱需修正", 32, WARNING)
-    else:
-        pdf.text(48, 185, "包中没有原谱")
+    pdf = preview_card(7, "原版波形图")
+    original_pdf_card(pdf, art, timeline_pair, cue_position, files, pages, with_pages, issues)
     yield "07-source-pdf.png", pdf.image
 
     volume = card(8, "声音解码与峰值")
@@ -405,13 +468,13 @@ def screenshot_cards(manifest, files, report, font_path):
     yield "09-review.png", gaps.image
 
 
-def generate(args):
+def generate(args, *, sealed_copy=None, overview_only=False):
     root = args.output_dir
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ssroutine-qa-") as staging, \
          tempfile.TemporaryDirectory(dir=root, prefix=".ssroutine-report-") as report_staging:
         work = Path(staging)
-        manifest, audio, optional, package_bytes, full_sha, manifest_sha = source_files(args.package, work)
+        manifest, audio, optional, package_bytes, full_sha, manifest_sha = source_files(args.package, work, sealed_copy)
         name = f"{manifest['program']}_{manifest['routine']}_{manifest['revision']}.qa"
         destination = root / name
         require(not destination.exists(), f"Evidence directory already exists: {name}")
@@ -449,19 +512,27 @@ def generate(args):
                 with pypdfium2.PdfDocument(optional["pdf"]) as document:
                     require(len(document) == manifest["pdf"]["pageCount"], "Original PDF page count does not match")
                     report["pdfPageCount"] = len(document)
+                _, proposals, _ = extract_cues(optional["pdf"], manifest["music"])
+                for song, source in zip(manifest["music"], proposals):
+                    has_printed_timeline = source["rows"] and source["status"] != "unresolved"
+                    if has_printed_timeline and not song.get("cues"):
+                        issues.append(f"{song['section']} 原谱有可读时间表，但资源包没有动作时间线。")
             except (ValueError, OSError, pypdfium2.PdfiumError):
                 issues.append("原谱无法打开，或实际页数与清单不符。")
         output = Path(report_staging) / "evidence"
         output.mkdir()
-        contact = Image.new("RGB", (1832, 1250), BACKGROUND)
+        width, height = SIZE
+        gap = 16
+        contact = Image.new("RGB", (3 * width + 4 * gap, 3 * height + 4 * gap), BACKGROUND)
         for file, frame in screenshot_cards(manifest, optional, report, font_path):
             index = int(file[:2]) - 1
-            frame.save(output / file)
-            contact.paste(ImageOps.contain(frame, (596, 403), Image.Resampling.LANCZOS),
-                          (14 + (index % 3) * 605, 14 + (index // 3) * 407))
+            if not overview_only:
+                frame.save(output / file)
+            contact.paste(frame, (gap + (index % 3) * (width + gap), gap + (index // 3) * (height + gap)))
         contact.save(output / "3x3-overview.png")
         report["offlineMediaPassed"] = not issues
-        write_html(output, manifest, report)
+        if not overview_only:
+            write_html(output, manifest, report)
         (output / "qa.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         output.rename(destination)
     print(json.dumps({"output": str(destination.resolve()), "screenshots": 9, "sha256": full_sha,

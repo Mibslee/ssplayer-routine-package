@@ -33,18 +33,18 @@ The private plan and review files are editing inputs. plan.music items use file 
 
 ## Batch handoff
 
-After answering the cover and source review, run `ssroutine.py submit` with the exact packages selected for delivery. The command checks each package and produces the following layout.
+After reviewing cover and sources, run `ssroutine.py finish` with one or more reviewed plans. Use `ssroutine.py submit` to verify and group packages that already exist. Both produce the following layout.
 
     SSplayer-20261124-xxxxxxxx/
       套路资源包/
         CORE_63_2.ssroutine
       质检图/
-        CORE_63_2/
-          01-…png through 09-…png
-          3x3-overview.png
+        CORE_63_2.png
       SSplayer-20261124-xxxxxxxx.ssfingerprints.json
 
 The batch fingerprint lists the standard name, program, release, revision, byte size, the complete package SHA-256, the raw internal manifest SHA-256 and the overview image SHA-256. Upload the batch as generated. A later media or metadata change produces a new fingerprint and needs a fresh review. The reviewer can return the free `.ssapproval` file alongside the exact approved packages. Open it in SSplayer before the packages or select it in the same import. Package import requires a verified Pro entitlement.
+
+Publishers can reuse previously signed releases by adding a verified `.ssapproval` and new fingerprint files in the Mac signer. The result covers the union of the exact file digests. Identical package entries are deduplicated. Conflicting bytes for one release and revision require a higher revision after review. The published Skill prepares fingerprints. The local publisher signs with a private Ed25519 key held outside the Skill. The approval contains the fingerprints, a public key identifier and a signature.
 
 ## Correcting an already shared package
 

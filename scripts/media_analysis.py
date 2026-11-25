@@ -20,8 +20,9 @@ from pathlib import Path
 SAMPLE_POSITIONS = ((0.14, "前段"), (0.48, "中段"), (0.80, "尾段"))
 
 STRUCTURAL_REPEAT = re.compile(
-    r"\b(?:REPEAT|RPT)\s+(?:(?:THE\s+|LUNGE\s+)?(?:BLOCKS?|SEQUENCES?|COMBOS?|SECTIONS?)\s+"
-    r"(?:\d+|[A-Z][0-9¹²³⁴⁵⁶⁷⁸⁹⁰]*)(?!\w)|[A-Z][0-9]*\s*(?:[-–—&+]|AND|TO)\s*[A-Z][0-9]*\b)",
+    r"\b(?:REPEAT|RPT)\s+(?:(?:THE\s+|LUNGE\s+)?(?:BLOCKS?|SEQUENCES?|COMBOS?|SECTIONS?|PARTS?)\s+"
+    r"(?:\d+|[A-Z][0-9¹²³⁴⁵⁶⁷⁸⁹⁰]*)(?!\w)|[A-Z][0-9]*\s*(?:[-–—&+]|AND|TO)\s*[A-Z][0-9]*\b)"
+    r"|(?:重复|重做)\s*(?:第\s*)?(?:段落|部分|组合|区块|小节|段)\s*[A-Z0-9一二三四五六七八九十]",
     re.IGNORECASE,
 )
 
@@ -128,15 +129,28 @@ def balance_audio(source, destination, target, video=False):
         audio = [s for s in media["streams"] if s["codec_type"] == "audio"]
         if len(audio) != 1:
             raise ValueError("Video balancing requires one audio stream. Select the intended version first.")
-        args = ["-map", "0", "-c", "copy", "-c:a:0", "aac", "-b:a:0", "256k",
-                "-filter:a:0", f"volume={gain:.6f}dB"]
+        args = ["-map", "0", "-c", "copy", "-c:a:0", "aac", "-b:a:0", "256k"]
+        volume_option = "-filter:a:0"
     else:
         duration, media = probe(source, "audio")
         source_codec = next(s["codec_name"] for s in media["streams"] if s["codec_type"] == "audio")
         lossless = source_codec in {"alac", "flac", "wavpack"} or source_codec.startswith("pcm_")
         audio_encoder = ["-c:a", "alac"] if lossless else ["-c:a", "aac", "-b:a", "256k"]
-        args = ["-map", "0:a:0", "-map_metadata", "0", *audio_encoder, "-af", f"volume={gain:.6f}dB"]
-    run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-i", str(source), *args, str(destination))
+        args = ["-map", "0:a:0", "-map_metadata", "0", *audio_encoder]
+        volume_option = "-af"
+
+    def encode(gain_db):
+        run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-i", str(source), *args,
+            volume_option, f"volume={gain_db:.6f}dB", str(destination))
+        return measure(destination)
+
+    final_lufs, final_peak = encode(gain)
+    if final_peak > -1.4:
+        # Some transients reconstruct far above the input peak after AAC.
+        # Use the measured result for one retry from the original recording.
+        gain -= final_peak + 2.2
+        destination.unlink()
+        final_lufs, final_peak = encode(gain)
     final_duration, final = probe(destination, "video" if video else "audio")
     if abs(final_duration - duration) > 0.20:
         raise ValueError(f"Audio balancing changed the duration of {source.name}")
@@ -152,7 +166,6 @@ def balance_audio(source, destination, target, video=False):
         final_audio = next(s for s in final["streams"] if s["codec_type"] == "audio")
         if abs(float(initial_audio.get("start_time", 0)) - float(final_audio.get("start_time", 0))) > 0.05:
             raise ValueError(f"Video balancing moved the embedded audio clock in {source.name}")
-    final_lufs, final_peak = measure(destination)
     if final_peak > -1.4 or abs(final_lufs - integrated - gain) > 1.0:
         raise ValueError(f"Post-encode loudness check failed for {source.name}")
     return destination, {"inputLUFS": integrated, "outputLUFS": final_lufs, "truePeakDBTP": final_peak,
@@ -681,6 +694,180 @@ def check_section_function(song, heading, conflicting=False):
     if declared != printed or heading.variant_source == "structured":
         return "manual", f"{location} 的功能或录音对应需人工复核。"
     return "matched", None
+
+
+def class_format_suggestions(path, pages=None):
+    """Read explicit duration tables. An agent still verifies order and omissions."""
+    if path is None:
+        return []
+    import pdfplumber
+    header = re.compile(
+        r"^(\d{1,3})\s*[-‐‑– ]?\s*MIN(?:UTE)?S?\s+(EXPRESS\s+FORMAT|FORMAT|STRENGTH|FLEXIBILITY)\b"
+        r"(?:\s*[-‐‑–—]\s*OPTION\s+(\d{1,2}))?", re.I)
+    token = r"0*\d{1,3}[A-Z]?"
+    consecutive = rf"{token}(?:\s*[&+]\s*(?:TRACK\s*)?(?:{token}|[A-Z])\b)*"
+    source_row = re.compile(
+        rf"^(?:TRACK\s*({consecutive}(?:\s*(?:/|\bor\b)\s*(?:TRACK\s*)?{consecutive})*)"
+        rf"|EXPRESS\s*(0*\d{{1,3}}))(?=\s|$)", re.I)
+    separator = re.compile(r"\s*(?:/|\bor\b)\s*(?:TRACK\s*)?", re.I)
+    chinese_header = re.compile(r"^(\d{1,3})\s*分钟\s*(?:课程)?(?:版本|课型|编排)\s*$")
+    chinese_row = re.compile(r"^(?:第\s*)?(\d{1,3})(?:\s*小节)?[\s、.：:]+([^\d].+)$")
+    structure_row = re.compile(r"^(\d{1,3})\s+(.+?)\s+\d{1,3}:(\d{2})$")
+    structure_total = re.compile(r"^(?:TOTAL|合计|总时长).*?(\d{1,3}):(\d{2})$", re.I)
+
+    def find_chinese_table(text, page):
+        tables = []
+        minutes, slots = None, []
+        for raw in text.splitlines() + ["结束"]:
+            line = unicodedata.normalize("NFKC", raw).strip()
+            if not line:
+                continue
+            if minutes is not None:
+                row = chinese_row.fullmatch(line)
+                if row and 1 <= int(row[1]) <= 128 and any("\u3400" <= char <= "\u9fff" for char in row[2]):
+                    slots.append({"sectionNumbers": [int(row[1])], "name": row[2].strip()})
+                    continue
+                if len(slots) >= 2 and len({slot["sectionNumbers"][0] for slot in slots}) == len(slots):
+                    tables.append({"minutes": minutes, "page": page, "slots": slots,
+                                   "_kind": "FORMAT", "_option": None})
+                minutes, slots = None, []
+            if (match := chinese_header.fullmatch(line)) and 5 <= int(match[1]) <= 180:
+                minutes = int(match[1])
+        return tables
+
+    def find_numbered_structure(text, page):
+        collecting, slots = False, []
+        for raw in text.splitlines():
+            line = unicodedata.normalize("NFKC", raw).strip()
+            if line == "课程结构":
+                collecting, slots = True, []
+            elif collecting and (match := structure_row.fullmatch(line)):
+                if int(match[1]) != len(slots) + 1 or len(slots) >= 64:
+                    return []
+                # This time column is per-song duration. Only the explicitly
+                # labelled total supplies the template duration.
+                slots.append({"sectionNumbers": [int(match[1])], "name": match[2].strip()})
+            elif collecting and (match := structure_total.fullmatch(line)):
+                if len(slots) >= 2 and 5 <= int(match[1]) <= 180 and int(match[2]) < 60:
+                    return [{"minutes": int(match[1]), "page": page, "slots": slots,
+                             "_kind": "FORMAT", "_option": None}]
+                return []
+        return []
+
+    def find_tables(text, page):
+        tables, current = [], None
+        for raw in text.splitlines():
+            line = unicodedata.normalize("NFKC", raw).strip()
+            if match := header.match(line):
+                minutes = int(match[1])
+                if 5 <= minutes <= 180:
+                    current = {"minutes": minutes, "page": page, "slots": [],
+                               "_kind": match[2].upper(), "_option": match[3]}
+                    tables.append(current)
+            elif re.match(r"^(?:Approx\.?\s*Time|PLEASE NOTE|TECHNICAL TEAM CREDIT|RELEASE FEEDBACK|GENERAL FEEDBACK)\b",
+                          line, re.I):
+                current = None
+            elif current is not None and (match := source_row.match(line)):
+                parts = separator.split(match[1].upper()) if match[1] else [match[2]]
+                groups = []
+                for part in parts:
+                    group = []
+                    for section in re.split(r"\s*[&+]\s*(?:TRACK\s*)?", part):
+                        if explicit := re.fullmatch(r"(\d+)([A-Z]?)", section):
+                            number, suffix = int(explicit[1]), explicit[2]
+                        else:
+                            suffix = section
+                        group.append((number, suffix))
+                    groups.append(group)
+                recordings = [recording for group in groups for recording in group]
+                numbers = list(dict.fromkeys(number for number, _ in recordings))
+                codes = [f"T{number}{suffix}" for number, suffix in recordings]
+                rest = line[match.end():].strip()
+                has_consecutive_parts = any(len(group) > 1 for group in groups)
+                unsupported_parts = has_consecutive_parts and (len(groups) != 1 or len(numbers) != 1
+                    or len(set(codes)) != len(codes) or not all(suffix for _, suffix in recordings))
+                leftover_selection = re.match(r"^(?:[&+]|/|\bor\b)\s*\(?\s*(?:TRACK\s*(?:\d|\()|\d)", rest, re.I)
+                if unsupported_parts or leftover_selection:
+                    current.setdefault("sourceReview", []).append(line)
+                    continue
+                if not all(1 <= number <= 128 for number in numbers):
+                    current = None
+                    continue
+                slot = {"sectionNumbers": numbers}
+                if any(code[-1].isalpha() for code in codes):
+                    slot["sectionCodes"] = codes
+                if has_consecutive_parts:
+                    slot["selectionMode"] = "consecutive"
+                if rest:
+                    slot["name"] = rest
+                if re.search(r"\bif time allows\b", rest, re.I):
+                    slot["isOptional"] = True
+                if match[2]:
+                    slot.update(variantPreference="alternative", enforcesVariant=True,
+                                requiredDurationMinutes=current["minutes"])
+                current["slots"].append(slot)
+            elif current is not None and re.match(r"^TRACK\s*\(", line, re.I):
+                current.setdefault("sourceReview", []).append(line)
+            elif current is not None and current["slots"]:
+                slot = current["slots"][-1]
+                if re.match(r"^\(if time allows\)", line, re.I):
+                    slot["isOptional"] = True
+                if slot.get("name", "").endswith("/") and re.match(r"^Bonus\b", line, re.I):
+                    slot["_bonus"] = line
+        return [table for table in tables if table["slots"] or table.get("sourceReview")]
+
+    guesses = []
+    with pdfplumber.open(path) as source:
+        numbers = range(1, len(source.pages) + 1) if pages is None else sorted(set(pages))
+        for number in numbers:
+            if not 1 <= number <= len(source.pages):
+                raise ValueError(f"Original course PDF has no physical page {number}.")
+            page = source.pages[number - 1]
+            text = page.extract_text() or ""
+            normalized = unicodedata.normalize("NFKC", text)
+            has_english = "format" in text.lower()
+            has_chinese = "分钟" in normalized
+            if not (has_english or has_chinese or "课程结构" in normalized):
+                continue
+            if "课程结构" in normalized:
+                guesses.extend(find_numbered_structure(text, number))
+            if not (has_english or has_chinese):
+                continue
+            midpoint = (page.bbox[0] + page.bbox[2]) / 2
+            left = page.crop((page.bbox[0], page.bbox[1], midpoint, page.bbox[3])).extract_text() or ""
+            right = page.crop((midpoint, page.bbox[1], page.bbox[2], page.bbox[3])).extract_text() or ""
+            if has_english:
+                columns = find_tables(left, number) + find_tables(right, number)
+                guesses.extend(columns or find_tables(text, number))
+            if has_chinese:
+                columns = find_chinese_table(left, number) + find_chinese_table(right, number)
+                guesses.extend(columns or find_chinese_table(text, number))
+    for item in guesses:
+        page_slots = [slot for table in guesses if table["page"] == item["page"] for slot in table["slots"]]
+        for slot in item["slots"]:
+            if bonus := slot.pop("_bonus", None):
+                matches = {candidate["sectionNumbers"][0] for candidate in page_slots
+                           if len(candidate["sectionNumbers"]) == 1
+                           and normalized_function_title(candidate.get("name", "")) == normalized_function_title(bonus)}
+                if len(matches) == 1 and not slot.get("sectionCodes"):
+                    slot["sectionNumbers"] = list(dict.fromkeys([*slot["sectionNumbers"], *matches]))
+                    slot["name"] = slot["name"].rstrip("/ ") + " / " + bonus
+    counts = {}
+    for template in guesses:
+        minutes = template["minutes"]
+        counts[minutes] = counts.get(minutes, 0) + 1
+        kind, option = template.pop("_kind"), template.pop("_option")
+        suffix = chr(64 + counts[minutes]) if sum(t["minutes"] == minutes for t in guesses) > 1 else ""
+        label = f"{minutes} 分钟"
+        if kind in {"STRENGTH", "FLEXIBILITY"}:
+            label += f" {kind.title()}"
+            suffix = ""
+        elif any(slot.get("enforcesVariant") for slot in template["slots"]):
+            label += " Express"
+        if option:
+            suffix = f"方案 {option}"
+        template.update(key=f"{minutes}-{counts[minutes]}", name=f"{label} {suffix}".strip(), approved=False)
+    return guesses
 
 
 def inspect_section_functions(path, songs):

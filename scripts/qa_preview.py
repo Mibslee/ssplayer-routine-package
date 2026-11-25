@@ -18,10 +18,11 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 from media_analysis import (SAMPLE_POSITIONS, alignment_module, extract_cues, map_recordings, measure,
                             probe, timing_windows, video_info)
-from qa_phone import (PhonePreview, clock, score_metadata, section_title, select_preview_tracks,
+from qa_phone import (FONT_PATHS, PhonePreview, clock, score_metadata, section_title, select_preview_tracks,
                       timeline_sample, video_position, wrapped_lines)
 from report_html import write_html
-from ssroutine import MAGIC, MAX_PACKAGE, consume, container_digest, read_manifest, require, validate_manifest
+from ssroutine import (MAGIC, MAX_PACKAGE, check_class_template_sources, consume, container_digest,
+                       read_class_template_document, read_manifest, require, validate_manifest)
 from subtitle_check import inspect_screen_subtitles, read_frame, subtitle_summary
 
 SIZE = (1200, 810)
@@ -37,17 +38,9 @@ STYLES = {
     "failed": ("需修正", "#ffa5a8", "#412730"),
 }
 CHECK_LABELS = {"contents": "包内资料", "audio": "音乐", "video": "视频定位", "subtitles": "字幕",
-                "timeline": "动作时间线", "pdf": "原版波形图", "structure": "小节功能"}
+                "timeline": "动作时间线", "pdf": "原版波形图", "structure": "小节功能", "formats": "课型识别"}
 TIMING_STATES = {"measured": "音画复测吻合", "review": "音画对位需复核", "unlocated": "未指定小节定位",
                  "approximate": "近似定位", "visuallyConfirmed": "按画面定位"}
-FONT_PATHS = [
-    "/System/Library/Fonts/STHeiti Medium.ttc",
-    "/System/Library/Fonts/STHeiti Light.ttc",
-    "C:/Windows/Fonts/msyh.ttc",
-    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
-]
-
-
 def add_issue(report, check, detail):
     report["checks"][check]["issues"].append(detail)
     report["blockingIssues"].append(detail)
@@ -68,6 +61,67 @@ def check_state(report, *keys):
 
 def sections_for(tracks):
     return "、".join(dict.fromkeys(section_title(track) for track in tracks))
+
+
+def class_slot_label(slot, *, show_edition=False):
+    codes = slot.get("sectionCodes") or [f"T{number}" for number in slot["sectionNumbers"]]
+    label = ("+" if slot.get("selectionMode") == "consecutive" else "/").join(codes)
+    if show_edition and (edition := slot.get("requiredDurationMinutes")):
+        label += f"（{edition} 分钟版）"
+    return f"({label})" if slot.get("isOptional") else label
+
+
+def class_slot_recordings(slot, songs):
+    edition = slot.get("requiredDurationMinutes")
+    codes = slot.get("sectionCodes")
+    matches = {}
+    for index, song in enumerate(songs):
+        code = song["section"]
+        if int(code[1:].rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")) not in slot["sectionNumbers"] or (codes and code not in codes):
+            continue
+        if edition is not None and song.get("classDurationMinutes") != edition:
+            continue
+        preference = slot.get("variantPreference")
+        if slot.get("enforcesVariant") and preference in ("standard", "alternative"):
+            if (song["variant"] == "standard") != (preference == "standard"):
+                continue
+        matches.setdefault(code, []).append(index)
+    if codes and slot.get("selectionMode") == "consecutive":
+        return [matches.get(code, []) for code in codes]
+    return [[index for by_code in matches.values() for index in by_code]]
+
+
+def class_recording_conditions(template, songs):
+    missing, demands = [], []
+    for slot in template["slots"]:
+        if slot.get("isOptional"):
+            continue
+        candidates = class_slot_recordings(slot, songs)
+        if all(candidates):
+            demands.extend(candidates)
+        else:
+            label = class_slot_label(slot, show_edition=True)
+            missing.append(label)
+    if missing:
+        return [f"{template['name']} · 缺 {'、'.join(missing)} 的录音。"]
+
+    # Each position can use one recording. Relocate earlier choices to avoid
+    # reporting a conflict when a different valid recording is available.
+    assigned = {}
+
+    def assign(position, visited):
+        for track in demands[position]:
+            if track in visited:
+                continue
+            visited.add(track)
+            if track not in assigned or assign(assigned[track], visited):
+                assigned[track] = position
+                return True
+        return False
+
+    if all(assign(position, set()) for position in range(len(demands))):
+        return []
+    return [f"{template['name']} · 包内不同录音不足以填满所有必选位置，可从其他套路补选。"]
 
 
 def source_files(package, work, sealed_copy=None):
@@ -92,7 +146,7 @@ def source_files(package, work, sealed_copy=None):
             (after.st_ino, after.st_size, after.st_mtime_ns), "Package changed during inspection")
     music_count = len(manifest["music"])
     others = iter(paths[music_count:])
-    optional = {key: next(others) for key in ("video", "pdf", "cover") if manifest.get(key)}
+    optional = {key: next(others) for key in ("video", "pdf", "cover", "classTemplatesFile") if manifest.get(key)}
     return (manifest, paths[:music_count], optional, after.st_size,
             full_digest.hexdigest(), hashlib.sha256(encoded).hexdigest())
 
@@ -461,12 +515,15 @@ def screenshot_cards(manifest, files, report, font_path):
     if picture:
         caption_parts = subtitle_summary(picture, report["screenSubtitles"])
         caption = " · ".join(caption_parts)
+    templates = report.get("classTemplates", [])
+    template_rows = [("排课模板", f"{len(templates)} 套 · " + " / ".join(t["name"] for t in templates))] if templates else []
     counts.rows([("音乐", f"{len(tracks)} 首"), ("视频", video_format), ("字幕", caption),
                  ("原谱", f"{pages} 页" if pages else "待核对" if "pdf" in files else "未附原谱"),
                  ("封面", "已包含" if "cover" in files else "App 会用占位图"),
                  ("视频定位", f"{len(chapter_set)} 个 · 实测吻合 {measured} 个"),
                  ("原谱入口", f"{len(with_pages)} 个物理页入口"),
                  ("小节功能", f"{sum(bool(row['sectionFunction']) for row in tracks)} / {len(tracks)} 首已有定义"),
+                 *template_rows,
                  ("动作", f"{with_cues} 条"),
                  ("完整性", f"{report['bytes']:,} 字节 · 所有载荷 SHA-256 已核对")])
     decorate(counts, 85, "contents", "subtitles")
@@ -525,12 +582,44 @@ def screenshot_cards(manifest, files, report, font_path):
     routine_overview(overview, art, manifest, files, report)
     yield "01-identity.png", overview.image
 
-    gaps = card(9, "复核清单")
-    notes = [(CHECK_LABELS[key], reason) for key, check in report["checks"].items()
-             for reason in [*check["issues"], *check["conditions"]]]
-    gaps.rows([*notes, *(("编号间隔", f"T{number} · 对照原谱确认") for number in report["sectionGaps"]),
-               ("App", "导入、播放与排课需在实际 App 中验收")])
-    gaps.status(check_state(report), 85)
+    gaps = card(9, "课型识别")
+    format_state = check_state(report, "formats")
+    if templates or format_state != "passed":
+        gaps.status(format_state, 85)
+    if templates:
+        per_column = 7 if len(templates) <= 7 else 6
+        width = 1070 if len(templates) <= 7 else 520
+        row_height = 75 if len(templates) == 7 else 87
+        checks = report["checks"]["formats"]
+        for index, template in enumerate(templates):
+            column, row = divmod(index, per_column)
+            x, y = 48 + column * 552, 172 + row * row_height
+            gaps.draw.rounded_rectangle((x, y, x + width, y + row_height - 6), 8, fill=PANEL)
+            prefix = f"{template['name']} ·"
+            notes = [note for note in checks["conditions"] if note.startswith(prefix)]
+            failed = any(note.startswith(prefix) for note in checks["issues"])
+            state = "failed" if failed else "conditional" if notes else "passed"
+            gaps.text(x + 12, y + 5, f"{template['name']} · 原谱第 {template['page']} 页", 23, ACCENT, width - 82)
+            gaps.status(state, y + 6, x=x + width - 64, marker_only=True)
+            order = " → ".join(class_slot_label(slot, show_edition=True) for slot in template["slots"])
+            gaps.text(x + 12, y + 31, order, 22, PRIMARY, width - 80)
+            if notes or failed:
+                note = notes[0].removeprefix(template["name"]).strip(" ·") if notes else "与原谱的选曲顺序不一致。"
+                gaps.text(x + 12, y + (51 if row_height < 80 else 56), note, 18, WARNING, width - 22)
+        pending = [note for note in checks["conditions"] if not any(
+            note.startswith(f"{template['name']} ·") for template in templates)]
+        if pending:
+            marker = f"另有 {len(pending)} 项待复核 · " if len(pending) > 1 else ""
+            gaps.text(48, 704, marker + pending[0], 21, WARNING, 1104)
+        gaps.text(48, 733 if pending else 719, "在实际 App 验收导入和跨套路排课", 21, SECONDARY)
+    else:
+        checks = report["checks"]
+        prioritized = ["formats", *(key for key in checks if key != "formats")]
+        notes = [(CHECK_LABELS[key], reason) for key in prioritized
+                 for reason in [*checks[key]["issues"], *checks[key]["conditions"]]]
+        gaps.rows([("课型", "包内未提供已核对的原谱课型"), *notes,
+                   *(("编号间隔", f"T{number} · 对照原谱确认") for number in report["sectionGaps"]),
+                   ("App", "导入、播放与排课需在实际 App 中验收")])
     yield "09-review.png", gaps.image
 
 
@@ -615,6 +704,19 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                     require(len(document) == manifest["pdf"]["pageCount"], "Original PDF page count does not match")
                     report["pdfPageCount"] = len(document)
                 _, proposals, _ = extract_cues(optional["pdf"], manifest["music"])
+                templates = []
+                if source_file := optional.get("classTemplatesFile"):
+                    with source_file.open("rb") as stream:
+                        templates = read_class_template_document(stream, manifest["pdf"])
+                    report["classTemplates"] = templates
+                try:
+                    for note in check_class_template_sources(optional["pdf"], templates, include_omissions=True):
+                        add_condition(report, "formats", note)
+                except ValueError as error:
+                    add_issue(report, "formats", str(error))
+                for template in templates:
+                    for note in class_recording_conditions(template, manifest["music"]):
+                        add_condition(report, "formats", note)
                 for song, source, track in zip(manifest["music"], proposals, tracks):
                     if checked := source.get("sectionFunctionCheck"):
                         status, message = checked

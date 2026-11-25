@@ -6,7 +6,7 @@ The file name is PROJECT_ROUTINE_REVISION.ssroutine. PROJECT uses 2–16 ASCII u
 
 Eight ASCII bytes SSRT0001, a four-byte unsigned big-endian JSON length, then the UTF-8 JSON manifest. The rest consists of raw file bytes in the order recorded below. There is no compression, executable metadata, encryption or file-system path in the format. Ordinary archive apps cannot expand it as a ZIP. A program implementing the format can read the payloads. SHA-256 checks content integrity against the manifest, while publisher trust and contribution approval are established outside the format.
 
-Manifest length is at most 4 MiB. The total file is at most 12 GiB. Each asset declares lowercase ext, exact positive bytes, and lowercase whole-file sha256. Files are ordered by the music array, then optional video, PDF and cover. Missing assets consume no bytes. Approved analysis refers only to the exact media bound into the same manifest.
+Manifest length is at most 4 MiB. The total file is at most 12 GiB. Each asset declares lowercase ext, exact positive bytes, and lowercase whole-file sha256. Files are ordered by the music array, then optional video, PDF, cover and class-templates.json. Missing assets consume no bytes. Approved analysis refers only to the exact media bound into the same manifest.
 
 | Field | Meaning |
 | --- | --- |
@@ -57,3 +57,11 @@ Publishers can reuse previously signed releases by adding a verified `.ssapprova
     python3 scripts/ssroutine.py submit "/local-work/revised/CORE_63_2.ssroutine" --output-dir "/chosen-output"
 
 Between the first two commands, correct the timelines, positions or metadata in `review-manifest.json` against the source. The revision reuses the original audio, video and PDF byte for byte. Use an explicitly approved `--cover /path/to/artwork.jpg` to change just the cover, or `--without-cover` if the creator chooses to omit it. Use `build` from the reviewed local sources when audio, video or PDF bytes change. Existing manual preparation and notes remain with their recording in SSplayer.
+
+### Class formats
+
+The optional independent payload `class-templates.json` carries an object with `schemaVersion` set to 1 and a `templates` array. The package manifest binds its bytes with the `classTemplatesFile` descriptor. No device-specific recording IDs are stored. A template can be reused across routines inside its project. Each format has a stable lowercase `key`, display `name`, `minutes`, physical `page`, and ordered `slots`. Each slot lists `sectionNumbers` in the printed order of alternatives. For example `[2, 3]` is one position with two eligible source sections. A separate slot can refer to T5 after T9.
+
+Use optional `name` for a printed function and `sectionCodes` for exact labels such as `["T8B"]`. Keep the matching `sectionNumbers`, for example `[8]`. With `selectionMode: "consecutive"`, `["T3A", "T3B"]` requires both recordings in that order from one routine. Mark a slot with `isOptional: true` when the original explicitly allows omission. Use `variantPreference` for a main or replacement preference, and `enforcesVariant` with `requiredDurationMinutes` when the source demands the exact edition. An audio item may declare `classDurationMinutes` after its edition has been verified. Keep missing required slots in the template so the App and QA can identify the gap. Previously authored packages can omit the template file and edition metadata.
+
+The agent must compare each proposed table with its source page before approving it. A contradiction in a readable table blocks build and submission. Pages requiring visual review are indicated in QA.

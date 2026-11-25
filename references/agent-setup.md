@@ -55,7 +55,7 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 ## 命令行示例
 
-在工作目录保留 `plan.json` 和 `review.json`。先把 `coverCandidates` 里的图片展示给制作者。示例里的 `/工作区/已确认.jpg` 可以是独立图片，也可以是计划提取的内嵌封面。制作者选择留空时，用 `--without-cover` 代替 `--cover`。
+在工作目录保留 `plan.json` 和 `review.json`。先展示 `coverCandidates` 里的图片。示例里的 `/工作区/已确认.jpg` 可以是独立图片，也可以是计划提取的内嵌封面。没有合适的候选时，先请制作者提供封面。
 
     python scripts/ssroutine.py doctor
     python scripts/ssroutine.py attribution
@@ -66,7 +66,12 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 首次确认可以加 `--remember-credit`，把本批选择保存为此设备当前账户的默认署名。可以存一个名字，也可以用 `--no-credit --remember-credit` 存默认不署名。以后确认时直接沿用计划列出的默认值。仅本批改名或不署名时，传 `--credit` 或 `--no-credit` 即可。用 `python scripts/ssroutine.py attribution --reset` 清除本机默认。配置默认位于 `~/.config/ssplayer_package_creator/attribution.json`，支持 `XDG_CONFIG_HOME`。它与批次交付目录分开。
 
-用 `--without-cover` 确认省略封面。旧版已核验的计划和资源包仍可处理。新版计划更改项目或套路身份、显示名称、版本、发行时间、封面或本批署名后，需要重新记录当前确认。
+制作者没有封面时，生成文字预览并展示。确认使用后，把 PNG 交给同一个 `--cover` 选项。图片会进入资源包和九宫格首图。可以从计划读取名称，也可以用下面的参数应用本轮改名。当前字体缺少字符时，用 `--font` 指定支持课程文字的字体，例如 Noto Sans CJK。
+
+    python scripts/ssroutine.py text-cover plan.json --project-name "综合训练" --routine-name "第 26 期" --output cover-preview.png
+    python scripts/ssroutine.py confirm-plan plan.json --project-name "综合训练" --routine-name "第 26 期" --cover cover-preview.png --no-credit --output confirmed-plan.json
+
+制作者选择留空时使用 `--without-cover`。旧版已核验的计划和资源包仍可处理。更改项目或套路身份、显示名称、版本、发行时间、封面或本批署名后，重新记录确认。采用文字封面时，改名也需要重新生成 PNG。
 
 先核对 `plan.json` 中的资料和归属，再运行 `analyze`。通过音画复测的小节会自动确认同步定位。对需要复核的章节和 PDF 动作，比较原始资料后再批准。能点选的智能体可用「确认开始」「调整选项」「输入要求」。也可以直接回复想用的画质、响度、署名或某一套的例外。见[制作和质检](quality-check.md)。
 
@@ -102,7 +107,7 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
     python scripts/qa_preview.py "/成品/TONE_26_1.ssroutine" --output-dir "/成品" --strict
 
-输出一个同名 `.qa` 目录，包含九张单图、`3x3-overview.png` 和 `report.html`。左上首图 `01-identity.png` 汇总套路、封面、发行时间、包版本、署名、总包大小、视频实测参数、音乐与原谱。视频有独立字幕轨时显示轨数，压进画面的字幕需看片确认。其余八图覆盖素材完整性、曲目与替换、视频画面、对位实测、动作时间线、原谱打开页、响度及复核项。可视报告把复核项放在前面，每首歌可以展开看具体结果。`qa.json` 是工具间交换用的数据。
+输出一个同名 `.qa` 目录，包含九张单图、`3x3-overview.png` 和 `report.html`。左上首图 `01-identity.png` 汇总套路、封面、发行时间、包版本、署名、总包大小、视频实测参数、音乐与原谱。视频有独立字幕轨时显示轨数，压进画面的字幕需看片确认。其余八图覆盖素材完整性、曲目及小节功能、视频画面、对位实测、动作时间线、原谱打开页、响度和课型识别。可视报告把复核项放在前面，每首歌可以展开看具体结果。`qa.json` 是工具间交换用的数据。
 
 首图沿用电影条目的阅读顺序，大封面旁是标题、发行时间和时长，下方突出包体积与离线质检结果。质检结果包含抽查视频帧和原谱打开页时发现的问题。
 

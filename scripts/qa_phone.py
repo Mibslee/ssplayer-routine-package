@@ -12,6 +12,12 @@ SEPARATOR = "#e2e5eb"
 PHONE = "#eff1f6"
 RED = "#e9254b"
 HIGHLIGHT = "#fbebee"
+FONT_PATHS = (
+    "/System/Library/Fonts/STHeiti Medium.ttc",
+    "/System/Library/Fonts/STHeiti Light.ttc",
+    "C:/Windows/Fonts/msyh.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+)
 VARIANTS = {"alternative": "替换曲", "bonus": "加曲", "combo45": "45 分钟版",
             "combo45Alternative": "45 分钟替换曲", "combo45Bonus": "45 分钟加曲",
             "outro": "结束曲", "preClass": "课前曲"}

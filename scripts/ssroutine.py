@@ -21,7 +21,7 @@ from pathlib import Path
 from time import perf_counter
 
 from media_analysis import (alignment_module, audio_packet_hash, balance_audio, efficient_video, extract_cues,
-                            inspect_section_functions, locate_chapters, map_recordings, optimize_video, probe, run, timing_windows,
+                            class_format_suggestions, inspect_section_functions, locate_chapters, map_recordings, optimize_video, probe, run, timing_windows,
                             unresolved_repeat_times, video_info)
 
 
@@ -29,13 +29,15 @@ MAGIC = b"SSRT0001"
 MIB = 1024 * 1024
 MAX_MANIFEST = 4 * MIB
 MAX_PACKAGE = 12 * 1024 * MIB
+MAX_PDF_MIB = 64
 AUDIO = {"aac", "aif", "aiff", "flac", "m4a", "mp3", "wav"}
 VIDEO = {"mp4", "m4v", "mov"}
 PICTURE = {"jpg", "jpeg", "png"}
 VARIANTS = {"standard", "bonus", "alternative", "combo45", "combo45Alternative", "combo45Bonus", "outro", "preClass"}
 PROGRAM_ALBUMS = {
     "BODYCOMBAT": "BC", "BODYJAM": "BJ", "BODYPUMP": "BP", "BODYATTACK": "BA", "RPM": "RPM",
-    "BC": "BC", "BJ": "BJ", "BP": "BP", "BA": "BA", "CORE": "CORE", "TONE": "TONE", "GRIT": "GRIT",
+    "BODYBALANCE": "BB", "BODYFLOW": "BB", "BODYSTEP": "BS",
+    "BC": "BC", "BJ": "BJ", "BP": "BP", "BA": "BA", "BB": "BB", "BS": "BS", "CORE": "CORE", "TONE": "TONE", "GRIT": "GRIT",
 }
 PROGRAM_ALIASES = {**PROGRAM_ALBUMS, **{f"LESMILLS{name}": code for name, code in PROGRAM_ALBUMS.items()},
                    "莱美核心": "CORE", "莱美核心训练": "CORE", "莱美GRIT": "GRIT", "莱美TONE": "TONE",
@@ -70,6 +72,17 @@ def identity(path):
     require((before.st_ino, before.st_size, before.st_mtime_ns) ==
             (after.st_ino, after.st_size, after.st_mtime_ns), f"File changed during analysis: {path.name}")
     return value
+
+
+def checked_pdf_path(value):
+    path = Path(value).resolve(strict=True)
+    require(path.is_file() and extension(path) == "pdf",
+            f"请选择可读取的原谱 PDF：{path.name}")
+    size = path.stat().st_size
+    require(size > 0, f"原谱 PDF 是空文件：{path.name}")
+    require(size <= MAX_PDF_MIB * MIB,
+            f"原谱 PDF 超过 {MAX_PDF_MIB} MiB：{path.name}。请使用保留页序和文字的压缩副本。")
+    return path
 
 
 def write_json(path, data):
@@ -130,7 +143,7 @@ def track_stem(stem, program, routine):
     return match[1] if match else stem
 
 
-def cover_extension(source):
+def cover_extension(source, names=None):
     from PIL import Image
 
     try:
@@ -139,17 +152,23 @@ def cover_extension(source):
             require(ext and all(1 <= size <= 8192 for size in image.size),
                     "Choose a JPEG or PNG image up to 8192 pixels per side.")
             image.load()
+            if names:
+                from text_cover import NAME_KEYS
+
+                artwork_names = tuple(image.info.get(key) for key in NAME_KEYS)
+                require(not any(artwork_names) or artwork_names == names,
+                        "课程或套路名称已变更，请重新生成并确认文字封面。")
             return ext
     except (OSError, Image.DecompressionBombError) as error:
         raise ValueError("The cover image cannot be decoded.") from error
 
 
-def cover_asset(path):
+def cover_asset(path, names=None):
     require(path.is_file(), "Choose a local cover image.")
     with path.open("rb") as artwork:
         data = artwork.read(8 * MIB + 1)
     require(0 < len(data) <= 8 * MIB, "Choose a cover image of at most 8 MiB.")
-    ext = cover_extension(BytesIO(data))
+    ext = cover_extension(BytesIO(data), names)
     require(extension(path) == ext, "The cover extension must match the image format.")
     return {"ext": ext, "bytes": len(data), "sha256": hashlib.sha256(data).hexdigest()}
 
@@ -192,7 +211,7 @@ def set_cover_selection(config, choice):
         config["coverSelection"] = {"omit": True}
         return None
     path = choice.resolve(strict=True)
-    asset = cover_asset(path)
+    asset = cover_asset(path, (config.get("projectName"), config.get("routineName")))
     config["cover"] = str(path)
     config["coverSelection"] = {"sha256": asset["sha256"]}
     return asset
@@ -203,7 +222,7 @@ def selected_cover(config):
     if path := config.get("cover"):
         require(selected and selected.get("sha256"),
                 "Show the artwork to the creator and run select-cover with the confirmed image.")
-        asset = cover_asset(Path(path))
+        asset = cover_asset(Path(path), (config.get("projectName"), config.get("routineName")))
         require(selected == {"sha256": asset["sha256"]},
                 "The confirmed artwork changed. Show it again and run select-cover.")
         return asset
@@ -217,7 +236,12 @@ def select_cover(args):
     document = read_json(args.input)
     config = document.get("plan", document)
     read_identity(config)
+    confirmed = config.get("identityConfirmation") is not None
+    if confirmed:
+        validate_confirmation(config)
     asset = set_cover_selection(config, args.cover)
+    if confirmed:
+        config["identityConfirmation"] = confirmation_values(config)
     if config is not document:
         if asset:
             document["cover"] = asset
@@ -280,6 +304,19 @@ def confirm_plan(args):
         save_default_credit(config["credit"] or "")
 
 
+def text_cover(args):
+    from text_cover import render
+
+    config = read_json(args.input)
+    program, _, _ = read_identity(config)
+    for argument, key in (("project_name", "projectName"), ("routine_name", "routineName")):
+        if getattr(args, argument) is not None:
+            config[key] = getattr(args, argument).strip()
+    validate_display_metadata(config)
+    require(config.get("projectName") and config.get("routineName"), "请填写课程名称和套路名称。")
+    render(args.output, program=program, project=config["projectName"], routine=config["routineName"], font_path=args.font)
+
+
 def canonical_duplicate(items):
     paths = [Path(item["file"]) for item, _ in items]
     durations = [duration for _, duration in items]
@@ -324,7 +361,7 @@ def plan(args):
         suffix = extension(file)
         if suffix in AUDIO:
             stem = track_stem(file.stem, program, routine)
-            match = re.match(r"^(?:(ALTERNATIVE|ALT|BNS|BONUS|替换曲|替换|备选|A|B)[ ._-]*)?(?:T[ ._-]*)?(\d{1,3})([A-Z]?)(?:[ ._-]+(.*)|$)",
+            match = re.match(r"^(?:(ALTERNATIVE|ALT|EXPRESS|BNS|BONUS|替换曲|替换|备选|A|B|E)[ ._-]*)?(?:T[ ._-]*)?(\d{1,3})([A-Z]?)(?:[ ._-]+(.*)|$)",
                              stem, re.I)
             if not match or not 1 <= int(match[2]) <= 128:
                 review.append(str(file))
@@ -332,6 +369,7 @@ def plan(args):
             prefix, number, letter, title = match.groups()
             markers = {"ALT": "alternative", "ALTERNATIVE": "alternative", "A": "alternative",
                        "替换曲": "alternative", "替换": "alternative", "备选": "alternative",
+                       "EXPRESS": "alternative", "E": "alternative",
                        "BNS": "bonus", "B": "bonus", "BONUS": "bonus"}
             variant = markers.get((prefix or "").upper(), "standard")
             suffix = re.match(r"^(ALTERNATIVE|ALT|BONUS|BNS|替换曲|替换|备选)(?:[ ._-]+(.*)|$)",
@@ -407,6 +445,7 @@ def analyze(args):
     program, _, _ = read_identity(config)
     validate_confirmation(config)
     cover = selected_cover(config)
+    pdf = checked_pdf_path(config["pdf"]) if config.get("pdf") else None
     songs = config["music"]
     require(1 <= len(songs) <= 128, "Choose the music files in the plan")
     validate_slots(program, songs)
@@ -420,14 +459,23 @@ def analyze(args):
     review = {"plan": config, "programRoutine": [config["program"], config["routine"]],
               "tracks": [{"source": row["source"], "duration": row["duration"], "selection": source_selection(row)}
                          for row in audio]}
-    if config.get("pdf"):
-        pdf = Path(config["pdf"]).resolve(strict=True)
+    if pdf:
         page_count, cues, warnings = extract_cues(pdf, audio, ocr=args.ocr)
         review.update(pdf={"source": identity(pdf), "pageCount": page_count}, pdfWarnings=warnings)
-        for record, rows in zip(review["tracks"], cues):
+        review["classTemplates"] = class_format_suggestions(pdf)
+        for song, record, rows in zip(songs, review["tracks"], cues):
             if function := rows.pop("sectionFunction", None):
                 record["sectionFunction"] = function
             record["cues"] = rows
+            stem = track_stem(Path(song["file"]).stem, program, config["routine"])
+            if song["variant"] == "alternative" and re.match(r"(?i)^(?:EXPRESS|E)[ ._-]*\d+", stem):
+                number = int(re.search(r"\d+", song["section"])[0])
+                editions = {(slot["requiredDurationMinutes"], template["page"])
+                            for template in review["classTemplates"] for slot in template["slots"]
+                            if slot.get("requiredDurationMinutes") and number in slot["sectionNumbers"]}
+                if len(editions) == 1:
+                    minutes, page = next(iter(editions))
+                    record["classEdition"] = {"minutes": minutes, "page": page, "approved": False}
     if config.get("video"):
         video = Path(config["video"]).resolve(strict=True)
         duration, metadata = probe(video, "video")
@@ -451,6 +499,9 @@ def analyze(args):
                       "chaptersProposed": sum(bool(x.get("chapter")) for x in review["tracks"]),
                       "cueRowsProposed": sum(len(x.get("cues", {}).get("rows", [])) for x in review["tracks"]),
                       "sectionFunctionsProposed": sum("sectionFunction" in record for record in review["tracks"]),
+                      "classTemplatesProposed": sum(not item.get("sourceReview") for item in review.get("classTemplates", [])),
+                      "classTemplateManualReview": [item["name"] for item in review.get("classTemplates", [])
+                                                    if item.get("sourceReview")],
                       "seconds": round(perf_counter() - started, 2)}))
 
 
@@ -561,6 +612,87 @@ def validate_quality_notes(notes):
                     for text in notes.values()), "Invalid quality note")
 
 
+def validate_class_templates(templates, pdf):
+    require(isinstance(templates, list) and len(templates) <= 12, "The pack can contain up to 12 class templates.")
+    require(not templates or pdf, "Class templates require the original course PDF.")
+    keys = set()
+    for template in templates:
+        key, name, minutes, page, slots = (template[k] for k in ("key", "name", "minutes", "page", "slots"))
+        require(isinstance(key, str) and re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", key) and key not in keys
+                and valid_text(name, 240, single_line=True) and name and name.strip() == name and len(name) <= 68
+                and type(minutes) is int and 5 <= minutes <= 180 and type(page) is int and 1 <= page <= pdf["pageCount"]
+                and isinstance(slots, list) and 1 <= len(slots) <= 64, "Invalid class template identity, duration, or source page.")
+        keys.add(key)
+        for slot in slots:
+            numbers = slot["sectionNumbers"]
+            edition = slot.get("requiredDurationMinutes")
+            mode = slot.get("selectionMode", "single")
+            require(isinstance(numbers, list) and 1 <= len(numbers) <= 20
+                    and all(type(x) is int and 1 <= x <= 128 for x in numbers) and len(set(numbers)) == len(numbers)
+                    and slot.get("variantPreference", "any") in ("standard", "alternative", "any")
+                    and mode in ("single", "consecutive")
+                    and type(slot.get("enforcesVariant", False)) is bool
+                    and type(slot.get("isOptional", False)) is bool
+                    and (edition is None or (type(edition) is int and 5 <= edition <= 180))
+                    and valid_text(slot.get("name", ""), 160, single_line=True),
+                    f"Invalid section or edition in class template {key}.")
+            if (codes := slot.get("sectionCodes")) is not None:
+                require(isinstance(codes, list) and 1 <= len(codes) <= 20
+                        and all(isinstance(code, str) and re.fullmatch(r"T[1-9][0-9]{0,2}[A-Z]?", code) for code in codes)
+                        and len(set(codes)) == len(codes)
+                        and {int(code[1:].rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")) for code in codes} == set(numbers)
+                        and (mode != "consecutive" or (len(codes) > 1 and len(numbers) == 1
+                             and all(code[-1].isalpha() for code in codes))),
+                        f"Invalid exact section codes in class template {key}.")
+
+
+def read_class_template_document(stream, pdf):
+    value = json.load(stream)
+    require(isinstance(value, dict) and type(value.get("schemaVersion")) is int and value["schemaVersion"] == 1,
+            "Unsupported class-templates.json schema.")
+    templates = value["templates"]
+    validate_class_templates(templates, pdf)
+    require(bool(templates), "The class template file must contain at least one format.")
+    return templates
+
+
+def check_class_template_sources(path, templates, *, include_omissions=False):
+    if not templates and not include_omissions:
+        return []
+    formats = class_format_suggestions(path, None if include_omissions else [template["page"] for template in templates])
+    grouped = {}
+    for index, item in enumerate(formats):
+        grouped.setdefault(item["page"], []).append((index, item))
+    manual = []
+    matched = set()
+
+    def rule(slot):
+        return (slot["sectionNumbers"], slot.get("requiredDurationMinutes"),
+                slot.get("sectionCodes"), slot.get("selectionMode", "single"), slot.get("isOptional", False),
+                slot.get("variantPreference") if slot.get("enforcesVariant") else None)
+
+    for template in templates:
+        choices = grouped.get(template["page"], [])
+        if not choices:
+            manual.append(f"{template['name']} · 原谱第 {template['page']} 页需人工核对课型。")
+            continue
+        template_rules = list(map(rule, template["slots"]))
+        matching = [index for index, item in choices if not item.get("sourceReview")
+                    and item["minutes"] == template["minutes"] and list(map(rule, item["slots"])) == template_rules]
+        if not matching and any(item["minutes"] == template["minutes"] and item.get("sourceReview") for _, item in choices):
+            raise ValueError(f"{template['name']} · 原谱第 {template['page']} 页有当前模板无法完整表达的组合选曲。")
+        require(matching, f"{template['name']} · 课长、选曲顺序或指定版本与原谱第 {template['page']} 页不符。")
+        matched.add(next((index for index in matching if index not in matched), matching[0]))
+    if include_omissions:
+        for index, item in enumerate(formats):
+            location = f"{item['name']} · 原谱第 {item['page']} 页"
+            if item.get("sourceReview"):
+                manual.append(f"{location} 有组合选曲需人工复核 · {' / '.join(item['sourceReview'])}")
+            elif index not in matched:
+                manual.append(f"{location} 有可识别课型，包内未提供对应模板。")
+    return manual
+
+
 def validate_manifest(value):
     program, _, _ = read_identity(value)
     songs = value["music"]
@@ -579,16 +711,23 @@ def validate_manifest(value):
         require(0 < video["duration"] <= 43200, "Invalid video duration")
     if pdf:
         assets.append(pdf["asset"])
-        allowed.append(({"pdf"}, 64))
+        allowed.append(({"pdf"}, MAX_PDF_MIB))
         require(type(pdf["pageCount"]) is int and 1 <= pdf["pageCount"] <= 2000, "Invalid PDF page count")
     if cover:
         assets.append(cover)
         allowed.append(({"png", "jpg"}, 8))
+    if class_file := value.get("classTemplatesFile"):
+        require(pdf and type(class_file["bytes"]) is int and class_file["bytes"] <= 256 * 1024,
+                "Class template file requires an original PDF and is limited to 256 KiB.")
+        assets.append(class_file)
+        allowed.append(({"json"}, 1))
     for asset, (extensions, max_mib) in zip(assets, allowed):
         require(asset["ext"] in extensions and type(asset["bytes"]) is int and 0 < asset["bytes"] <= max_mib * MIB
                 and re.fullmatch(r"[a-f0-9]{64}", asset["sha256"]) is not None, "Invalid media entry")
     for item in songs:
         require(type(item["duration"]) in (int, float) and 0 < item["duration"] <= 43200, "Invalid music duration")
+        if (edition := item.get("classDurationMinutes")) is not None:
+            require(type(edition) is int and 5 <= edition <= 180, "Invalid recording edition.")
         if (chapter := item.get("chapter")) is not None:
             require(video and 0 <= chapter["start"] < chapter["end"] <= video["duration"] and
                     chapter["evidence"] in {"audioMatched", "visuallyConfirmed", "approximate"},
@@ -651,10 +790,17 @@ def package(args):
     source_pdf = review["pdf"] if config.get("pdf") else None
     functions = [approved_section_function(song, findings, source_pdf)
                  for song, findings in zip(config["music"], review["tracks"])]
-    pdf_path = same_source(config["pdf"], source_pdf["source"]) if source_pdf else None
+    pdf_path = same_source(checked_pdf_path(config["pdf"]), source_pdf["source"]) if source_pdf else None
     declared_sections = [{**song, "sectionFunction": function} for song, function in zip(config["music"], functions) if function]
     checked_functions = inspect_section_functions(pdf_path, declared_sections)
     manual_functions = require_matching_section_functions(checked_functions)
+    approved_templates = [item for item in review.get("classTemplates", []) if item.get("approved") is True]
+    require(not any(item.get("sourceReview") for item in approved_templates),
+            "Skip course formats marked sourceReview. Their printed choices do not fit this template schema.")
+    templates = [{key: value for key, value in item.items() if key not in {"approved", "sourceReview"}}
+                 for item in approved_templates]
+    validate_class_templates(templates, source_pdf)
+    check_class_template_sources(pdf_path, templates)
     cover = selected_cover(config)
     if cover:
         require(review.get("cover") == cover, "Review no longer matches the confirmed cover image.")
@@ -690,6 +836,8 @@ def package(args):
             duration, _ = probe(path, "audio")
             row = {key: song[key] for key in ("section", "variant", "catalogTrackID", "title", "pdfPage") if key in song}
             row.update(asset=identity(path), duration=round(duration, 6))
+            if (edition := findings.get("classEdition")) and edition.get("approved") is True:
+                row["classDurationMinutes"] = edition["minutes"]
             if (chapter := findings.get("chapter")) and chapter.get("approved") is True:
                 row["chapter"] = {key: chapter[key] for key in ("start", "end", "evidence")}
                 if chapter["evidence"] == "audioMatched":
@@ -751,6 +899,11 @@ def package(args):
         if cover:
             path = same_source(config["cover"], cover)
             manifest["cover"] = cover
+            files.append(path)
+        if templates:
+            path = work / "class-templates.json"
+            write_json(path, {"schemaVersion": 1, "templates": templates})
+            manifest["classTemplatesFile"] = identity(path)
             files.append(path)
         assets = validate_manifest(manifest)
         encoded = json.dumps(manifest, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
@@ -814,18 +967,28 @@ def require_matching_section_functions(checks):
 def verify(path, *, manual_functions=None):
     before = path.stat()
     require(before.st_size <= MAX_PACKAGE, "Package too large")
-    with path.open("rb") as stream, tempfile.SpooledTemporaryFile(max_size=4 * MIB) as pdf:
+    with (path.open("rb") as stream, tempfile.SpooledTemporaryFile(max_size=4 * MIB) as pdf,
+          tempfile.SpooledTemporaryFile(max_size=MIB) as class_file):
         encoded, manifest = read_manifest(stream)
         package_digest = container_digest(encoded)
         assets = validate_manifest(manifest)
-        pdf_asset = (manifest["pdf"]["asset"] if manual_functions is None
-                     and any(item.get("sectionFunction") for item in manifest["music"]) else None)
+        template_asset = manifest.get("classTemplatesFile")
+        checks_functions = manual_functions is None and any(item.get("sectionFunction") for item in manifest["music"])
+        pdf_asset = manifest["pdf"]["asset"] if checks_functions or template_asset else None
         for asset in assets:
-            consume(stream, asset, package_digest=package_digest, mirror=pdf if asset is pdf_asset else None)
+            mirror = pdf if asset is pdf_asset else class_file if asset is template_asset else None
+            consume(stream, asset, package_digest=package_digest, mirror=mirror)
         require(not stream.read(1), "Trailing data in package")
+        templates, manual_formats = [], []
+        if template_asset:
+            class_file.seek(0)
+            templates = read_class_template_document(class_file, manifest["pdf"])
         if pdf_asset is not None:
             pdf.seek(0)
-            manual_functions = require_matching_section_functions(inspect_section_functions(pdf, manifest["music"]))
+            manual_formats = check_class_template_sources(pdf, templates)
+            if checks_functions:
+                pdf.seek(0)
+                manual_functions = require_matching_section_functions(inspect_section_functions(pdf, manifest["music"]))
     after = path.stat()
     require((before.st_ino, before.st_size, before.st_mtime_ns) ==
             (after.st_ino, after.st_size, after.st_mtime_ns), "Package changed during verification")
@@ -836,7 +999,9 @@ def verify(path, *, manual_functions=None):
             "cover": bool(manifest.get("cover")), "chapters": sum("chapter" in m for m in manifest["music"]),
             "pdfOpeningPages": sum(m.get("pdfPage") is not None for m in manifest["music"]),
             "cueRows": sum(len(m.get("cues") or []) for m in manifest["music"]),
-            "sectionFunctionManualReview": manual_functions or []}
+            "sectionFunctionManualReview": manual_functions or [],
+            "classTemplates": len(templates),
+            "classTemplateManualReview": manual_formats if templates else []}
 
 
 def extract_manifest(args):
@@ -862,6 +1027,10 @@ def revise(args):
             updated["cover"] = cover_asset(args.cover)
         else:
             updated.pop("cover", None)
+    if args.class_templates:
+        with args.class_templates.open("rb") as document:
+            read_class_template_document(document, updated.get("pdf"))
+        updated["classTemplatesFile"] = identity(args.class_templates)
     assets = validate_manifest(updated)
     encoded = json.dumps(updated, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
     require(0 < len(encoded) <= MAX_MANIFEST and
@@ -882,16 +1051,22 @@ def revise(args):
         with temporary.open("xb") as stream:
             os.chmod(temporary, 0o600)
             stream.write(MAGIC + struct.pack(">I", len(encoded)) + encoded)
-            media_assets = old_assets[:-1] if replacing_cover and old.get("cover") else old_assets
+            media_assets = old_assets[:len(old["music"]) + bool(old.get("video")) + bool(old.get("pdf"))]
             for asset in media_assets:
                 consume(source, asset, destination=stream)
-            if replacing_cover and old.get("cover"):
-                consume(source, old["cover"])
-            require(not source.read(1), "Trailing data in the source package")
+            if original_cover := old.get("cover"):
+                consume(source, original_cover, destination=None if replacing_cover else stream)
             if args.cover is not None:
                 with args.cover.open("rb") as artwork:
                     consume(artwork, updated["cover"], destination=stream)
                     require(not artwork.read(1), "Cover changed while packing")
+            if original_template := old.get("classTemplatesFile"):
+                consume(source, original_template, destination=None if args.class_templates else stream)
+            if args.class_templates:
+                with args.class_templates.open("rb") as document:
+                    consume(document, updated["classTemplatesFile"], destination=stream)
+                    require(not document.read(1), "Class template file changed while packing")
+            require(not source.read(1), "Trailing data in the source package")
             stream.flush()
             os.fsync(stream.fileno())
         receipt = verify(temporary)
@@ -980,6 +1155,12 @@ def main():
     cover.add_argument("--cover", type=Path)
     cover.add_argument("--without-cover", action="store_true")
     p.add_argument("--output", required=True, type=Path)
+    p = commands.add_parser("text-cover", help="Preview a square cover using the course and routine names")
+    p.add_argument("input", type=Path, help="Routine plan with the proposed display names")
+    p.add_argument("--project-name", help="Course name for the preview")
+    p.add_argument("--routine-name", help="Routine name for the preview")
+    p.add_argument("--font", type=Path, help="Font file when the system font lacks the needed characters")
+    p.add_argument("--output", required=True, type=Path)
     p = commands.add_parser("attribution", help="Show or reset the local default attribution choice")
     p.add_argument("--reset", action="store_true")
     p = commands.add_parser("select-cover", help="Record the creator's artwork selection in a plan or review")
@@ -1016,6 +1197,7 @@ def main():
     cover_options = p.add_mutually_exclusive_group()
     cover_options.add_argument("--cover", type=Path, help="Use an explicitly approved replacement cover")
     cover_options.add_argument("--without-cover", action="store_true", help="Remove the previous cover")
+    p.add_argument("--class-templates", type=Path, help="Reviewed class-templates.json file to add or replace")
     p = commands.add_parser("submit", help="Create a clean batch with verified packages, QA images and fingerprints")
     p.add_argument("packages", type=Path, nargs="+")
     p.add_argument("--output-dir", required=True, type=Path)
@@ -1033,7 +1215,7 @@ def main():
             from batch_submission import submit
             submit(args)
         else:
-            {"plan": plan, "confirm-plan": confirm_plan, "attribution": attribution,
+            {"plan": plan, "confirm-plan": confirm_plan, "text-cover": text_cover, "attribution": attribution,
              "select-cover": select_cover, "analyze": analyze, "build": package,
              "manifest": extract_manifest, "revise": revise, "finish": finish}[args.command](args)
     except (ValueError, KeyError, TypeError, OSError, ImportError, subprocess.SubprocessError) as error:

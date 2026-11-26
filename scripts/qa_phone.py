@@ -197,7 +197,16 @@ class PhonePreview:
 
         def row_text(row):
             width = self.right - self.left - 34
-            action = wrapped_lines(self.draw, row["action"], self.card.font(18), width, 4)
+            mapped = {value["actionLine"]: value["counts"] for value in row.get("actionRows", [])}
+            action = []
+            if mapped:
+                for index, line in enumerate(row["action"].splitlines()):
+                    count = mapped.get(index)
+                    wrapped = wrapped_lines(self.draw, line, self.card.font(18), width - (56 if count else 0), 4)
+                    action.extend((value, count if i == 0 else None) for i, value in enumerate(wrapped))
+                action = action[:max(1, min(12, (self.bottom - self.content_y - 110) // 21))]
+            else:
+                action = [(value, None) for value in wrapped_lines(self.draw, row["action"], self.card.font(18), width, 4)]
             note = wrapped_lines(self.draw, row.get("coaching") or "", self.card.font(14), width, 2)
             return action, note, 35 + len(action) * 21 + len(note) * 16
 
@@ -235,7 +244,7 @@ class PhonePreview:
                 rgb = tuple(round(255 * level[key]) for key in ("red", "green", "blue"))
                 self.draw.rounded_rectangle((self.right - 8, y + 5, self.right - 4, y + height - 5), 2, fill=rgb)
             self.text(self.left + 13, y + 10, clock(row["time"]), 17, RED if current else MUTED)
-            counts = score_metadata(row.get("counts"))
+            counts = "" if row.get("actionRows") else score_metadata(row.get("counts"))
             repetitions = score_metadata(row.get("repetitions"))
             if repetitions:
                 counts = f"{counts}  REPS {repetitions}".lstrip()
@@ -245,8 +254,10 @@ class PhonePreview:
                 self.text(self.left + 65, y + 11, row["music"], 14, RED if current else MUTED,
                           144 if counts else 268)
             detail_y = y + 32
-            for value in action:
+            for value, count in action:
                 self.text(self.left + 13, detail_y, value, 18)
+                if count:
+                    self.text(self.right - 15, detail_y, count, 14, MUTED, anchor="rt")
                 detail_y += 21
             for value in note:
                 self.text(self.left + 13, detail_y, value, 14, MUTED)

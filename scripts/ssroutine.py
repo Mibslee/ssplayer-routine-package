@@ -33,7 +33,7 @@ from score_evidence import ocr_languages
 
 
 MAGIC = b"SSRT0001"
-VERSION = "1.7.4"
+VERSION = "1.7.5"
 MIB = 1024 * 1024
 MAX_MANIFEST = 4 * MIB
 MAX_PACKAGE = 12 * 1024 * MIB
@@ -876,6 +876,18 @@ def validate_manifest(value):
             for key in ("action", "music", "counts", "repetitions", "coaching"):
                 if (text := cue.get(key)) is not None:
                     require(valid_text(text, 4096), f"Invalid cue field for {item['section']}")
+            if (action_rows := cue.get("actionRows")) is not None:
+                counts = [line.strip() for line in (cue.get("counts") or "").splitlines() if line.strip()]
+                require(type(action_rows) is list and 0 < len(action_rows) == len(counts) <= 256,
+                        f"Invalid action counts for {item['section']}")
+                actions = cue["action"].splitlines()
+                previous_line = -1
+                for row, count in zip(action_rows, counts):
+                    require(type(row) is dict and type(row.get("actionLine")) is int
+                            and previous_line < row["actionLine"] < len(actions)
+                            and actions[row["actionLine"]].strip() and row.get("counts") == count,
+                            f"Action count does not match a source line in {item['section']}")
+                    previous_line = row["actionLine"]
             if level := cue.get("level"):
                 require(all(0 <= level[channel] <= 1 for channel in ("red", "green", "blue")), "Invalid PDF level color")
     return assets

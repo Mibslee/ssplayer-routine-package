@@ -6,8 +6,33 @@ import unittest
 from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-from media_analysis import extract_cues, inspect_section_functions
+from media_analysis import extract_cues, inspect_section_functions, read_page_rows
+from qa_preview import mismatched_action_counts
 from score_evidence import ScorePageReader
+
+
+class ScoreActionRowTests(unittest.TestCase):
+    def test_counts_follow_action_lines_across_blank_cells_and_stop_before_footer(self):
+        import pdfplumber
+
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "score.pdf"
+            write_pdf(path, [[(550, "MUSIC", 80), (550, "EXERCISE", 210),
+                              (550, "CTS", 460), (550, "REPS", 510),
+                              (575, "0:11", 30), (575, "Phrase", 80), (575, "Sequence title", 210),
+                              (590, "First movement", 210), (590, "8", 465),
+                              (605, "OPTION: Use support", 210),
+                              (620, "Second movement", 210), (620, "8", 465),
+                              (900, "Long explanatory note for people arriving", 295),
+                              (913, "Review this quick note after class", 295)]])
+            with pdfplumber.open(path) as document:
+                page = document.pages[0]
+                [cue] = read_page_rows(page, page.extract_words(), 1, lambda value: 11 if value == "0:11" else None)
+        self.assertEqual(cue["counts"], "8\n8")
+        self.assertEqual(cue["action"], "Sequence title\nFirst movement\nOPTION: Use support\nSecond movement")
+        self.assertEqual(cue["actionRows"], [{"actionLine": 1, "counts": "8"}, {"actionLine": 3, "counts": "8"}])
+        misplaced = dict(cue, actionRows=[{"actionLine": 0, "counts": "8"}, {"actionLine": 1, "counts": "8"}])
+        self.assertEqual(mismatched_action_counts([cue], [misplaced]), [11])
 
 def write_pdf(path, document):
     """Write a small extractable PDF with no test dependencies beyond the skill."""

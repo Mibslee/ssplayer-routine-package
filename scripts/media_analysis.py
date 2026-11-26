@@ -521,6 +521,35 @@ def expand_sequence(action, definitions):
     return "\n".join(result), modifier
 
 
+def detached_score_footer(body, exercise, counts, page):
+    if not exercise < counts < page.width:
+        return body
+    lines = row_lines(body)
+    # A wide prose line after a clearly detached gap can cross all of the
+    # table's columns. Keep the complete table above it, including sparse rows.
+    for previous, current in zip(lines, lines[1:]):
+        gap = current[0]["top"] - previous[0]["top"]
+        if (gap >= page.width * 0.10 and len(current) >= 6
+                and current[0]["top"] >= page.height * 0.79
+                and exercise + page.width * 0.05 < current[0]["x0"] < counts <= current[-1]["x1"]):
+            return [word for word in body if word["top"] < current[0]["top"] - 3]
+    return body
+
+
+def score_action_rows(actions, count_lines):
+    result = []
+    for line in count_lines:
+        counts = " ".join(word["text"] for word in line)
+        if re.fullmatch(r"\d{1,3}(?:\s*[x×]\s*\d{1,3})?", counts) is None:
+            return []
+        candidates = [index for index, action in enumerate(actions)
+                      if abs(action[0]["top"] - line[0]["top"]) <= 3]
+        if len(candidates) != 1 or (result and candidates[0] <= result[-1]["actionLine"]):
+            return []
+        result.append({"actionLine": candidates[0], "counts": counts})
+    return result
+
+
 def read_page_rows(page, words, page_number, parse_time, definitions=None):
     if definitions is None:
         definitions = {}
@@ -556,12 +585,17 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
         for i, (top, time) in enumerate(marks):
             limit = marks[i + 1][0] - 3 if i + 1 < len(marks) else page.height * 0.92
             body = [w for w in words if top - 3 <= w["top"] < limit]
+            if i == len(marks) - 1:
+                body = detached_score_footer(body, exercise, counts, page)
+            def column_lines(begin, end, top_bound=None, bottom_bound=None):
+                return row_lines([w for w in body if begin <= w["x0"] < end
+                                  and (top_bound is None or w["top"] >= top_bound)
+                                  and (bottom_bound is None or w["top"] < bottom_bound)])
             def column(begin, end, top_bound=None, bottom_bound=None):
                 return "\n".join(" ".join(w["text"] for w in line)
-                                 for line in row_lines([w for w in body if begin <= w["x0"] < end
-                                     and (top_bound is None or w["top"] >= top_bound)
-                                     and (bottom_bound is None or w["top"] < bottom_bound)]))
+                                 for line in column_lines(begin, end, top_bound, bottom_bound))
             action_end = min((x for x in (counts, reps, level) if x > exercise), default=page.width)
+            count_end = exercise if counts < exercise else min(reps, level)
             action = column(exercise, action_end)
             if action:
                 codes = sorted((w for w in body if sequence_left <= w["x0"] < exercise
@@ -573,12 +607,15 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
                         definitions[unicodedata.normalize("NFKC", code["text"])] = text
                 cue = {"time": time, "page": page_number, "action": action,
                        "music": column(music, min(sequence_left, counts)),
-                       "counts": column(counts, exercise if counts < exercise else min(reps, level)),
+                       "counts": column(counts, count_end),
                        "repetitions": column(reps, level)}
                 if expanded := expand_sequence(action, definitions):
                     cue["action"], qualifier = expanded
                     if qualifier:
                         cue["coaching"] = qualifier
+                elif action_rows := score_action_rows(column_lines(exercise, action_end),
+                                                      column_lines(counts, count_end)):
+                    cue["actionRows"] = action_rows
                 if color := visible_level(page, level + 6, top + 3):
                     cue["level"] = color
                 rows.append(cue)

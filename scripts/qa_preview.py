@@ -102,6 +102,20 @@ def missing_printed_cue_times(source_rows, packaged_rows):
     return missed
 
 
+def mismatched_action_counts(source_rows, packaged_rows):
+    sources = {}
+    for cue in source_rows:
+        sources.setdefault((cue["page"], cue["time"], cue["action"]), []).append(cue)
+    mismatches = []
+    for cue in packaged_rows:
+        if not cue.get("actionRows"):
+            continue
+        same_action = sources.get((cue["page"], cue["time"], cue["action"]), [])
+        if len(same_action) == 1 and same_action[0].get("actionRows") and same_action[0]["actionRows"] != cue["actionRows"]:
+            mismatches.append(cue["time"])
+    return mismatches
+
+
 def readable_untimed_score(pdf, tracks):
     """Corroborate an explicitly limited course against its readable original."""
     import pdfplumber
@@ -802,6 +816,9 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                             at = "、".join(clock(time) for time in missing[:4])
                             add_condition(report, "timeline",
                                           f"{song['section']} 缺 {len(missing)} 个原谱动作起点（{at}）。核对时间和动作后补齐。")
+                        if mismatched := mismatched_action_counts(source["rows"], song["cues"]):
+                            points = "、".join(clock(time) for time in mismatched[:4])
+                            add_issue(report, "timeline", f"{song['section']} 的逐行动作拍数与原谱不符（{points}）。")
             except (ValueError, OSError, pypdfium2.PdfiumError):
                 add_issue(report, "pdf", "原谱无法打开，或实际页数与清单不符。")
         for key, reason in manifest.get("qualityNotes", {}).items():

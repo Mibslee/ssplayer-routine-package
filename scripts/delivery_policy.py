@@ -56,3 +56,64 @@ def blocker_lines(delivery):
     """Render exact checks so the creator can repair the next draft."""
     return [f"{CHECK_NAMES.get(item['check'], item['check'])} · {item['detail']}"
             for item in delivery["blockers"]]
+
+
+def class_slot_label(slot, *, show_edition=False):
+    codes = slot.get("sectionCodes") or [f"T{number}" for number in slot["sectionNumbers"]]
+    label = ("+" if slot.get("selectionMode") == "consecutive" else "/").join(codes)
+    if show_edition and (edition := slot.get("requiredDurationMinutes")):
+        label += f"（{edition} 分钟版）"
+    return f"({label})" if slot.get("isOptional") else label
+
+
+def class_slot_recordings(slot, songs):
+    edition = slot.get("requiredDurationMinutes")
+    codes = slot.get("sectionCodes")
+    matches = {}
+    for index, song in enumerate(songs):
+        code = song["section"]
+        if int(code[1:].rstrip("ABCDEFGHIJKLMNOPQRSTUVWXYZ")) not in slot["sectionNumbers"] or (codes and code not in codes):
+            continue
+        if edition is not None and song.get("classDurationMinutes") != edition:
+            continue
+        preference = slot.get("variantPreference")
+        if slot.get("enforcesVariant") and preference in ("standard", "alternative"):
+            if (song["variant"] == "standard") != (preference == "standard"):
+                continue
+        matches.setdefault(code, []).append(index)
+    if codes and slot.get("selectionMode") == "consecutive":
+        return [matches.get(code, []) for code in codes]
+    return [[index for by_code in matches.values() for index in by_code]]
+
+
+def class_recording_conditions(template, songs):
+    missing, demands = [], []
+    for slot in template["slots"]:
+        if slot.get("isOptional"):
+            continue
+        candidates = class_slot_recordings(slot, songs)
+        if all(candidates):
+            demands.extend(candidates)
+        else:
+            label = class_slot_label(slot, show_edition=True)
+            missing.append(label)
+    if missing:
+        return [f"{template['name']} · 缺 {'、'.join(missing)} 的录音。"]
+
+    # Each position can use one recording. Relocate earlier choices to avoid
+    # reporting a conflict when a different valid recording is available.
+    assigned = {}
+
+    def assign(position, visited):
+        for track in demands[position]:
+            if track in visited:
+                continue
+            visited.add(track)
+            if track not in assigned or assign(assigned[track], visited):
+                assigned[track] = position
+                return True
+        return False
+
+    if all(assign(position, set()) for position in range(len(demands))):
+        return []
+    return [f"{template['name']} · 包内不同录音不足以填满所有必选位置，可从其他套路补选。"]

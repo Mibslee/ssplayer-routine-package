@@ -16,19 +16,24 @@ import subprocess
 import sys
 import tempfile
 import unicodedata
+from collections import Counter
+from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
 from time import perf_counter
 
+from delivery_policy import class_recording_conditions
 from grit_evidence import check_grit_section_function, grit_source_evidence
 from grit_intervals import parse_grit_intervals, validate_interval_review
 from media_analysis import (alignment_module, audio_packet_hash, class_format_suggestions,
                             efficient_video, extract_cues, inspect_section_functions, locate_chapters,
                             map_recordings, measure, optimize_video, original_peak_notice, probe, run,
                             timing_failure_detail, timing_windows, unresolved_repeat_times, video_info)
+from score_evidence import ocr_languages
 
 
 MAGIC = b"SSRT0001"
+VERSION = "1.7.4"
 MIB = 1024 * 1024
 MAX_MANIFEST = 4 * MIB
 MAX_PACKAGE = 12 * 1024 * MIB
@@ -437,11 +442,22 @@ def plan(args):
         section = re.fullmatch(r"T(\d+)([A-Z]?)", row["section"])
         return (row["variant"] != "standard", int(section[1]), section[2], row["variant"])
     value["music"].sort(key=song_key)
+    explicit_pdf = getattr(args, "score_pdf", None)
+    if explicit_pdf:
+        selected = checked_pdf_path(explicit_pdf)
+        require(str(selected) in assets["pdf"], "Choose a score PDF from the selected source folder.")
+        value["pdf"] = str(selected)
     for name, paths in assets.items():
+        if name in value:
+            continue
         if len(paths) == 1:
             value[name] = paths[0]
         elif paths:
             review.extend(paths)
+    for field, name in (("cue_pages", "cuePages"), ("class_format_pages", "classFormatPages")):
+        if pages := getattr(args, field, None):
+            require("pdf" in value, "Select the source PDF before choosing physical pages.")
+            value[name] = pages
     if args.cover or args.without_cover:
         set_cover_selection(value, args.cover)
     else:
@@ -500,9 +516,9 @@ def analyze(args):
               "tracks": [{"source": row["source"], "duration": row["duration"], "selection": source_selection(row)}
                          for row in audio]}
     if pdf:
-        page_count, cues, warnings = extract_cues(pdf, audio, ocr=args.ocr)
+        page_count, cues, warnings = extract_cues(pdf, audio, ocr=args.ocr, page_numbers=config.get("cuePages"))
         review.update(pdf={"source": identity(pdf), "pageCount": page_count}, pdfWarnings=warnings)
-        review["classTemplates"] = class_format_suggestions(pdf)
+        review["classTemplates"] = class_format_suggestions(pdf, pages=config.get("classFormatPages"))
         grit = grit_source_evidence(pdf, audio, config["routine"]) if program == "GRIT" else None
         intervals = grit_interval_proposals(pdf, audio, grit)
         if grit:
@@ -891,9 +907,19 @@ def chapter_preflight(songs, paths, video, video_duration):
 
 
 
-def package(args):
-    started = perf_counter()
-    review = read_json(args.review)
+@dataclass(frozen=True)
+class ReviewedContent:
+    identity: tuple
+    timelines: list
+    source_pdf: dict | None
+    pdf_path: Path | None
+    functions: list
+    manual_functions: list
+    templates: list
+    cover: dict | None
+
+
+def inspect_review_sources(review, *, for_delivery=False):
     config = review["plan"]
     program, routine, revision = read_identity(config)
     require((program, routine) == author_identity(program, routine),
@@ -921,10 +947,43 @@ def package(args):
     templates = [{key: value for key, value in item.items() if key not in {"approved", "sourceReview"}}
                  for item in approved_templates]
     validate_class_templates(templates, source_pdf)
-    check_class_template_sources(pdf_path, templates, source_evidence=grit)
+    format_notes = check_class_template_sources(pdf_path, templates, include_omissions=for_delivery,
+                                                source_evidence=grit) if pdf_path else []
+    if for_delivery:
+        songs = []
+        for song, findings, function in zip(config["music"], review["tracks"], functions, strict=True):
+            entry = {**song, "duration": findings["duration"]}
+            if "pdfPage" not in entry and findings.get("pdfOpeningPage") is not None:
+                entry["pdfPage"] = findings["pdfOpeningPage"]
+            if function is not None:
+                entry["sectionFunction"] = function
+            if (edition := findings.get("classEdition")) and edition.get("approved") is True:
+                entry["classDurationMinutes"] = edition["minutes"]
+            songs.append(entry)
+        recording_notes = [note for template in templates for note in class_recording_conditions(template, songs)]
+        source_notes = manual_functions + format_notes + recording_notes
+        untimed = [index for index, (timeline, track) in enumerate(zip(timelines, review["tracks"], strict=True))
+                   if not timeline and track.get("supplementary") is not True]
+        if pdf_path and untimed and not source_notes:
+            _, proposals, _ = extract_cues(pdf_path, songs)
+            source_notes.extend(f"{songs[index]['section']} · 原谱无法证明这首没有动作计时，需回看动作页与续页。"
+                                for index in untimed if not proposals[index].get("untimedScorePage"))
+        require(not source_notes, "\n".join(source_notes))
     cover = selected_cover(config)
     if cover:
         require(review.get("cover") == cover, "Review no longer matches the confirmed cover image.")
+    return ReviewedContent((program, routine, revision), timelines, source_pdf, pdf_path,
+                           functions, manual_functions, templates, cover)
+
+
+def package(args, *, review=None, content=None):
+    started = perf_counter()
+    if review is None:
+        review = read_json(args.review)
+    config = review["plan"]
+    if content is None:
+        content = inspect_review_sources(review)
+    program, routine, revision = content.identity
     if args.video_quality == "original":
         require(args.video_max_height is None and args.video_bitrate_kbps is None and args.video_codec is None,
                 "Choose efficient, ipad or compact before setting video encoding options")
@@ -948,7 +1007,7 @@ def package(args):
         preflight_problems = []
         video_quality = None
         preflight_seconds = 0.0
-        print(f"{name} · 检查并保留 {len(timelines)} 首原始音乐", file=sys.stderr, flush=True)
+        print(f"{name} · 检查并保留 {len(content.timelines)} 首原始音乐", file=sys.stderr, flush=True)
 
         def prepare_audio(item):
             song, findings, timeline, function = item
@@ -972,7 +1031,7 @@ def package(args):
                 row["sectionFunction"] = function
             return path, row, levels
 
-        tracks = zip(config["music"], review["tracks"], timelines, functions)
+        tracks = zip(config["music"], review["tracks"], content.timelines, content.functions, strict=True)
         for path, song, levels in map_recordings(prepare_audio, tracks):
             files.append(path)
             manifest["music"].append(song)
@@ -998,7 +1057,15 @@ def package(args):
                 codec = args.video_codec or "hevc"
                 path, encoded_picture = encode(path, work / "encoded.mp4",
                     args.video_max_height or height, args.video_bitrate_kbps or bitrate, codec)
-                if encoded_picture["codec"] != codec:
+                used_fallback = encoded_picture.get("compression") == "keptOriginal"
+                compatible = (encoded_picture["codec"] == "h264" or
+                              (encoded_picture["codec"] == "hevc" and encoded_picture.get("codecTag") == "hvc1"))
+                required_size = args.video_max_height is not None or args.video_bitrate_kbps is not None
+                use_source_video = used_fallback and args.video_codec is None and not required_size and compatible
+                if use_source_video:
+                    reason = encoded_picture["reason"]
+                    print(f"{name} · 保留源视频与字幕轨。{reason}", file=sys.stderr, flush=True)
+                elif encoded_picture["codec"] != codec or (used_fallback and (required_size or not compatible)):
                     name_for_codec = "H.265 (HEVC)" if codec == "hevc" else "H.264"
                     reason = encoded_picture.get("reason", "Output codec did not match.")
                     raise ValueError(f"Could not package {name_for_codec} video. {reason} "
@@ -1010,16 +1077,16 @@ def package(args):
             manifest["video"] = {"asset": identity(path), "duration": round(encoded_picture["duration"], 6)}
             files.append(path)
         video_seconds = perf_counter() - started - audio_seconds - preflight_seconds
-        if pdf_path:
-            manifest["pdf"] = {"asset": source_pdf["source"], "pageCount": source_pdf["pageCount"]}
-            files.append(pdf_path)
-        if cover:
-            path = same_source(config["cover"], cover)
-            manifest["cover"] = cover
+        if content.pdf_path:
+            manifest["pdf"] = {"asset": content.source_pdf["source"], "pageCount": content.source_pdf["pageCount"]}
+            files.append(content.pdf_path)
+        if content.cover:
+            path = same_source(config["cover"], content.cover)
+            manifest["cover"] = content.cover
             files.append(path)
-        if templates:
+        if content.templates:
             path = work / "class-templates.json"
-            write_json(path, {"schemaVersion": 1, "templates": templates})
+            write_json(path, {"schemaVersion": 1, "templates": content.templates})
             manifest["classTemplatesFile"] = identity(path)
             files.append(path)
         assets = validate_manifest(manifest)
@@ -1036,7 +1103,7 @@ def package(args):
                     require(not source.read(1), f"Source grew while packing: {file.name}")
             stream.flush()
             os.fsync(stream.fileno())
-        receipt = verify(pending, manual_functions=manual_functions)
+        receipt = verify(pending, manual_functions=content.manual_functions)
         os.link(pending, output)
     receipt.update(output=str(output.resolve()), loudness=loudness, videoQuality=video_quality,
                    seconds=round(perf_counter() - started, 2), audioSeconds=round(audio_seconds, 2),
@@ -1210,9 +1277,9 @@ def doctor():
     for name in ("ffmpeg", "ffprobe"):
         require(shutil.which(name), f"Install {name} and add it to the agent terminal's PATH")
     alignment_module()
-    print(json.dumps({"python": sys.version.split()[0], "numpy": numpy.__version__,
+    print(json.dumps({"version": VERSION, "python": sys.version.split()[0], "numpy": numpy.__version__,
                       "pdfplumber": pdfplumber.__version__,
-                      "ocr": all(shutil.which(name) for name in ("pdftoppm", "tesseract")),
+                      "ocr": bool(shutil.which("tesseract")), "ocrLanguages": ocr_languages(),
                       "screenSubtitleOCR": bool(shutil.which("tesseract"))}))
 
 
@@ -1231,6 +1298,19 @@ def add_delivery_location(command):
     location = command.add_mutually_exclusive_group(required=True)
     location.add_argument("--workspace", type=Path, help="Current project's workspace; deliver under its 交付 folder")
     location.add_argument("--output-dir", type=Path, help="Delivery folder explicitly chosen for this batch")
+
+
+def physical_pages(value):
+    pages = set()
+    for item in value.split(","):
+        match = re.fullmatch(r"(\d{1,4})(?:-(\d{1,4}))?", item.strip())
+        if not match:
+            raise argparse.ArgumentTypeError("Use physical PDF pages such as 4,6-18")
+        first, last = int(match[1]), int(match[2] or match[1])
+        if not 1 <= first <= last <= 2000:
+            raise argparse.ArgumentTypeError("Physical PDF pages must be in 1–2000")
+        pages.update(range(first, last + 1))
+    return sorted(pages)
 
 
 def review_problems(review, *, source_limited=False):
@@ -1287,7 +1367,12 @@ def review_problems(review, *, source_limited=False):
 def check_review(args):
     review = read_json(args.review)
     blockers = review_problems(review, source_limited=args.source_limited)
-    if getattr(args, "measure_video", False) and review["plan"].get("video"):
+    if not blockers:
+        try:
+            inspect_review_sources(review, for_delivery=True)
+        except ValueError as error:
+            blockers.extend(str(error).splitlines())
+    if not blockers and getattr(args, "measure_video", False) and review["plan"].get("video"):
         video = same_source(review["plan"]["video"], review["video"]["source"])
         songs, paths = [], []
         for song, record in zip(review["plan"]["music"], review["tracks"], strict=True):
@@ -1302,38 +1387,72 @@ def check_review(args):
 
 
 def finish(args):
-    from batch_submission import delivery_batch_id, submit
+    from batch_submission import (ITEM_ERRORS, delivery_batch_id, package_header, record_block, submit,
+                                  subtitle_observations)
 
     started = perf_counter()
-    require(1 <= len(args.reviews) <= 256, "Select between 1 and 256 reviewed routines")
-    require(getattr(args, "screen_subtitles", None) is None or len(args.reviews) == 1,
+    existing = list(getattr(args, "include_package", None) or [])
+    require(1 <= len(args.reviews) + len(existing) <= 256, "Select between 1 and 256 routines")
+    require(getattr(args, "screen_subtitles", None) is None or len(args.reviews) + len(existing) == 1,
             "An explicit subtitle observation applies to one inspected package")
+    subtitle_observations(args)
     args.batch_id = delivery_batch_id(args)
-    for review in args.reviews:
-        blockers = review_problems(read_json(review), source_limited=getattr(args, "source_limited", False))
-        require(not blockers, f"{review.name} 暂缓交付，尚未开始编码。\n" + "\n".join(blockers))
+    keep_going = bool(getattr(args, "keep_going", False))
+    source_limited = bool(getattr(args, "source_limited", False))
+    blocked, reviewed, included = [], [], []
+    for path in existing:
+        try:
+            included.append((path, package_header(path)[0]))
+        except ITEM_ERRORS as error:
+            record_block(blocked, path, "检查复用资源包", error, keep_going)
+    for path in args.reviews:
+        try:
+            review = read_json(path)
+            blockers = review_problems(review, source_limited=source_limited)
+            require(not blockers, "\n".join(blockers))
+            content = inspect_review_sources(review, for_delivery=True)
+        except ITEM_ERRORS as error:
+            record_block(blocked, path, "编码前核对", error, keep_going)
+            continue
+        program, routine, revision = content.identity
+        reviewed.append((path, review, content, f"{program}_{routine}_{revision}.ssroutine"))
+    names = Counter([name for _, name in included] + [name for _, _, _, name in reviewed])
+    for path, name in included + [(path, name) for path, _, _, name in reviewed]:
+        if names[name] > 1:
+            record_block(blocked, path, "检查批次", ValueError(f"同一项目、套路和修订重复：{name}"), keep_going)
+    existing = [path for path, name in included if names[name] == 1]
+    reviewed = [item for item in reviewed if names[item[3]] == 1]
+    require(reviewed or existing, "没有完成预检的套路，尚未开始编码。")
     work = Path(tempfile.mkdtemp(prefix="ssroutine-production-"))
     outputs = []
     try:
-        for review in args.reviews:
+        for path, review, content, _ in reviewed:
             options = argparse.Namespace(**vars(args))
-            options.review = review
+            options.review = path
             options.output_dir = work
-            outputs.append(package(options))
-        args.packages = outputs
-        submit(args)
+            try:
+                outputs.append(package(options, review=review, content=content))
+            except ITEM_ERRORS as error:
+                record_block(blocked, path, "制作", error, keep_going)
+        require(outputs or existing, "本轮没有可质检的资源包。")
+        args.packages = existing + outputs
+        submit(args, blocked=blocked)
     except BaseException:
         if outputs:
             print(f"已完成的资源包保存在 {work}；可检查后用 submit 继续交付。", file=sys.stderr)
         else:
             work.rmdir()
         raise
-    shutil.rmtree(work)
+    if blocked and outputs:
+        print(f"本轮构建副本仍保存在 {work}。补齐后可加入同一份新的批次指纹。", file=sys.stderr)
+    else:
+        shutil.rmtree(work)
     print(f"制作与质检合计 {perf_counter() - started:.1f}s", file=sys.stderr)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--version", action="version", version=VERSION)
     commands = parser.add_subparsers(dest="command", required=True)
     commands.add_parser("doctor")
     p = commands.add_parser("plan")
@@ -1349,6 +1468,9 @@ def main():
     p.add_argument("--release-date", help="A confirmed release date or quarter, such as 2024Q3")
     p.add_argument("--video-note", help="Known reason for intentionally missing or unlocated video")
     p.add_argument("--timeline-note", help="Known reason for an omitted action timeline")
+    p.add_argument("--score-pdf", type=Path, help="Selected original choreography PDF from this source folder")
+    p.add_argument("--cue-pages", type=physical_pages, help="Physical PDF pages for action analysis, for example 6-34")
+    p.add_argument("--class-format-pages", type=physical_pages, help="Physical pages for class formats, for example 4,6-7")
     cover = p.add_mutually_exclusive_group()
     cover.add_argument("--cover", type=Path, help="A JPEG or PNG confirmed by the creator")
     cover.add_argument("--without-cover", action="store_true")
@@ -1382,7 +1504,7 @@ def main():
     p = commands.add_parser("analyze")
     p.add_argument("plan", type=Path)
     p.add_argument("--output", required=True, type=Path)
-    p.add_argument("--ocr", action="store_true")
+    p.add_argument("--ocr", action="store_true", help="Compatibility flag; sparse scanned pages are detected automatically")
     p.add_argument("--skip-alignment", action="store_true")
     p = commands.add_parser("build")
     p.add_argument("review", type=Path)
@@ -1397,6 +1519,10 @@ def main():
                    help="Deliver a creator-confirmed limited scope when original materials are genuinely absent")
     p.add_argument("--screen-subtitles", choices=("present", "absent"),
                    help="Visual judgment after examining the frames of the output video")
+    p.add_argument("--subtitle-observations", type=Path, help="Per-package subtitle observations bound to SHA-256")
+    p.add_argument("--keep-going", action="store_true", help="Deliver verified routines and report individual blockers")
+    p.add_argument("--include-package", type=Path, action="append",
+                   help="Reuse a previously built package in this new batch; repeat for multiple packages")
     add_media_options(p)
     p = commands.add_parser("check-review", help="List unfinished source checks before encoding")
     p.add_argument("review", type=Path)
@@ -1428,6 +1554,8 @@ def main():
                    help="Deliver a creator-confirmed limited scope when original materials are genuinely absent")
     p.add_argument("--screen-subtitles", choices=("present", "absent"),
                    help="Visual judgment after examining the samples of a single exact package")
+    p.add_argument("--subtitle-observations", type=Path, help="Per-package subtitle observations bound to SHA-256")
+    p.add_argument("--keep-going", action="store_true", help="Deliver verified packages and report individual blockers")
     p.add_argument("--keep-music", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("--target-lufs", action=RejectAudioEdit, help=argparse.SUPPRESS)
     args = parser.parse_args()

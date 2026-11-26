@@ -35,6 +35,8 @@ import sys
 from pathlib import Path
 from typing import Any, Iterable, Sequence
 
+from score_evidence import header_labels, numbered_ocr_heading
+
 
 SCHEMA_VERSION = 2
 PDF_CUE_TIME_BASIS = "track-relative"
@@ -336,16 +338,13 @@ def _has_cue_table_header(
     music_headers = [
         word
         for word in words
-        if _word_text(word).upper() == "MUSIC"
+        if "MUSIC" in header_labels(_word_text(word))
         and 0 <= float(word.get("x0", page_width)) < page_width * 0.40
     ]
     exercise_headers = [
         word
         for word in words
-        if (
-            _word_text(word).upper() == "EXERCISE"
-            or "SEQUENCE/EXERCISE" in _word_text(word).upper()
-        )
+        if "EXERCISE" in header_labels(_word_text(word))
         and page_width * 0.20 < float(word.get("x0", -1)) <= page_width
     ]
     exercise_table = any(
@@ -454,7 +453,13 @@ def parse_cue_page_words(
                 _normalized_segment(match.group("segment")),
             ))
     if not track_candidates:
-        return None
+        heading = numbered_ocr_heading(words, page_width, PDF_TRACK_RE, PDF_INLINE_TRACK_RE)
+        if not heading:
+            return None
+        word = heading[0]
+        match = PDF_TRACK_RE.fullmatch(word["text"]) or PDF_INLINE_TRACK_RE.fullmatch(word["text"])
+        track_candidates.append((word["top"], word["x0"], int(match.group("number")),
+                                 _normalized_segment(match.group("segment"))))
     track_candidates.sort()
     track_numbers = {candidate[2] for candidate in track_candidates}
     if len(track_numbers) != 1:
@@ -535,19 +540,16 @@ def _partition_clock_runs(pages: Sequence[CuePage]) -> list[list[CuePage]]:
 
     runs: list[list[CuePage]] = []
     current: list[CuePage] = []
-    previous_last: float | None = None
+    last_by_segment: dict[str | None, float] = {}
     for page in sorted(pages, key=lambda item: item.page_number):
         first = page.cue_times_seconds[0]
-        if (
-            current
-            and previous_last is not None
-            and page.segment == current[-1].segment
-            and first < previous_last - 1
-        ):
+        previous_last = last_by_segment.get(page.segment)
+        if previous_last is not None and first < previous_last - 1:
             runs.append(current)
             current = []
+            last_by_segment.clear()
         current.append(page)
-        previous_last = page.cue_times_seconds[-1]
+        last_by_segment[page.segment] = page.cue_times_seconds[-1]
     if current:
         runs.append(current)
     return runs

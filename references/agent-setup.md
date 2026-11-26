@@ -6,15 +6,18 @@
 
 用能访问素材目录和写入交付目录的桌面或命令行 Agent。原素材、构建、日志和质检都在本地处理。先确认当前 Agent 的终端能运行 Python 3.10 或更新版本、FFmpeg 和 ffprobe。新装工具后重开终端，检查 PATH。[FFmpeg 下载](https://ffmpeg.org/download.html)
 
-macOS 可通过 Homebrew 安装 FFmpeg。可安装 Tesseract 做画面字幕抽查。识别无文本层的 PDF 时，再装 Poppler。
+macOS 可通过 Homebrew 安装 FFmpeg。Tesseract 用于扫描原谱和画面字幕抽查。需要中文等语言时安装相应语言包，用 `tesseract --list-langs` 核对。
 
     brew install ffmpeg
-    brew install poppler tesseract
+    brew install tesseract tesseract-lang
+
+PDF 有有效文字层时直接读取原文。遇到缺少有效文字层的中文、西语等扫描件，可在当前 Agent 的终端设 `SSPLAYER_OCR_LANGUAGES=eng+chi_sim` 或 `eng+spa`，同一批的分析与质检沿用相同设置。只列出已安装且适用于这批资料的语言。
 
 在 Skill 目录创建独立的 Python 环境。将下文命令里的 `python` 换成这个环境中的 Python。
 
     python3 -m venv .venv
     .venv/bin/python -m pip install -r requirements.txt
+    .venv/bin/python scripts/ssroutine.py --version
     .venv/bin/python scripts/ssroutine.py doctor
 
 Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路径改用 `& .\.venv\Scripts\python.exe`。把已安装的 FFmpeg 和可选 OCR 工具所在目录加入 PATH。处理有文本层的 PDF 时，`doctor` 可以显示 `ocr: false`。从项目工作目录运行时，用 Skill 里的 Python 和脚本的实际绝对路径。给含空格的路径加引号。
@@ -33,6 +36,8 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
        git clone https://github.com/Mibslee/ssplayer_package_creator.git .dsh/skills/ssplayer-package-creator
 
 2. 在项目工作区运行已配置的 `dsh`。在会话点名使用 Skill，并给出原始资料目录。已有项目工作区时可省略交付路径。如没有自动发现，明确指定 `.dsh/skills/ssplayer-package-creator/SKILL.md`。[DSH 官方技能发现规则](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/skills.md)
+
+升级后先用该目录的 `scripts/ssroutine.py --version` 核对实际版本。正在继续旧任务时，把新版 `SKILL.md` 的绝对路径告诉 DSH，沿用旧会话已确认的选项、原始资料和通过质检的成品。让它从阻塞项开始。
 
 ## MiniMax Code
 
@@ -84,15 +89,23 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 修改小节、曲目版本、目录槽位或动作提取页后，更新计划，运行 `analyze --output review-v2.json`。保留之前的复核文件，对新结果重新核实受影响的小节。独立的原谱打开页可在核对后填写。同名成品内容不一致时使用新修订号。
 
+选定多份候选原谱中的一份时，用 `plan --score-pdf "/原始资料/中文.pdf"`。双语合册可用 `--cue-pages 6-34 --class-format-pages 5` 指定实际 PDF 中的物理页。范围以本册为准，续页也要纳入。跨布局或不同语言时，先认清是动作表、课型表、技术说明还是图例，再确认动作与录音的关系。少量水印文字的扫描页会自动进入 OCR。抽取结果待视觉核实，确认后写入复核文件。
+
 ## 提交一批
 
 用 `finish` 处理一套或多套已核对的方案。进度会显示音乐、视频和质检阶段；完成后可以看到各阶段耗时。已有成品可从本机工作区选出并直接提交。
 
-先根据 `check-review` 指出的小节补齐证据。用 `check-review reviewed.json --measure-video` 复测已确认的音频匹配。遇到固定偏移、持续漂移或只能按画面跳章，按[音画校时指南](video-clock.md)记录相应证据。正式构建会在启动长视频编码前核对实际采用的源音频。正式批次只会接收已核实的包，失败批次没有可签注指纹。制作者明确选择适用于原始资料的有限范围后，可对 `check-review`、`finish` 或 `submit` 传 `--source-limited`。质检仍会核对已提供的素材。
+先根据 `check-review` 指出的小节补齐证据。工具会核对原谱功能、课型顺序及必选位置能否填满。用 `check-review reviewed.json --measure-video` 复测已确认的音频匹配。遇到固定偏移、持续漂移或只能按画面跳章，按[音画校时指南](video-clock.md)记录相应证据。制作者明确选择适用于原始资料的有限范围后，可对 `check-review`、`finish` 或 `submit` 传 `--source-limited`。质检仍会核对已提供的素材。
 
 让智能体直接显示 `finish` 的标准错误进度，或写入日志后按需查看。长视频会报告编码百分比。已完成的资源包使用 `submit` 接续，省去重新编码。生成正式批次时，`finish` 已包含 `submit` 和九宫格质检。
 
     python scripts/ssroutine.py submit "/本机工作区/成品/TONE_26_1.ssroutine" "/本机工作区/成品/CORE_63_3.ssroutine" --workspace "/当前项目工作目录"
+
+多套制作时加 `--keep-going`。工具先核对所有方案，再逐套构建和质检。仍有阻塞时会给出 `partial` 汇总，指纹只包含通过质检的包。全部阻塞时不生成批次。下一次可合并已完成的成品和新修好的方案，重复传 `--include-package` 加入已有包，并使用新的批次 ID。已有批次和指纹保留。
+
+    python scripts/ssroutine.py finish review-fixed.json --include-package "/先前成品/TONE_26_1.ssroutine" --workspace "/当前项目工作目录" --batch-id TONE-combined-2 --keep-going
+
+多个成品已逐一看过抽样帧时，可为 `finish` 或 `submit` 提供 `--subtitle-observations captions.json`。JSON 的键是规范包名，每项提供该包完整 SHA-256 和 `status`（`present` 或 `absent`）。哈希可从 `verify` 的输出读取。只有匹配同一份成品的记录可以通过该项确认，未填写的包继续自动抽查。
 
 完成后返回本地批次目录。每套成品对应一张同名九宫格 PNG，整批只需一份指纹文件。用户明确指定上传的批次和目的地后，再分享有权分发的文件。若要核对网盘副本，从网盘读回包执行 `verify`，把输出里的完整 SHA-256 与批次指纹比较。原始素材、计划、完整报告和测试文件留在本机。
 
@@ -122,7 +135,7 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 | `--video-quality ipad` | HEVC，最高 1080p，视频目标码率 1800 kb/s |
 | `--video-quality compact` | HEVC，最高 720p，视频目标码率 950 kb/s |
 
-按素材细节调整 `--video-max-height` 和 `--video-bitrate-kbps`。需要指定 H.264 时可选 iPad 或轻量档并加 `--video-codec h264`。降低分辨率时保持比例，已低于上限的画面沿用原分辨率或向下取偶。默认 H.265 档有源画面码率时会据此试压，避免低码率素材转码后反而变大。默认压缩档要求视频体积至少减少 10%，头、中、尾三个画面样本的平均 SSIM 均达到 0.96。默认档未通过时，只有源视频与要求的编码一致才会沿用源文件。源编码不同时会提示原因，可改用 iPad 或轻量档重做，或明确选择原画。质检首图显示实际打包的编码。
+按素材细节调整 `--video-max-height` 和 `--video-bitrate-kbps`。需要指定编码时用 `--video-codec hevc` 或 `h264`。降低分辨率时保持比例，已低于上限的画面沿用原分辨率或向下取偶。默认压缩档尝试 H.265，要求视频体积至少减少 10%，头、中、尾三个画面样本的平均 SSIM 均达到 0.96，并验证音轨、独立字幕和时钟。默认方案且没有指定编码、分辨率或码率时，未通过的压缩尝试可保留兼容的原视频，构建日志显示原因。明确指定的参数继续约束输出。质检首图显示实际打包的编码。
 
     python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality ipad
     python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality compact --video-max-height 540 --video-bitrate-kbps 750

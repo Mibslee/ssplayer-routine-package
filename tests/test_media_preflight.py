@@ -1,5 +1,8 @@
 """Regressions for source timing and the creator's audio policy."""
 
+from argparse import Namespace
+from contextlib import redirect_stderr, redirect_stdout
+from io import StringIO
 import json
 import math
 import shutil
@@ -15,9 +18,9 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from delivery_policy import assess_delivery
-from media_analysis import optimize_video, stream_hashes
+from media_analysis import optimize_video, stream_hashes, video_info
 from qa_preview import inspect_loudness
-from ssroutine import chapter_preflight, digest, identity, read_manifest
+from ssroutine import chapter_preflight, digest, identity, package as build_package, read_manifest
 
 
 def loudness_report(quiet=-25.0, peak=-1.0):
@@ -114,6 +117,31 @@ class OriginalAudioCLITests(unittest.TestCase):
             self.assertEqual(fingerprints["packages"][0]["sha256"], digest(package))
             self.assertEqual(digest(resubmitted / "套路资源包" / package.name), digest(package))
 
+            blocked_review = folder / "unready-review.json"
+            blocked_review.write_text("{}", encoding="utf-8")
+            continued = self.invoke("ssroutine.py", "finish", blocked_review, "--include-package", package,
+                                    "--output-dir", batch, "--batch-id", "continued", "--source-limited",
+                                    "--keep-going")
+            summary = next(json.loads(line) for line in continued.stderr.splitlines() if line.startswith("{"))
+            self.assertEqual((summary["status"], summary["ready"]), ("partial", [package.name]))
+            self.assertEqual(summary["blocked"][0]["stage"], "编码前核对")
+            accepted = batch / "continued" / "套路资源包" / package.name
+            self.assertEqual(digest(accepted), digest(package))
+
+            duplicate = self.invoke("ssroutine.py", "submit", package, built, "--output-dir", batch,
+                                    "--batch-id", "duplicate", "--source-limited", "--keep-going", succeeds=False)
+            self.assertIn("同一项目、套路和修订重复", duplicate.stderr)
+            self.assertFalse((batch / "duplicate").exists())
+
+            observations = folder / "captions.json"
+            observations.write_text(json.dumps({package.name: {"sha256": "0" * 64, "status": "absent"}}),
+                                    encoding="utf-8")
+            stale = self.invoke("ssroutine.py", "submit", package, "--output-dir", batch,
+                                "--batch-id", "stale", "--source-limited",
+                                "--subtitle-observations", observations, succeeds=False)
+            self.assertIn("字幕确认对应不同指纹", stale.stderr)
+            self.assertFalse((batch / "stale").exists())
+
             manifest_path = folder / "manifest.json"
             self.invoke("ssroutine.py", "manifest", package, "--output", manifest_path)
             revised = folder / "revision"
@@ -172,6 +200,41 @@ class OriginalAudioCLITests(unittest.TestCase):
             audio = stream_hashes(result, "a")
             self.assertEqual(len(audio.splitlines()), 2)
             self.assertEqual(audio, stream_hashes(source, "a"))
+
+    def test_default_quality_can_keep_compatible_source_but_explicit_codec_is_enforced(self):
+        encoders = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"], text=True)
+        if "libx264" not in encoders:
+            self.skipTest("FFmpeg H.264 encoder required")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video, audio = root / "lesson.mp4", root / "T1.wav"
+            subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi",
+                            "-i", "sine=frequency=410:duration=2", str(audio)], check=True, timeout=20)
+            caption = root / "lesson.srt"
+            caption.write_text("1\n00:00:00,100 --> 00:00:01,600\nTest caption\n", encoding="utf-8")
+            subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi",
+                            "-i", "testsrc2=size=96x96:rate=24:duration=2", "-i", str(audio), "-i", str(caption),
+                            "-c:v", "libx264", "-c:a", "aac", "-c:s", "mov_text", str(video)], check=True, timeout=20)
+            review = {"plan": {"program": "DEMO", "routine": "2", "revision": 1, "video": str(video),
+                               "music": [{"file": str(audio), "section": "T1", "variant": "standard"}]},
+                      "tracks": [{"source": identity(audio), "duration": 2}],
+                      "video": {"source": identity(video)}}
+            options = Namespace(output_dir=root / "result", video_quality="efficient",
+                                video_codec=None, video_max_height=None, video_bitrate_kbps=None)
+            fallback = {**video_info(video), "compression": "keptOriginal", "reason": "Picture sample failed"}
+            with (patch("ssroutine.efficient_video", return_value=(video, fallback)),
+                  redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+                result = build_package(options, review=review)
+                with result.open("rb") as stream:
+                    _, manifest = read_manifest(stream)
+                    self.assertEqual(manifest["video"]["asset"]["sha256"], digest(video))
+                    stream.seek(manifest["music"][0]["asset"]["bytes"], 1)
+                    self.assertEqual(stream.read(manifest["video"]["asset"]["bytes"]), video.read_bytes())
+                options.output_dir = root / "strict"
+                options.video_codec = "hevc"
+                with self.assertRaisesRegex(ValueError, "Could not package H.265"):
+                    build_package(options, review=review)
+                self.assertFalse(list(options.output_dir.glob("*.ssroutine")))
 
     def test_legacy_edit_options_reject_before_writing_output(self):
         cases = [

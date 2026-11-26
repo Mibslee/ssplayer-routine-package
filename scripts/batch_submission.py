@@ -30,9 +30,6 @@ def submit(args):
     require(1 <= len(args.packages) <= 256, "Select between 1 and 256 packages")
     observation = getattr(args, "screen_subtitles", None)
     source_limited = bool(getattr(args, "source_limited", False))
-    target_lufs = getattr(args, "target_lufs", getattr(args, "lufs", None))
-    if getattr(args, "keep_music", False):
-        target_lufs = None
     require(observation is None or len(args.packages) == 1,
             "An explicit subtitle observation applies to one inspected package")
     root = args.output_dir
@@ -68,7 +65,7 @@ def submit(args):
             print(f"质检 {name}", file=sys.stderr, flush=True)
             with redirect_stdout(StringIO()):
                 passed = generate(Namespace(package=source, output_dir=work, credit=None, made_at=None,
-                                            font=args.font, screen_subtitles=observation, target_lufs=target_lufs,
+                                            font=args.font, screen_subtitles=observation,
                                             source_limited=source_limited),
                                   sealed_copy=package, overview_only=True)
             evidence = work / (stem + ".qa")

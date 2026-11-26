@@ -117,95 +117,11 @@ def measure(path):
     return integrated, peak
 
 
-def balance_audio(source, destination, target, video=False, *, measured=None):
-    """Apply constant gain with headroom. None only attenuates a peak above 0 dBTP."""
-    integrated, peak = measure(source) if measured is None else measured
-    receipt = {"inputLUFS": integrated, "outputLUFS": integrated, "truePeakDBTP": peak, "gainDB": 0}
-    if target is None and peak <= 0:
-        return source, receipt
-    # This extra headroom leaves room for the encoder's reconstructed peaks.
-    gain = -2.0 - peak if target is None else min(target - integrated, -2.0 - peak, 12.0)
-    initial_gain = gain
-    # Peak-only repairs preserve the creator's levels while leaving a small
-    # measured margin. Target normalization continues to require full headroom.
-    peak_limit = -0.2 if target is None else -1.4
-    if abs(gain) <= 0.5 and peak <= -1.5:
-        return source, receipt
-    retry_mapping = None
-    if video:
-        duration, media = probe(source, "video")
-        audio = [s for s in media["streams"] if s["codec_type"] == "audio"]
-        if len(audio) != 1:
-            raise ValueError("Video balancing requires one audio stream. Select the intended version first.")
-        args = ["-map", "0", "-c", "copy", "-c:a:0", "aac", "-b:a:0", "256k"]
-        volume_option = "-filter:a:0"
-    else:
-        duration, media = probe(source, "audio")
-        source_codec = next(s["codec_name"] for s in media["streams"] if s["codec_type"] == "audio")
-        lossless = source_codec in {"alac", "flac", "wavpack"} or source_codec.startswith("pcm_")
-        mapping = ["-map", "0:a:0", "-map_metadata", "0"]
-        if lossless:
-            args = [*mapping, "-c:a", "alac"]
-        else:
-            args = [*mapping, "-c:a", "aac", "-b:a", "256k"]
-            retry_mapping = mapping
-        volume_option = "-af"
-
-    def encode(gain_db, options):
-        run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-i", str(source), *options,
-            volume_option, f"volume={gain_db:.6f}dB", str(destination))
-        return measure(destination)
-
-    final_lufs, final_peak = encode(gain, args)
-    reduction = final_peak + 2.2
-    if final_peak > peak_limit and retry_mapping and reduction > 2.0:
-        # A different AAC encoder or bitrate can avoid the reconstructed peak at the same gain.
-        alternatives = [("aac", "192k")]
-        if sys.platform == "darwin":
-            encoders = run("ffmpeg", "-hide_banner", "-encoders").decode(errors="replace")
-            if "aac_at" in encoders:
-                alternatives.insert(0, ("aac_at", "256k"))
-        for encoder, bitrate in alternatives:
-            destination.unlink(missing_ok=True)
-            try:
-                alternative_lufs, alternative_peak = encode(
-                    gain, [*retry_mapping, "-c:a", encoder, "-b:a", bitrate])
-                alternative_duration, _ = probe(destination, "audio")
-            except ValueError:
-                continue
-            if (alternative_peak <= peak_limit and abs(alternative_lufs - integrated - gain) <= 1.0
-                    and abs(alternative_duration - duration) <= 0.20):
-                final_lufs, final_peak = alternative_lufs, alternative_peak
-                break
-    if final_peak > peak_limit:
-        gain -= reduction
-        destination.unlink(missing_ok=True)
-        final_lufs, final_peak = encode(gain, args)
-    if retry_mapping and (final_peak > peak_limit or abs(final_lufs - integrated - gain) > 1.0):
-        # A lossy codec can reconstruct clipped peaks even at reduced gain.
-        # Preserve the attenuated samples in the existing supported M4A container.
-        destination.unlink(missing_ok=True)
-        gain = initial_gain
-        final_lufs, final_peak = encode(gain, [*retry_mapping, "-c:a", "alac"])
-    final_duration, final = probe(destination, "video" if video else "audio")
-    if abs(final_duration - duration) > 0.20:
-        raise ValueError(f"Audio balancing changed the duration of {source.name}")
-    if video:
-        # Compare all video packet timestamps and compressed payloads, not only container duration.
-        entries = "packet=pts_time,dts_time,duration_time,size,data_hash"
-        def picture_packets(path):
-            return run("ffprobe", "-v", "error", "-select_streams", "v", "-show_packets",
-                       "-show_data_hash", "sha256", "-show_entries", entries, "-of", "compact", str(path))
-        if picture_packets(source) != picture_packets(destination):
-            raise ValueError(f"Video balancing changed the encoded picture or its clock in {source.name}")
-        initial_audio = next(s for s in media["streams"] if s["codec_type"] == "audio")
-        final_audio = next(s for s in final["streams"] if s["codec_type"] == "audio")
-        if abs(float(initial_audio.get("start_time", 0)) - float(final_audio.get("start_time", 0))) > 0.05:
-            raise ValueError(f"Video balancing moved the embedded audio clock in {source.name}")
-    if final_peak > peak_limit or abs(final_lufs - integrated - gain) > 1.0:
-        raise ValueError(f"Post-encode loudness check failed for {source.name}")
-    return destination, {"inputLUFS": integrated, "outputLUFS": final_lufs, "truePeakDBTP": final_peak,
-                         "gainDB": round(gain, 3)}
+def original_peak_notice(label, peak):
+    if peak > 0:
+        return (f"{label} 原始真峰值 {peak:+.1f} dBTP。已保留原音频。"
+                "如需调整，请使用 App 的 Mix「歌单响度一致化」。")
+    return None
 
 
 def picture_stream(media):

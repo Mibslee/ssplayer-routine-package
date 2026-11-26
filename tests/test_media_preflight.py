@@ -14,9 +14,10 @@ from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
-from media_analysis import balance_audio
+from delivery_policy import assess_delivery
+from media_analysis import optimize_video, stream_hashes
 from qa_preview import inspect_loudness
-from ssroutine import chapter_preflight, identity, read_manifest
+from ssroutine import chapter_preflight, digest, identity, read_manifest
 
 
 def loudness_report(quiet=-25.0, peak=-1.0):
@@ -35,109 +36,161 @@ def loudness_report(quiet=-25.0, peak=-1.0):
 
 
 class AudioPolicyTests(unittest.TestCase):
-    def test_default_preserves_relative_levels_and_still_rejects_excess_peaks(self):
+    def test_original_peaks_are_advisories_without_blocking_or_requiring_changes(self):
         report = loudness_report(peak=0.4)
         inspect_loudness(report)
         self.assertEqual(report["loudnessPolicy"], "keepOriginalDynamics")
-        self.assertEqual(report["checks"]["audio"]["conditions"], [])
-        self.assertEqual(len(report["blockingIssues"]), 1)
-        self.assertIn("+0.4 dBTP", report["blockingIssues"][0])
-        self.assertNotIn("loudnessReview", report["tracks"][1])
-
-    def test_explicit_target_still_flags_differences(self):
-        report = loudness_report()
-        inspect_loudness(report, -16.0)
-        self.assertEqual(report["loudnessPolicy"], "targetLoudness")
-        self.assertEqual(len(report["checks"]["audio"]["conditions"]), 1)
-        self.assertIn("T2", report["checks"]["audio"]["conditions"][0])
+        self.assertEqual(report["checks"]["audio"], {"issues": [], "conditions": []})
         self.assertEqual(report["blockingIssues"], [])
-
-    @patch("media_analysis.probe", return_value=(30.0, {"streams": [{"codec_type": "audio", "codec_name": "mp3"}]}))
-    @patch("media_analysis.measure")
-    @patch("media_analysis.run")
-    def test_peak_repair_falls_back_to_supported_lossless_if_aac_repeatedly_exceeds_the_limit(self, run, measure, probe):
-        codecs = []
-
-        def encode(*args):
-            if "-encoders" in args:
-                return b"aac"
-            codecs.append(args[args.index("-c:a") + 1])
-            Path(args[-1]).touch()
-            return b""
-
-        run.side_effect = encode
-        measure.side_effect = [(-10.0, 0.4), (-12.4, 0.6), (-12.4, 0.2), (-15.2, 0.5), (-12.4, -2.0)]
-        with tempfile.TemporaryDirectory() as folder:
-            source = Path(folder) / "source.mp3"
-            output = Path(folder) / "output.m4a"
-            repaired, receipt = balance_audio(source, output, None)
-            self.assertEqual(repaired, output)
-            self.assertTrue(output.exists())
-        self.assertEqual(codecs[-1], "alac")
-        self.assertAlmostEqual(receipt["gainDB"], -2.4)
-        self.assertEqual(receipt["truePeakDBTP"], -2.0)
+        self.assertEqual(assess_delivery({}, report), {"status": "ready", "blockers": [], "limitations": []})
+        self.assertEqual(len(report["advisories"]), 1)
+        self.assertIn("+0.4 dBTP", report["advisories"][0]["detail"])
+        self.assertIn("Mix「歌单响度一致化」", report["advisories"][0]["detail"])
+        self.assertTrue(report["tracks"][0]["originalPeakAboveZero"])
+        self.assertNotIn("originalPeakAboveZero", report["tracks"][1])
 
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
 class OriginalAudioCLITests(unittest.TestCase):
-    def test_default_finish_and_resubmission_keep_the_original_songs(self):
+    def invoke(self, script, *args, succeeds=True):
         scripts = Path(__file__).resolve().parents[1] / "scripts"
-
-        def invoke(script, *args):
-            result = subprocess.run([sys.executable, str(scripts / script), *map(str, args)],
-                                    capture_output=True, text=True, timeout=60)
+        result = subprocess.run([sys.executable, str(scripts / script), *map(str, args)],
+                                capture_output=True, text=True, timeout=60)
+        if succeeds:
             self.assertEqual(result.returncode, 0, result.stderr)
-            return result.stdout
+        else:
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+        return result
 
+    def test_build_finish_submit_and_revise_keep_original_music_bytes_and_report_peaks(self):
         with tempfile.TemporaryDirectory() as directory:
             folder = Path(directory)
             songs, findings = [], []
-            for index, level in enumerate((0.40, 0.12, 0.32), 1):
+            for index, level in enumerate((1.0, 0.12, 0.32), 1):
                 audio = folder / f"T{index}.wav"
+                if index == 1:
+                    # A near-full-scale sequence with a reproducible intersample peak.
+                    frame_rate = 48000
+                    pcm = struct.pack("<hhhh", 32765, 32765, -32765, -32765) * 36000
+                else:
+                    frame_rate = 8000
+                    pcm = b"".join(struct.pack("<h", round(32767 * level * math.sin(sample * math.tau / 8)))
+                                   for sample in range(3 * frame_rate))
                 with wave.open(str(audio), "wb") as writer:
-                    writer.setparams((1, 2, 8000, 0, "NONE", "not compressed"))
-                    writer.writeframes(b"".join(struct.pack("<h", round(32767 * level * math.sin(sample * math.tau / 8)))
-                                                for sample in range(24000)))
+                    writer.setparams((1, 2, frame_rate, 0, "NONE", "not compressed"))
+                    writer.writeframes(pcm)
                 songs.append({"file": str(audio), "section": f"T{index}", "variant": "standard", "title": f"Test {index}"})
                 findings.append({"source": identity(audio), "duration": 3.0})
             review = folder / "review.json"
             review.write_text(json.dumps({"plan": {"program": "DEMO", "routine": "1", "revision": 1, "music": songs},
                                           "tracks": findings}), encoding="utf-8")
-            batch = folder / "batches"
-            invoke("ssroutine.py", "finish", review, "--output-dir", batch, "--batch-id", "original", "--source-limited")
-            package = batch / "original" / "套路资源包" / "DEMO_1_1.ssroutine"
-            with package.open("rb") as stream:
-                _, manifest = read_manifest(stream)
-                for found, song in zip(findings, manifest["music"], strict=True):
-                    self.assertEqual(song["asset"], found["source"])
-                for original, song in zip(songs, manifest["music"], strict=True):
-                    self.assertEqual(stream.read(song["asset"]["bytes"]), Path(original["file"]).read_bytes())
 
-            invoke("ssroutine.py", "submit", package, "--output-dir", batch, "--batch-id", "resubmitted", "--source-limited")
-            self.assertTrue((batch / "resubmitted" / "resubmitted.ssfingerprints.json").is_file())
+            def assert_original_music(package):
+                with package.open("rb") as stream:
+                    _, manifest = read_manifest(stream)
+                    for found, packaged in zip(findings, manifest["music"], strict=True):
+                        self.assertEqual(packaged["asset"], found["source"])
+                    for original, packaged in zip(songs, manifest["music"], strict=True):
+                        self.assertEqual(stream.read(packaged["asset"]["bytes"]), Path(original["file"]).read_bytes())
+
+            kept = folder / "build"
+            build = self.invoke("ssroutine.py", "build", review, "--output-dir", kept, "--keep-music")
+            receipt = json.loads(build.stdout)
+            self.assertEqual(receipt["musicPolicy"], "keepOriginalDynamics")
+            self.assertTrue(all(row["gainDB"] == 0 for row in receipt["loudness"]))
+            self.assertGreater(receipt["loudness"][0]["truePeakDBTP"], 0)
+            self.assertIn("Mix「歌单响度一致化」", build.stderr)
+            built = kept / "DEMO_1_1.ssroutine"
+            assert_original_music(built)
+
+            batch = folder / "batches"
+            self.invoke("ssroutine.py", "finish", review, "--output-dir", batch, "--batch-id", "original", "--source-limited")
+            package = batch / "original" / "套路资源包" / built.name
+            assert_original_music(package)
+            self.assertEqual(digest(package), digest(built))
+            self.invoke("ssroutine.py", "submit", package, "--output-dir", batch, "--batch-id", "resubmitted", "--source-limited")
+            resubmitted = batch / "resubmitted"
+            fingerprints = json.loads((resubmitted / "resubmitted.ssfingerprints.json").read_text(encoding="utf-8"))
+            self.assertEqual(fingerprints["packages"][0]["sha256"], digest(package))
+            self.assertEqual(digest(resubmitted / "套路资源包" / package.name), digest(package))
+
+            manifest_path = folder / "manifest.json"
+            self.invoke("ssroutine.py", "manifest", package, "--output", manifest_path)
+            revised = folder / "revision"
+            self.invoke("ssroutine.py", "revise", package, manifest_path, "--revision", "2", "--output-dir", revised)
+            assert_original_music(revised / "DEMO_1_2.ssroutine")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            manifest["music"][0]["asset"]["sha256"] = "f" * 64
+            manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+            rejected = self.invoke("ssroutine.py", "revise", package, manifest_path, "--revision", "3",
+                                   "--output-dir", revised, succeeds=False)
+            self.assertIn("Changing media requires building a new package from source", rejected.stderr)
+            self.assertFalse((revised / "DEMO_1_3.ssroutine").exists())
+
             qa = folder / "qa"
-            invoke("qa_preview.py", package, "--output-dir", qa, "--strict", "--source-limited")
-            result = json.loads((qa / "DEMO_1_1.qa" / "qa.json").read_text(encoding="utf-8"))
+            self.invoke("qa_preview.py", package, "--output-dir", qa, "--strict", "--source-limited")
+            evidence = qa / "DEMO_1_1.qa"
+            result = json.loads((evidence / "qa.json").read_text(encoding="utf-8"))
             self.assertEqual(result["loudnessPolicy"], "keepOriginalDynamics")
             self.assertEqual(result["checks"]["audio"], {"issues": [], "conditions": []})
+            self.assertTrue(result["offlineMediaPassed"])
+            self.assertEqual(result["delivery"]["status"], "readyWithLimitations")
+            self.assertEqual(len(result["advisories"]), 1)
+            self.assertGreater(result["tracks"][0]["truePeakDBTP"], 0)
             levels = [row["lufs"] for row in result["tracks"]]
             self.assertGreater(max(levels) - min(levels), 9.0)
+            self.assertFalse(any(item["check"] == "audio" for item in result["delivery"]["limitations"]))
+            html = (evidence / "report.html").read_text(encoding="utf-8")
+            self.assertIn("原音频峰值观察", html)
+            self.assertIn("Mix「歌单响度一致化」", html)
 
-            normalized = folder / "normalized"
-            out = json.loads(invoke("ssroutine.py", "build", review, "--output-dir", normalized, "--lufs", "-16"))
-            self.assertEqual(out["musicPolicy"], "targetLoudness")
-            self.assertTrue(all(abs(song["outputLUFS"] + 16.0) <= 1.0 for song in out["loudness"]))
-            with (normalized / package.name).open("rb") as stream:
-                _, manifest = read_manifest(stream)
-            self.assertTrue(all(song["asset"]["sha256"] != found["source"]["sha256"]
-                                for song, found in zip(manifest["music"], findings, strict=True)))
-            invoke("ssroutine.py", "submit", normalized / package.name, "--output-dir", batch,
-                   "--batch-id", "verified-target", "--source-limited", "--target-lufs", "-16")
-            self.assertTrue((batch / "verified-target" / "verified-target.ssfingerprints.json").is_file())
+            corrupt = folder / package.name
+            data = package.read_bytes()
+            corrupt.write_bytes(data[:-1] + bytes([data[-1] ^ 1]))
+            rejected = self.invoke("ssroutine.py", "submit", corrupt, "--output-dir", batch, "--batch-id", "corrupt",
+                                   "--source-limited", succeeds=False)
+            self.assertIn("Media payload digest mismatch", rejected.stderr)
+            self.assertFalse((batch / "corrupt").exists())
 
-            kept = folder / "explicit-keep"
-            invoke("ssroutine.py", "build", review, "--output-dir", kept, "--keep-music", "--lufs", "-18")
-            self.assertEqual((kept / package.name).read_bytes(), package.read_bytes())
+    def test_video_compression_keeps_every_original_audio_stream(self):
+        encoders = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"], text=True)
+        if "libx265" not in encoders and not (sys.platform == "darwin" and "hevc_videotoolbox" in encoders):
+            self.skipTest("FFmpeg HEVC encoder required")
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "original.mp4"
+            compressed = Path(directory) / "compressed.mp4"
+            subprocess.run(["ffmpeg", "-nostdin", "-v", "error",
+                            "-f", "lavfi", "-i", "testsrc2=size=96x96:rate=24:duration=2",
+                            "-f", "lavfi", "-i", "sine=frequency=440:duration=2",
+                            "-f", "lavfi", "-i", "sine=frequency=540:duration=2",
+                            "-map", "0:v", "-map", "1:a", "-map", "2:a", "-c:v", "mpeg4", "-c:a", "aac",
+                            "-metadata:s:a:0", "language=eng", "-metadata:s:a:1", "language=zho", str(source)],
+                           check=True, capture_output=True, timeout=30)
+            result, metadata = optimize_video(source, compressed, 64, None, "hevc")
+            self.assertEqual(metadata["codec"], "hevc")
+            self.assertEqual(metadata["height"], 64)
+            audio = stream_hashes(result, "a")
+            self.assertEqual(len(audio.splitlines()), 2)
+            self.assertEqual(audio, stream_hashes(source, "a"))
+
+    def test_legacy_edit_options_reject_before_writing_output(self):
+        cases = [
+            ("ssroutine.py", ["build", "review.json"], ["--lufs", "-16"]),
+            ("ssroutine.py", ["build", "review.json"], ["--balance-video"]),
+            ("ssroutine.py", ["finish", "review.json"], ["--repair-music-peaks"]),
+            ("ssroutine.py", ["revise", "input.ssroutine", "manifest.json", "--revision", "2"], ["--reduce-peak", "T1"]),
+            ("ssroutine.py", ["revise", "input.ssroutine", "manifest.json", "--revision", "2"], ["--rebalance", "T1"]),
+            ("ssroutine.py", ["submit", "input.ssroutine"], ["--target-lufs", "-16"]),
+            ("qa_preview.py", ["input.ssroutine"], ["--target-lufs", "-16"]),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "output"
+            for script, command, option in cases:
+                with self.subTest(script=script, option=option):
+                    result = self.invoke(script, *command, "--output-dir", output, *option, succeeds=False)
+                    self.assertIn(f"{option[0]} 已停用", result.stderr)
+                    self.assertIn("Mix「歌单响度一致化」", result.stderr)
+                    self.assertFalse(output.exists())
 
 
 class MediaPreflightTests(unittest.TestCase):

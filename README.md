@@ -4,6 +4,7 @@
 
 - [安装与启动](references/agent-setup.md) 包含 WorkBuddy、dsh、MiniMax Code 和命令行的具体步骤。
 - [制作和质检](references/quality-check.md) 包含命名、日期、封面、替换曲、AB 段、原谱和 App 验收。
+- [音画校时指南](references/video-clock.md) 说明怎么处理固定偏移、持续速度差和只能按画面验证的章节。
 - [SKILL.md](SKILL.md) 是智能体读取的入口。下载安装时保留完整目录和脚本。
 - [文件格式](references/format.md) 说明清单与兼容要求。
 
@@ -29,7 +30,7 @@
 
 ## 贡献资源包
 
-核对素材、封面和设置后，运行 `ssroutine.py check-review`，通过后用 `finish` 构建和准备本地批次。已有成品可直接用 `submit`。 音乐默认原样入包，保留整套的响度起伏，质检仍核对解码、时长和真峰值。批次包含 `套路资源包`、`质检图` 和一份 `.ssfingerprints.json`。每套只交一张完整九宫格。制包中断时，按已完成阶段接续。需要修正单首歌响度时，可修订原包并复用视频。发布者核对图片与指纹后，可用 Mac 签注工具生成 `.ssapproval`。[批次提交和修订命令](references/format.md#batch-handoff)
+核对素材、封面和设置后，运行 `ssroutine.py check-review`，通过后用 `finish` 构建和准备本地批次。已有成品可直接用 `submit`。套路音乐按原文件字节入包，质检核对解码、时长并记录响度和真峰值。Mix 的音量和峰值调整使用 App 的「歌单响度一致化」。批次包含 `套路资源包`、`质检图` 和一份 `.ssfingerprints.json`。每套只交一张完整九宫格。制包中断时，按已完成阶段接续。发布者核对图片与指纹后，可用 Mac 签注工具生成 `.ssapproval`。[批次提交和修订命令](references/format.md#batch-handoff)
 
 先完成一套并约定提交渠道。累计 10 套不同套路，经开发者核验可用后可兑换 1 个月 Pro 激活码。同一套路的修订沿用原记录。制作人可以填写愿意公开的署名。GitHub Issues 用于报告制作工具问题。
 

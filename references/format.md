@@ -58,7 +58,7 @@ Publishers can reuse previously signed releases by adding a verified `.ssapprova
 
 Between the first two commands, correct the timelines, positions or metadata in `review-manifest.json` against the source. An ordinary revision reuses the original audio, video and PDF byte for byte. Use an explicitly approved `--cover /path/to/artwork.jpg` to change the cover, or `--without-cover` if the creator chooses to omit it.
 
-To rebalance the same packaged recording, add `--rebalance T15` to the `revise` command. The other recordings, video and PDF are reused. Retest the affected recording for loudness and chapter alignment before submission. Use `build` with reviewed inputs to replace a recording or to change video or PDF content. Existing manual preparation and notes remain with their recording in SSplayer.
+A revision reuses each packaged recording by its verified payload hash. Rebuild from confirmed originals when restoring recordings altered in an earlier package or choosing a different source. The tool keeps every selected music recording byte for byte. Mix loudness and peak adjustment belong in SSplayer’s playlist loudness control. Existing manual preparation and notes remain with their recording in SSplayer.
 
 ### Class formats
 

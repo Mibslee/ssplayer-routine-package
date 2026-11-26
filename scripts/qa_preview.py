@@ -22,11 +22,11 @@ from delivery_policy import assess_delivery
 from grit_evidence import check_grit_section_function, grit_source_evidence
 from grit_intervals import validate_interval_review
 from media_analysis import (SAMPLE_POSITIONS, alignment_module, extract_cues, map_recordings, measure,
-                            probe, timing_failure_detail, timing_windows, video_info)
+                            original_peak_notice, probe, timing_failure_detail, timing_windows, video_info)
 from qa_phone import (FONT_PATHS, PhonePreview, clock, score_metadata, section_title, select_preview_tracks,
                       timeline_sample, video_position, wrapped_lines)
 from report_html import write_html
-from ssroutine import (MAGIC, MAX_PACKAGE, check_class_template_sources, consume, container_digest,
+from ssroutine import (MAGIC, MAX_PACKAGE, RejectAudioEdit, check_class_template_sources, consume, container_digest,
                        grit_interval_proposals, read_class_template_document, read_manifest, require, validate_manifest)
 from subtitle_check import inspect_screen_subtitles, read_frame, subtitle_summary
 
@@ -70,23 +70,13 @@ def delivery_display(manifest, report, *keys):
     return state, outcome
 
 
-def inspect_loudness(report, target=None):
-    tracks = [row for row in report["tracks"] if row["decoded"] and row["durationMatches"]]
-    if target is None:
-        report["loudnessPolicy"] = "keepOriginalDynamics"
-    else:
-        report["loudnessPolicy"] = "targetLoudness"
-        report["loudnessReference"] = {"lufs": target, "source": "target"}
-    for row in tracks:
-        title = section_title(row)
-        if target is not None and abs(delta := round(row["lufs"] - target, 2)) > 2.0:
-            add_condition(report, "audio",
-                          f"{title} 实测 {row['lufs']:.1f} LUFS，较制作目标 {target:.1f} LUFS 偏差 {delta:+.1f} LU。")
-            row["loudnessReview"] = True
-        if row["truePeakDBTP"] > 0:
-            add_issue(report, "audio",
-                      f"{title} 实测真峰值 {row['truePeakDBTP']:+.1f} dBTP，高于 0 dBTP。")
-            row["loudnessReview"] = True
+def inspect_loudness(report):
+    report["loudnessPolicy"] = "keepOriginalDynamics"
+    for row in report["tracks"]:
+        if row["decoded"] and row["durationMatches"]:
+            if notice := original_peak_notice(section_title(row), row["truePeakDBTP"]):
+                row["originalPeakAboveZero"] = True
+                report.setdefault("advisories", []).append({"check": "audio", "detail": notice})
 
 
 def check_state(report, *keys):
@@ -648,12 +638,11 @@ def screenshot_cards(manifest, files, report, font_path):
     for row in tracks:
         detail = (f"{row['lufs']:.1f} LUFS    {row['truePeakDBTP']:.1f} dBTP"
                   if row["decoded"] else "解码或测量需复核")
-        if row.get("loudnessReview"):
-            detail += " · 待听"
+        if row.get("originalPeakAboveZero"):
+            detail += " · 原峰值保留"
         level_rows.append((section_title(row), detail))
-    if report.get("loudnessPolicy") == "keepOriginalDynamics":
-        volume.text(43, 172, "保留音乐相对响度 · 核对解码与真峰值", 20, SECONDARY)
-    volume.rows(level_rows, top=204 if report.get("loudnessPolicy") == "keepOriginalDynamics" else 180)
+    volume.text(43, 172, "原音乐保持不变 · 峰值仅记录 · 调整在 App 的 Mix「歌单响度一致化」", 20, SECONDARY)
+    volume.rows(level_rows, top=204)
     decorate(volume, 85, "audio")
     yield "08-loudness.png", volume.image
 
@@ -704,11 +693,6 @@ def screenshot_cards(manifest, files, report, font_path):
 
 
 def generate(args, *, sealed_copy=None, overview_only=False):
-    target_lufs = getattr(args, "target_lufs", None)
-    keep_music = bool(getattr(args, "keep_music", False))
-    require(not keep_music or target_lufs is None, "Choose original dynamics or a loudness target.")
-    require(target_lufs is None or -24 <= target_lufs <= -12,
-            "Select a loudness reference between -24 and -12 LUFS")
     root = args.output_dir
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ssroutine-qa-") as staging, \
@@ -731,7 +715,7 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                   "sectionGaps": sorted(set(range(1, max(sections) + 1)) - sections),
                   "appImportVerified": False, "sourceLimited": bool(getattr(args, "source_limited", False)),
                   "tracks": inspect_tracks(manifest, audio, optional),
-                  "blockingIssues": [], "checks": {
+                  "blockingIssues": [], "advisories": [], "checks": {
                       key: {"issues": [], "conditions": []} for key in CHECK_LABELS
                   }}
         output = Path(report_staging) / "evidence"
@@ -791,7 +775,7 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                 add_issue(report, "audio", f"{slot} 实际音乐时长与清单不符。")
             if song["status"] == "review":
                 add_issue(report, "video", f"{slot} 包内音画复测未通过。{timing_failure_detail(song)}。")
-        inspect_loudness(report, target_lufs)
+        inspect_loudness(report)
         if "video" in optional:
             try:
                 picture = video_info(optional["video"])
@@ -914,11 +898,8 @@ def main():
     parser.add_argument("--credit", help="Display credit for this evidence set")
     parser.add_argument("--made-at", help="Verified creation time in ISO 8601; omit to use evidence generation time")
     parser.add_argument("--font", type=Path, help="Optional font with Chinese glyphs")
-    loudness = parser.add_mutually_exclusive_group()
-    loudness.add_argument("--target-lufs", type=float, metavar="LUFS",
-                          help="Verify against an explicitly selected target; omit to preserve original dynamics")
-    loudness.add_argument("--keep-music", action="store_true",
-                          help="Preserve relative loudness (default); still check decoding and true peaks")
+    parser.add_argument("--keep-music", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--target-lufs", action=RejectAudioEdit, help=argparse.SUPPRESS)
     parser.add_argument("--source-limited", action="store_true",
                         help="Assess a creator-confirmed scope with genuinely absent original materials")
     parser.add_argument("--screen-subtitles", choices=("present", "absent"), metavar="RESULT",

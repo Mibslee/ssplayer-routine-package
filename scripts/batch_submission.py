@@ -13,15 +13,24 @@ import tempfile
 
 from ssroutine import MAX_PACKAGE, author_identity, digest, read_json, read_manifest, require, validate_manifest, write_json
 from media_analysis import unresolved_repeat_times
+from delivery_policy import assess_delivery, blocker_lines
+
+
+def delivery_batch_id(args):
+    batch = args.batch_id or f"SSplayer-{datetime.now():%Y%m%d}-{uuid4().hex[:8]}"
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}", batch), "Invalid batch ID")
+    require(not (args.output_dir / batch).exists(), f"Batch already exists: {batch}")
+    return batch
 
 
 def submit(args):
     from qa_preview import generate
 
-    batch = args.batch_id or f"SSplayer-{datetime.now():%Y%m%d}-{uuid4().hex[:8]}"
-    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9-]{0,63}", batch), "Invalid batch ID")
+    batch = delivery_batch_id(args)
     require(1 <= len(args.packages) <= 256, "Select between 1 and 256 packages")
     observation = getattr(args, "screen_subtitles", None)
+    source_limited = bool(getattr(args, "source_limited", False))
+    target_lufs = None if getattr(args, "keep_music", False) else getattr(args, "lufs", None)
     require(observation is None or len(args.packages) == 1,
             "An explicit subtitle observation applies to one inspected package")
     root = args.output_dir
@@ -57,16 +66,19 @@ def submit(args):
             print(f"质检 {name}", file=sys.stderr, flush=True)
             with redirect_stdout(StringIO()):
                 passed = generate(Namespace(package=source, output_dir=work, credit=None, made_at=None,
-                                            font=args.font, screen_subtitles=observation),
+                                            font=args.font, screen_subtitles=observation, target_lufs=target_lufs,
+                                            source_limited=source_limited),
                                   sealed_copy=package, overview_only=True)
             evidence = work / (stem + ".qa")
             report = read_json(evidence / "qa.json")
             require(report["manifestSHA256"] == hashlib.sha256(encoded).hexdigest(),
                     f"Package identity changed during review: {source.name}")
-            require(passed is True and report["offlineMediaPassed"] is True,
-                    f"{name} 的质检有待修复\n" + "\n".join(report["blockingIssues"]))
-            if report["qaStatus"] == "conditional":
-                print(f"{name} · 条件通过。缺项与原因已列在质检图。", file=sys.stderr, flush=True)
+            delivery = assess_delivery(manifest, report, source_limited=source_limited)
+            require(passed is True and report["offlineMediaPassed"] is True and delivery["status"] != "blocked",
+                    f"{name} 未达到投稿交付要求。请修复以下项目后重新质检：\n"
+                    + "\n".join(blocker_lines(delivery) or report["blockingIssues"]))
+            if delivery["status"] == "readyWithLimitations":
+                print(f"{name} · 可交付，原始资料限制已列在质检图。", file=sys.stderr, flush=True)
             overview = evidence / "3x3-overview.png"
             require(overview.is_file(), f"Missing 3×3 QA image: {name}")
             fingerprint = {

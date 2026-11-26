@@ -4,7 +4,7 @@
 
 ## 准备环境
 
-用能访问素材目录和输出目录的桌面或命令行 Agent。先确认当前 Agent 的终端能运行 Python 3.10 或更新版本、FFmpeg 和 ffprobe。新装工具后重开终端，检查 PATH。[FFmpeg 下载](https://ffmpeg.org/download.html)
+用能访问素材目录和写入交付目录的桌面或命令行 Agent。原素材、构建、日志和质检都在本地处理。先确认当前 Agent 的终端能运行 Python 3.10 或更新版本、FFmpeg 和 ffprobe。新装工具后重开终端，检查 PATH。[FFmpeg 下载](https://ffmpeg.org/download.html)
 
 macOS 可通过 Homebrew 安装 FFmpeg。可安装 Tesseract 做画面字幕抽查。识别无文本层的 PDF 时，再装 Poppler。
 
@@ -17,7 +17,7 @@ macOS 可通过 Homebrew 安装 FFmpeg。可安装 Tesseract 做画面字幕抽�
     .venv/bin/python -m pip install -r requirements.txt
     .venv/bin/python scripts/ssroutine.py doctor
 
-Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路径改用 `& .\.venv\Scripts\python.exe`。把已安装的 FFmpeg 和可选 OCR 工具所在目录加入 PATH。处理有文本层的 PDF 时，`doctor` 可以显示 `ocr: false`。
+Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路径改用 `& .\.venv\Scripts\python.exe`。把已安装的 FFmpeg 和可选 OCR 工具所在目录加入 PATH。处理有文本层的 PDF 时，`doctor` 可以显示 `ocr: false`。从项目工作目录运行时，用 Skill 里的 Python 和脚本的实际绝对路径。给含空格的路径加引号。
 
 ## WorkBuddy 桌面端
 
@@ -32,7 +32,7 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
        mkdir -p .dsh/skills
        git clone https://github.com/Mibslee/ssplayer_package_creator.git .dsh/skills/ssplayer-package-creator
 
-2. 在同一个工作区运行已配置的 `dsh`。在会话点名使用 Skill，并给出两个路径。如没有自动发现，明确指定 `.dsh/skills/ssplayer-package-creator/SKILL.md`。[DSH 官方技能发现规则](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/skills.md)
+2. 在项目工作区运行已配置的 `dsh`。在会话点名使用 Skill，并给出原始资料目录。已有项目工作区时可省略交付路径。如没有自动发现，明确指定 `.dsh/skills/ssplayer-package-creator/SKILL.md`。[DSH 官方技能发现规则](https://github.com/deepseek-ai/deepseek-harness/blob/master/docs/subsystems/skills.md)
 
 ## MiniMax Code
 
@@ -41,30 +41,37 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
        mkdir -p .minimax/skills
        git clone https://github.com/Mibslee/ssplayer_package_creator.git .minimax/skills/ssplayer-package-creator
 
-2. 新开或重新载入会话，从中点名使用 Skill。技能列表没刷新时直接给 `SKILL.md` 路径。用能访问私有原始资料的本地工作区运行辅助工具。[MiniMax Code 官方技能目录说明](https://github.com/MiniMax-AI/mcode-stack#installation)
+2. 新开会话，在 `/skills` 确认能看到技能，再输入 `/ssplayer-package-creator`。若同名旧版仍被加载，直接给出本项目新版 `SKILL.md` 的绝对路径。让 Agent 在计划中列出所读 Skill 和本轮交付目录的绝对路径。[MiniMax Code 官方技能目录说明](https://github.com/MiniMax-AI/mcode-stack#quick-start)
+
+## 其他 Agent 或直接使用终端
+
+保留整份 Skill 目录，让 Agent 读 `SKILL.md`，用当地的命令执行能力运行 Python 脚本。没有技能列表、选择卡片或后台任务面板时，可以按同一流程使用文本回复和命令行。缺少本地文件权限时，换到能读写所选空间的客户端。
 
 ## 发给智能体的提示
 
     使用 ssplayer-package-creator 制作一批 SSplayer 套路资源包。
     原始资料目录是「填写可读的完整目录」。
-    输出目录是「填写最终成品目录」。
+    成品默认放在当前项目的「交付」文件夹。我指定其他输出目录时按本轮指示。
     把识别出的项目、套路、发行时间和封面选项列成一张表，一次和我核对。
     整批视频规格和署名用「填写偏好」，单套例外在表里标出。
     保留源文件，核对替换曲、AB 段、小节功能及原谱页、视频定位和动作时间线。
-    完成质检后执行 submit，给我可上传的批次目录和需要了解的缺项。
+    通过 check-review 后执行 finish，返回本地批次目录、素材限制和实际验收范围。
 
 ## 命令行示例
 
-在工作目录保留 `plan.json` 和 `review.json`。先展示 `coverCandidates` 里的图片。示例里的 `/工作区/已确认.jpg` 可以是独立图片，也可以是计划提取的内嵌封面。没有合适的候选时，先请制作者提供封面。
+在工作目录保留 `plan.json` 和 `review.json`。下列脚本路径相对于 Skill 目录，工作文件也可替换为实际绝对路径。先展示 `coverCandidates` 里的图片。示例中的封面可以是独立图片、计划提取的内嵌封面或已确认的文字封面。
 
     python scripts/ssroutine.py doctor
     python scripts/ssroutine.py attribution
     python scripts/ssroutine.py plan "/资料/TONE 26" --program TONE --routine 26 --release-date 2024Q3 --output plan.json
     python scripts/ssroutine.py confirm-plan plan.json --project-name "综合训练" --routine-name "TONE 第 26 期" --cover "/工作区/已确认.jpg" --credit "我的署名" --remember-credit --output confirmed-plan.json
     python scripts/ssroutine.py analyze confirmed-plan.json --output review.json
-    python scripts/ssroutine.py finish review.json --output-dir "/交付目录"
+    python scripts/ssroutine.py check-review review.json
+    python scripts/ssroutine.py finish review.json --workspace "/当前项目工作目录"
 
-首次确认可以加 `--remember-credit`，把本批选择保存为此设备当前账户的默认署名。可以存一个名字，也可以用 `--no-credit --remember-credit` 存默认不署名。以后确认时直接沿用计划列出的默认值。仅本批改名或不署名时，传 `--credit` 或 `--no-credit` 即可。用 `python scripts/ssroutine.py attribution --reset` 清除本机默认。配置默认位于 `~/.config/ssplayer_package_creator/attribution.json`，支持 `XDG_CONFIG_HOME`。它与批次交付目录分开。
+在创建 MiniMax Code 等项目时已选工作文件夹的，直接用该目录。提前显示完整的交付路径，放进原有的批次确认中。用户本轮明确指定其他交付位置时，用 `--output-dir`。历史批次位置只用于查阅已有成品。
+
+首次选择公开署名时，请制作者填写实际显示的名字。若本轮已经给出确切署名，直接沿用。选择「公开并设为默认」时如姓名留空，先补问姓名，再运行 `confirm-plan --credit "已确认的署名" --remember-credit`。默认不署名用 `--no-credit --remember-credit`。以后只需在批次确认里显示已存选择，制作者可以沿用或修改。仅本批改名或留空时，用 `--credit` 或 `--no-credit`。用 `python scripts/ssroutine.py attribution --reset` 清除本机默认。配置默认位于 `~/.config/ssplayer_package_creator/attribution.json`，支持 `XDG_CONFIG_HOME`。
 
 制作者没有封面时，生成文字预览并展示。确认使用后，把 PNG 交给同一个 `--cover` 选项。图片会进入资源包和九宫格首图。可以从计划读取名称，也可以用下面的参数应用本轮改名。当前字体缺少字符时，用 `--font` 指定支持课程文字的字体，例如 Noto Sans CJK。
 
@@ -75,15 +82,31 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 先核对 `plan.json` 中的资料和归属，再运行 `analyze`。通过音画复测的小节会自动确认同步定位。对需要复核的章节和 PDF 动作，比较原始资料后再批准。能点选的智能体可用「确认开始」「调整选项」「输入要求」。也可以直接回复想用的画质、响度、署名或某一套的例外。见[制作和质检](quality-check.md)。
 
-修改小节、曲目版本、目录槽位或动作提取页后，更新计划并重新分析。独立的原谱打开页可在核对后填写。同名文件内容不一致时使用新修订号。
+修改小节、曲目版本、目录槽位或动作提取页后，更新计划，运行 `analyze --output review-v2.json`。保留之前的复核文件，对新结果重新核实受影响的小节。独立的原谱打开页可在核对后填写。同名成品内容不一致时使用新修订号。
 
 ## 提交一批
 
 用 `finish` 处理一套或多套已核对的方案。进度会显示音乐、视频和质检阶段；完成后可以看到各阶段耗时。已有成品可从本机工作区选出并直接提交。
 
-    python scripts/ssroutine.py submit "/本机工作区/成品/TONE_26_1.ssroutine" "/本机工作区/成品/CORE_63_3.ssroutine" --output-dir "/交付目录"
+先根据 `check-review` 指出的曲目补齐证据。用 `build` 加 `qa_preview.py` 可以生成本机草稿和查看图。正式批次只会接收已核实的包，失败批次没有可签注指纹。制作者明确选择适用于原始资料的有限范围后，可对 `check-review`、`finish` 或 `submit` 传 `--source-limited`。质检仍会核对已提供的素材。
 
-上传生成的整个批次目录。每套成品对应一张同名九宫格 PNG，整批只需要一份指纹文件。发给审校人的内容是网盘链接。若要核对网盘副本，从网盘读回包执行 `verify`，把输出里的完整 SHA-256 与批次指纹比较。审校人签回的 `.ssapproval` 可以和对应的资源包一起分发。
+让智能体直接显示 `finish` 的标准错误进度，或写入日志后按需查看。长视频会报告编码百分比。已完成的资源包使用 `submit` 接续，省去重新编码。生成正式批次时，`finish` 已包含 `submit` 和九宫格质检。
+
+    python scripts/ssroutine.py submit "/本机工作区/成品/TONE_26_1.ssroutine" "/本机工作区/成品/CORE_63_3.ssroutine" --workspace "/当前项目工作目录"
+
+完成后返回本地批次目录。每套成品对应一张同名九宫格 PNG，整批只需一份指纹文件。用户明确指定上传的批次和目的地后，再分享有权分发的文件。若要核对网盘副本，从网盘读回包执行 `verify`，把输出里的完整 SHA-256 与批次指纹比较。原始素材、计划、完整报告和测试文件留在本机。
+
+### 失败恢复与局部修订
+
+| 情况 | 下一步 |
+| --- | --- |
+| `check-review` 未通过 | 根据列出的小节找对应动作、音画或课型证据，补齐后再检查。 |
+| 包已生成，批次验收失败 | 使用工具报告的保留路径，对同一成品运行 `qa_preview.py ... --strict`，打开报告及抽样帧。只有字幕判定变化时，对同一成品用 `submit --screen-subtitles present` 或 `absent`。 |
+| 动作、打开页或章节要改 | 提取旧包清单，校正字段，用 `revise` 提高修订号，复核后重新 `submit`。旧版视频和音频会直接复用。 |
+| 已入包的同一录音需要修正响度 | 使用 `revise --rebalance T15` 选中曲目并提高修订号。其余素材保留原字节，修订后重新核对时钟与响度。 |
+| 换了一首录音、视频或原谱 | 重新匹配对应来源，生成新复核文件后构建。 |
+
+[命令与修订字段](format.md#correcting-an-already-shared-package)
 
 ## 选择视频质量
 
@@ -114,16 +137,16 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 三张手机备课页预览都标记为「离线预览」。
 
 - `04-video-seek.png` 从包内整课视频提取实帧，同时显示小节内时间、整课取帧时间和前中尾对位偏差。复测吻合后才按同一小节时间高亮动作。近似定位和画面定位显示视频章内时间。
-- `03-track-list.png` 标明每首录音已核实的小节功能和实际原谱页。没有证据的功能留空，条件通过说明列出缺项。
+- `03-track-list.png` 标明每首录音已核实的小节功能和实际原谱页。功能缺少证据时，报告列出具体小节和待核对的内容。
 - `06-action-timeline.png` 展示实际动作、拍数、重复次数和高亮行。原谱有 Level 色条时随动作显示。整段重复只在 Block 标题标一次，展开后的动作照常显示。
 - `07-source-pdf.png` 优先打开所展示动作的原谱页，保留实际 PDF 页码。缺少动作时会提示可核对的原谱入口。
 
-严格质检会阻止损坏或无法解码的文件、时长不符、声称贴合音乐却复测失败的定位。单独运行离线预览会保留报告并以状态码 2 结束。跳过未证实的位置，包内可用资料可以继续交付。
+严格质检会阻止损坏文件、时长不符、音画复测失败和可补齐的教学缺项。遇到阻断时，单独运行离线预览会保留报告，并以状态码 2 结束。用报告定位问题后，再决定修订原包还是重新构建。
 
-### 字幕与条件通过
+### 字幕与交付范围
 
 - 首图核对成品有无独立字幕轨或闭路字幕，并抽查 24 帧。工具用已安装的 Tesseract 语言包查画面下方。需要中文识别时可安装简体中文语言包。抽样未检出会标明帧数。字幕可能出现在抽样时刻之外。
 - 引擎不可用或有疑似字幕时，打开独立质检生成的 `subtitle-samples.jpg` 实际查看。只在核对过这份成品的画面后，用 `qa_preview.py --screen-subtitles present` 或 `--screen-subtitles absent` 重绘。如需单套提交，在 `ssroutine.py submit` 复用同一参数。
-- 正常通过的栏目带绿色勾。缺视频、原谱、动作时间线或个别可靠定位时，质检图标明「条件通过」、具体受影响小节和可用资料。创作者已有明确理由时，可在 `plan` 使用 `--video-note`、`--timeline-note`，或在计划的 `qualityNotes` 写下说明。
+- 已核实的栏目带绿色勾。可修复的缺项会暂缓交付。经制作者确认且能从源资料核实的限制会单独显示。可在 `plan` 用 `--video-note`、`--timeline-note` 或 `qualityNotes` 补充背景。
 
-在本机用总览和可视报告核对曲目和对位，有 Pro 时再验证 App 导入和排课。报告 HTML 内嵌总览，可以单独打开。上传时使用 `submit` 整理过的批次目录，确需补充远程排查证据时再通过约定渠道提供。
+在本机用总览和可视报告核对曲目和对位，有 Pro 时再验证 App 导入和排课。报告 HTML 内嵌总览，可以单独打开。对外提供内容时，遵循用户本轮指定的文件和目的地。

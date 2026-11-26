@@ -33,11 +33,11 @@ Music accepts AAC, AIFF, FLAC, M4A, MP3 and WAV. Video accepts MP4, M4V and MOV.
 
 Existing package files can omit display names. File names, catalogue matching and review approval continue to use the canonical identity. An existing local project or routine keeps its name. The saved local attribution preference is outside the package. Only the selected public credit can be included.
 
-The private plan and review files are editing inputs. plan.music items use file for the local source path, optional pdfPages for cue extraction, and optional pdfPage for a separately verified opening page. An empty pdfPages list suppresses cue extraction for that track. Approve cue rows after comparing the complete timed actions with the selected source pages. The generated package contains the portable manifest and selected assets.
+The private plan and review files are local editing inputs. `plan.music` items use `file` for the local source path, optional `pdfPages` for cue extraction, and optional `pdfPage` for a separately verified opening page. An empty `pdfPages` list suppresses ordinary cue extraction. Use it only where the source has no extractable exercise rows. A duration-based exercise table needs the [interval and clock workflow](quality-check.md#分段时长表与曲内时钟). Approve cue rows after comparing the complete actions with the selected source and clock. The generated package contains the portable manifest and selected assets.
 
 ## Batch handoff
 
-After reviewing cover and sources, run `ssroutine.py finish` with one or more reviewed plans. Use `ssroutine.py submit` to verify and group packages that already exist. Both produce the following layout.
+After reviewing cover and sources, run `ssroutine.py finish` with one or more reviewed plans. Use `ssroutine.py submit` to verify and group packages that already exist. Pass `--workspace` for the current project or `--output-dir` for an explicitly selected destination. Both produce the following layout.
 
     SSplayer-20261124-xxxxxxxx/
       套路资源包/
@@ -46,7 +46,7 @@ After reviewing cover and sources, run `ssroutine.py finish` with one or more re
         CORE_63_2.png
       SSplayer-20261124-xxxxxxxx.ssfingerprints.json
 
-The batch fingerprint lists the standard name, program, release, revision, byte size, the complete package SHA-256, the raw internal manifest SHA-256 and the overview image SHA-256. Upload the batch as generated. A later media or metadata change produces a new fingerprint and needs a fresh review. The reviewer can return the free `.ssapproval` file alongside the exact approved packages. Open it in SSplayer before the packages or select it in the same import. Package import requires a verified Pro entitlement.
+The batch fingerprint lists the standard name, program, release, revision, byte size, the complete package SHA-256, the raw internal manifest SHA-256 and the overview image SHA-256. Share the generated batch only as authorized. A later media or metadata change produces a new fingerprint and needs a fresh review. The reviewer can return the free `.ssapproval` file alongside the exact approved packages. Open it in SSplayer before the packages or select it in the same import. Package import requires a verified Pro entitlement.
 
 Publishers can reuse previously signed releases by adding a verified `.ssapproval` and new fingerprint files in the Mac signer. The result covers the union of the exact file digests. Identical package entries are deduplicated. Conflicting bytes for one release and revision require a higher revision after review. The published Skill prepares fingerprints. The local publisher signs with a private Ed25519 key held outside the Skill. The approval contains the fingerprints, a public key identifier and a signature.
 
@@ -54,9 +54,11 @@ Publishers can reuse previously signed releases by adding a verified `.ssapprova
 
     python3 scripts/ssroutine.py manifest CORE_63_1.ssroutine --output review-manifest.json
     python3 scripts/ssroutine.py revise CORE_63_1.ssroutine review-manifest.json --revision 2 --output-dir "/local-work/revised"
-    python3 scripts/ssroutine.py submit "/local-work/revised/CORE_63_2.ssroutine" --output-dir "/chosen-output"
+    python3 scripts/ssroutine.py submit "/local-work/revised/CORE_63_2.ssroutine" --workspace "/current-project"
 
-Between the first two commands, correct the timelines, positions or metadata in `review-manifest.json` against the source. The revision reuses the original audio, video and PDF byte for byte. Use an explicitly approved `--cover /path/to/artwork.jpg` to change just the cover, or `--without-cover` if the creator chooses to omit it. Use `build` from the reviewed local sources when audio, video or PDF bytes change. Existing manual preparation and notes remain with their recording in SSplayer.
+Between the first two commands, correct the timelines, positions or metadata in `review-manifest.json` against the source. An ordinary revision reuses the original audio, video and PDF byte for byte. Use an explicitly approved `--cover /path/to/artwork.jpg` to change the cover, or `--without-cover` if the creator chooses to omit it.
+
+To rebalance the same packaged recording, add `--rebalance T15` to the `revise` command. The other recordings, video and PDF are reused. Retest the affected recording for loudness and chapter alignment before submission. Use `build` with reviewed inputs to replace a recording or to change video or PDF content. Existing manual preparation and notes remain with their recording in SSplayer.
 
 ### Class formats
 

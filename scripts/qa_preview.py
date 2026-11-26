@@ -4,11 +4,14 @@
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 from contextlib import ExitStack
 from datetime import datetime
 import hashlib
 import json
 from pathlib import Path
+import re
+from statistics import median
 import subprocess
 import struct
 import tempfile
@@ -16,13 +19,16 @@ import tempfile
 import pypdfium2
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from delivery_policy import assess_delivery
+from grit_evidence import check_grit_section_function, grit_source_evidence
+from grit_intervals import validate_interval_review
 from media_analysis import (SAMPLE_POSITIONS, alignment_module, extract_cues, map_recordings, measure,
                             probe, timing_windows, video_info)
 from qa_phone import (FONT_PATHS, PhonePreview, clock, score_metadata, section_title, select_preview_tracks,
                       timeline_sample, video_position, wrapped_lines)
 from report_html import write_html
 from ssroutine import (MAGIC, MAX_PACKAGE, check_class_template_sources, consume, container_digest,
-                       read_class_template_document, read_manifest, require, validate_manifest)
+                       grit_interval_proposals, read_class_template_document, read_manifest, require, validate_manifest)
 from subtitle_check import inspect_screen_subtitles, read_frame, subtitle_summary
 
 SIZE = (1200, 810)
@@ -34,8 +40,8 @@ ACCENT = "#75efc0"
 WARNING = "#ffcc93"
 STYLES = {
     "passed": ("通过", ACCENT, "#183833"),
-    "conditional": ("条件通过", WARNING, "#3c2e24"),
-    "failed": ("需修正", "#ffa5a8", "#412730"),
+    "conditional": ("资料受限", WARNING, "#3c2e24"),
+    "failed": ("暂缓交付", "#ffa5a8", "#412730"),
 }
 CHECK_LABELS = {"contents": "包内资料", "audio": "音乐", "video": "视频定位", "subtitles": "字幕",
                 "timeline": "动作时间线", "pdf": "原版波形图", "structure": "小节功能", "formats": "课型识别"}
@@ -50,6 +56,44 @@ def add_condition(report, check, detail):
     report["checks"][check]["conditions"].append(detail)
 
 
+def add_source_limitation(report, check, code, detail):
+    add_condition(report, check, detail)
+    report.setdefault("sourceLimitations", []).append({"check": check, "code": code, "detail": detail})
+
+
+def delivery_display(manifest, report, *keys):
+    selected = {key: report["checks"][key] for key in keys} if keys else report["checks"]
+    outcome = assess_delivery(manifest, {**report, "checks": selected},
+                              source_limited=report.get("sourceLimited", False))
+    state = {"ready": "passed", "readyWithLimitations": "conditional", "blocked": "failed"}[outcome["status"]]
+    if state == "conditional" and all(item["code"] == "supplementary_outro" for item in outcome["limitations"]):
+        state = "passed"
+    return state, outcome
+
+
+def inspect_loudness(report, target):
+    tracks = [row for row in report["tracks"] if row["decoded"] and row["durationMatches"]]
+    if target is not None:
+        reference = target
+        label = "制作目标"
+    else:
+        reference = median(row["lufs"] for row in tracks) if len(tracks) >= 3 else None
+        label = "包内中位响度"
+    if reference is not None:
+        report["loudnessReference"] = {
+            "lufs": reference, "source": "target" if target is not None else "packageMedian",
+        }
+    for row in tracks:
+        title = section_title(row)
+        if reference is not None and abs(delta := round(row["lufs"] - reference, 2)) > 2.0:
+            add_condition(report, "audio",
+                          f"{title} 实测 {row['lufs']:.1f} LUFS，较{label} {reference:.1f} LUFS 偏差 {delta:+.1f} LU。")
+            row["loudnessReview"] = True
+        if row["truePeakDBTP"] > 0:
+            add_condition(report, "audio", f"{title} 实测真峰值 {row['truePeakDBTP']:+.1f} dBTP。")
+            row["loudnessReview"] = True
+
+
 def check_state(report, *keys):
     checks = [report["checks"][key] for key in keys] if keys else report["checks"].values()
     if any(check["issues"] for check in checks):
@@ -61,6 +105,35 @@ def check_state(report, *keys):
 
 def sections_for(tracks):
     return "、".join(dict.fromkeys(section_title(track) for track in tracks))
+
+
+def missing_printed_cue_times(source_rows, packaged_rows):
+    recorded = sorted(cue["time"] for cue in packaged_rows)
+    missed = []
+    for time in sorted({cue["time"] for cue in source_rows}):
+        index = bisect_left(recorded, time - 0.5)
+        if index == len(recorded) or recorded[index] > time + 0.5:
+            missed.append(time)
+    return missed
+
+
+def readable_untimed_score(pdf, tracks):
+    """Corroborate an explicitly limited course against its readable original."""
+    import pdfplumber
+
+    opening_pages = {track["pdfPage"] for track in tracks}
+    if not opening_pages or None in opening_pages:
+        return False
+    clock = re.compile(r"\b\d{1,3}\s*[:：.]\s*[0-5]\d\b"
+                       r"|\b\d+\s*(?:secs?(?:onds?)?|mins?(?:utes?)?)\b"
+                       r"|\d+\s*(?:分钟|秒钟|分\s*\d|秒)"
+                       r"|\bDURATION\b|时长", re.I)
+    with pdfplumber.open(pdf) as document:
+        for page_number, page in enumerate(document.pages, 1):
+            content = (page.extract_text() or "").strip()
+            if (not content and (page_number != 1 or page_number in opening_pages)) or clock.search(content):
+                return False
+    return True
 
 
 def class_slot_label(slot, *, show_edition=False):
@@ -283,12 +356,14 @@ def routine_overview(card, title, manifest, files, report):
     card.draw.rounded_rectangle((466, 271, 845, 392), 17, fill=PANEL)
     card.text(488, 286, "资源包大小", 24, SECONDARY)
     card.text(488, 321, file_size(report["bytes"]), 55, limit=335)
-    state = check_state(report)
+    state, outcome = delivery_display(manifest, report)
     status_label, status_color, status_background = STYLES[state]
     card.draw.rounded_rectangle((861, 271, 1152, 392), 17, fill=status_background)
-    card.text(885, 286, "离线质检", 24, status_color)
+    card.text(885, 286, "交付验收", 24, status_color)
     card.status(state, 327, x=870, marker_only=True)
-    card.text(918, 325, status_label, 39, status_color, limit=223)
+    card.text(918, 325, "可交付" if state == "passed" else status_label, 39, status_color, limit=223)
+    if state == "passed" and outcome["limitations"]:
+        card.text(885, 365, "附加收尾曲见说明", 17, status_color, limit=247)
 
     if picture:
         codec = {"hevc": "H.265", "h264": "H.264"}.get(picture["codec"], picture["codec"].upper())
@@ -489,13 +564,14 @@ def screenshot_cards(manifest, files, report, font_path):
     with_pages = [entry for entry in tracks if entry["pdfPage"]]
     with_cues = sum(entry["cueRows"] for entry in tracks)
     marker = report["sha256"][:12]
-    def decorate(panel, y, *keys, reason_x=48):
-        state = check_state(report, *keys)
+    def decorate(panel, y, *keys, reason_x=48, show_note=True):
+        state, outcome = delivery_display(manifest, report, *keys)
         panel.status(state, y)
-        if state == "conditional":
-            notes = [reason for key in keys for reason in report["checks"][key]["conditions"]]
-            if notes:
-                panel.text(reason_x, 724, notes[0], 21, WARNING, 1152 - reason_x)
+        notes = outcome["blockers"] or outcome["limitations"]
+        if notes and show_note:
+            prefix = f"{len(notes)} 项 · " if len(notes) > 1 else ""
+            color = SECONDARY if state == "passed" else WARNING
+            panel.text(reason_x, 724, prefix + notes[0]["detail"], 21, color, 1152 - reason_x)
 
     def card(number, title):
         return Card(title, f"{number:02d} / 09     {art}     SHA-256 {marker}", font_path)
@@ -556,9 +632,10 @@ def screenshot_cards(manifest, files, report, font_path):
     timing_rows = []
     for row in tracks if picture else ():
         values = " / ".join(f"{window['offsetMS']:+.1f}" for window in row["windows"])
-        timing_rows.append((section_title(row), values + " ms" if values else TIMING_STATES[row["status"]]))
+        result = "收尾曲 · 仅音乐" if row.get("supplementary") and not row["chapter"] else TIMING_STATES[row["status"]]
+        timing_rows.append((section_title(row), values + " ms" if values else result))
     timing.rows(timing_rows or [("时钟复测", "本包未提供可复测的视频。")])
-    decorate(timing, 85, "video")
+    decorate(timing, 85, "video", show_note=bool(delivery_display(manifest, report, "video")[1]["blockers"]))
     yield "05-timing.png", timing.image
 
     cues = preview_card(6, "动作时间线")
@@ -571,9 +648,15 @@ def screenshot_cards(manifest, files, report, font_path):
     decorate(pdf, 33, "pdf", reason_x=511)
     yield "07-source-pdf.png", pdf.image
 
-    volume = card(8, "声音解码与峰值")
-    volume.rows([(row["section"], f"{row['lufs']:.2f} LUFS    {row['truePeakDBTP']:.2f} dBTP"
-                  if row["decoded"] else "解码或测量需复核") for row in tracks])
+    volume = card(8, "音乐响度与峰值")
+    level_rows = []
+    for row in tracks:
+        detail = (f"{row['lufs']:.1f} LUFS    {row['truePeakDBTP']:.1f} dBTP"
+                  if row["decoded"] else "解码或测量需复核")
+        if row.get("loudnessReview"):
+            detail += " · 待听"
+        level_rows.append((section_title(row), detail))
+    volume.rows(level_rows)
     decorate(volume, 85, "audio")
     yield "08-loudness.png", volume.image
 
@@ -583,7 +666,7 @@ def screenshot_cards(manifest, files, report, font_path):
     yield "01-identity.png", overview.image
 
     gaps = card(9, "课型识别")
-    format_state = check_state(report, "formats")
+    format_state, _ = delivery_display(manifest, report, "formats")
     if templates or format_state != "passed":
         gaps.status(format_state, 85)
     if templates:
@@ -598,7 +681,7 @@ def screenshot_cards(manifest, files, report, font_path):
             prefix = f"{template['name']} ·"
             notes = [note for note in checks["conditions"] if note.startswith(prefix)]
             failed = any(note.startswith(prefix) for note in checks["issues"])
-            state = "failed" if failed else "conditional" if notes else "passed"
+            state = "failed" if failed or notes else "passed"
             gaps.text(x + 12, y + 5, f"{template['name']} · 原谱第 {template['page']} 页", 23, ACCENT, width - 82)
             gaps.status(state, y + 6, x=x + width - 64, marker_only=True)
             order = " → ".join(class_slot_label(slot, show_edition=True) for slot in template["slots"])
@@ -624,6 +707,9 @@ def screenshot_cards(manifest, files, report, font_path):
 
 
 def generate(args, *, sealed_copy=None, overview_only=False):
+    target_lufs = getattr(args, "target_lufs", None)
+    require(target_lufs is None or -24 <= target_lufs <= -12,
+            "Select a loudness reference between -24 and -12 LUFS")
     root = args.output_dir
     root.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="ssroutine-qa-") as staging, \
@@ -644,23 +730,40 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                   "madeAtLabel": "制作时间" if args.made_at else "质检时间",
                   "bytes": package_bytes, "sha256": full_sha, "manifestSHA256": manifest_sha,
                   "sectionGaps": sorted(set(range(1, max(sections) + 1)) - sections),
-                  "appImportVerified": False, "tracks": inspect_tracks(manifest, audio, optional),
+                  "appImportVerified": False, "sourceLimited": bool(getattr(args, "source_limited", False)),
+                  "tracks": inspect_tracks(manifest, audio, optional),
                   "blockingIssues": [], "checks": {
                       key: {"issues": [], "conditions": []} for key in CHECK_LABELS
                   }}
         output = Path(report_staging) / "evidence"
         output.mkdir()
         tracks = report["tracks"]
-        missing_chapters = [track for track in tracks if not track["chapter"]]
+        grit, untimed = None, False
+        if "pdf" in optional:
+            try:
+                if manifest["program"] == "GRIT":
+                    grit = grit_source_evidence(optional["pdf"], manifest["music"], manifest["routine"])
+                if report["sourceLimited"] and any(not track["cueRows"] for track in tracks):
+                    untimed = readable_untimed_score(optional["pdf"], tracks)
+            except (ValueError, OSError):
+                add_issue(report, "pdf", "无法读取原谱，不能核实小节资料的覆盖范围。")
+        supplemental = {section for section, record in grit["tracks"].items() if record["supplement"]} if grit else set()
+        def is_supplement(track):
+            return track["variant"] == "standard" and track["section"] in supplemental
+
+        missing_chapters = [track for track in tracks if not track["chapter"] and not is_supplement(track)]
         uncertain_chapters = [track for track in tracks if track["status"] in {"approximate", "visuallyConfirmed"}]
-        missing_cues = [track for track in tracks if not track["cueRows"]]
+        missing_cues = [track for track in tracks if not track["cueRows"] and not is_supplement(track)]
         missing_functions = [track for track in tracks if not track["sectionFunction"]]
         if missing_functions:
             detail = ("本包未提供可核实的小节功能。" if len(missing_functions) == len(tracks)
                       else f"{sections_for(missing_functions)} 未提供可核实的小节功能。")
-            add_condition(report, "structure", detail)
+            if "pdf" in optional:
+                add_condition(report, "structure", detail)
+            else:
+                add_source_limitation(report, "structure", "no_source_functions", detail)
         if "video" not in optional:
-            add_condition(report, "video", "本包未附视频。音乐可以播放和排课。")
+            add_source_limitation(report, "video", "no_source_video", "本包未附视频。音乐可以播放和排课。")
         elif missing_chapters:
             add_condition(report, "video", f"{sections_for(missing_chapters)} 无可靠小节定位。可按整段视频观看。")
         if uncertain_chapters:
@@ -668,9 +771,25 @@ def generate(args, *, sealed_copy=None, overview_only=False):
         if missing_cues:
             text = ("本包未附动作时间线。" if len(missing_cues) == len(tracks)
                     else f"{sections_for(missing_cues)} 未提供可用动作时间线。")
-            add_condition(report, "timeline", text + ("可直接查看原谱。" if "pdf" in optional else "音乐仍可播放和排课。"))
+            if untimed:
+                add_source_limitation(report, "timeline", "no_timed_score",
+                                      text + "可读原谱中没有分段时间。")
+            elif "pdf" in optional:
+                add_condition(report, "timeline", text + "请核对原谱中的时间表或分段时长。")
+            else:
+                add_source_limitation(report, "timeline", "no_timed_source", text + "音乐仍可播放和排课。")
+        for track in tracks:
+            if is_supplement(track):
+                track["supplementary"] = True
+                label = section_title(track)
+                if "video" in optional and not track["chapter"]:
+                    add_source_limitation(report, "video", "supplementary_outro",
+                                          f"{label} 为原谱列出的收尾曲，保留音乐及原谱入口。")
+                if not track["cueRows"]:
+                    add_source_limitation(report, "timeline", "supplementary_outro",
+                                          f"{label} 为原谱列出的收尾曲，无教学动作表。")
         if "pdf" not in optional:
-            add_condition(report, "pdf", "本包未附原版波形图或教学讲义。")
+            add_source_limitation(report, "pdf", "no_source_pdf", "本包未附原版波形图或教学讲义。")
         elif missing_pages := [track for track in tracks if not track["pdfPage"]]:
             add_condition(report, "pdf", f"{sections_for(missing_pages)} 无指定页入口。可浏览完整原谱。")
         for song in tracks:
@@ -681,6 +800,7 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                 add_issue(report, "audio", f"{slot} 实际音乐时长与清单不符。")
             if song["status"] == "review":
                 add_issue(report, "video", f"{slot} 声明为按音乐定位，但包内三段复测未通过。")
+        inspect_loudness(report, target_lufs)
         if "video" in optional:
             try:
                 picture = video_info(optional["video"])
@@ -704,13 +824,15 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                     require(len(document) == manifest["pdf"]["pageCount"], "Original PDF page count does not match")
                     report["pdfPageCount"] = len(document)
                 _, proposals, _ = extract_cues(optional["pdf"], manifest["music"])
+                intervals = grit_interval_proposals(optional["pdf"], manifest["music"], grit)
                 templates = []
                 if source_file := optional.get("classTemplatesFile"):
                     with source_file.open("rb") as stream:
                         templates = read_class_template_document(stream, manifest["pdf"])
                     report["classTemplates"] = templates
                 try:
-                    for note in check_class_template_sources(optional["pdf"], templates, include_omissions=True):
+                    for note in check_class_template_sources(optional["pdf"], templates, include_omissions=True,
+                                                             source_evidence=grit):
                         add_condition(report, "formats", note)
                 except ValueError as error:
                     add_issue(report, "formats", str(error))
@@ -718,7 +840,11 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                     for note in class_recording_conditions(template, manifest["music"]):
                         add_condition(report, "formats", note)
                 for song, source, track in zip(manifest["music"], proposals, tracks):
-                    if checked := source.get("sectionFunctionCheck"):
+                    grit_record = grit["tracks"].get(song["section"]) if grit and song["variant"] == "standard" else None
+                    if grit_record and track["pdfPage"] is not None and track["pdfPage"] not in grit_record["openingPages"]:
+                        add_issue(report, "pdf", f"{song['section']} 的原谱入口与对应课型和录音不符。")
+                    verified_role = check_grit_section_function(song, grit) if grit_record else None
+                    if checked := verified_role or source.get("sectionFunctionCheck"):
                         status, message = checked
                         track["sectionFunctionCheck"] = status
                         if status == "contradiction":
@@ -726,8 +852,20 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                         if status == "manual":
                             add_condition(report, "structure", message)
                     has_printed_timeline = source["rows"] and source["status"] != "unresolved"
-                    if has_printed_timeline and not song.get("cues"):
+                    if interval := intervals.get(song["section"]):
+                        state, detail = validate_interval_review(interval, song.get("cues") or [])
+                        if state == "contradiction":
+                            add_issue(report, "timeline", f"{song['section']} · {detail}")
+                        elif state != "matched":
+                            add_condition(report, "timeline", f"{song['section']} · {detail}")
+                    elif has_printed_timeline and not song.get("cues"):
                         add_condition(report, "timeline", f"{song['section']} 原谱有可读时间表，包内未提供对应的动作时间线。")
+                    elif has_printed_timeline:
+                        missing = missing_printed_cue_times(source["rows"], song["cues"])
+                        if missing:
+                            at = "、".join(clock(time) for time in missing[:4])
+                            add_condition(report, "timeline",
+                                          f"{song['section']} 缺 {len(missing)} 个原谱动作起点（{at}）。核对时间和动作后补齐。")
             except (ValueError, OSError, pypdfium2.PdfiumError):
                 add_issue(report, "pdf", "原谱无法打开，或实际页数与清单不符。")
         for key, reason in manifest.get("qualityNotes", {}).items():
@@ -744,6 +882,7 @@ def generate(args, *, sealed_copy=None, overview_only=False):
         contact.save(output / "3x3-overview.png")
         report["qaStatus"] = check_state(report)
         report["offlineMediaPassed"] = report["qaStatus"] != "failed"
+        report["delivery"] = assess_delivery(manifest, report, source_limited=report["sourceLimited"])
         if not overview_only:
             write_html(output, manifest, report)
         (output / "qa.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -751,8 +890,10 @@ def generate(args, *, sealed_copy=None, overview_only=False):
     print(json.dumps({"output": str(destination.resolve()), "screenshots": 9, "sha256": full_sha,
                       "measuredChapters": sum(row["status"] == "measured" for row in report["tracks"]),
                       "offlineMediaPassed": report["offlineMediaPassed"], "status": report["qaStatus"],
+                      "deliveryStatus": report["delivery"]["status"],
                       "blockingIssues": len(report["blockingIssues"])}))
-    return report["offlineMediaPassed"]
+    return report["offlineMediaPassed"] and (not getattr(args, "strict", False)
+                                             or report["delivery"]["status"] != "blocked")
 
 
 def main():
@@ -762,14 +903,18 @@ def main():
     parser.add_argument("--credit", help="Display credit for this evidence set")
     parser.add_argument("--made-at", help="Verified creation time in ISO 8601; omit to use evidence generation time")
     parser.add_argument("--font", type=Path, help="Optional font with Chinese glyphs")
+    parser.add_argument("--target-lufs", type=float, metavar="LUFS",
+                        help="The producer's chosen loudness target; omit to compare tracks within the package")
+    parser.add_argument("--source-limited", action="store_true",
+                        help="Assess a creator-confirmed scope with genuinely absent original materials")
     parser.add_argument("--screen-subtitles", choices=("present", "absent"), metavar="RESULT",
                         help="Visual judgment after reviewing samples from this exact package")
-    parser.add_argument("--strict", action="store_true", help="Write full evidence but exit 2 for confirmed media issues")
+    parser.add_argument("--strict", action="store_true", help="Write full evidence and exit 2 if delivery is blocked")
     args = parser.parse_args()
     try:
         passed = generate(args)
         if args.strict and not passed:
-            parser.exit(2, "Package media needs correction. See report.html.\n")
+            parser.exit(2, "Package delivery is blocked. See report.html.\n")
     except (ValueError, OSError, TypeError, KeyError) as error:
         parser.exit(1, f"{error}\n")
 

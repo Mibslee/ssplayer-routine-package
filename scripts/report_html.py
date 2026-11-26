@@ -5,6 +5,7 @@ from html import escape
 from io import BytesIO
 from PIL import Image
 
+from delivery_policy import CHECK_NAMES
 from subtitle_check import subtitle_summary
 
 CSS = """
@@ -26,6 +27,8 @@ summary{cursor:pointer;padding:12px 14px;font-weight:600}.body{padding:0 14px 14
 dl{display:grid;grid-template-columns:max-content 1fr;column-gap:16px;row-gap:3px;margin:4px 0}
 dt{color:var(--muted)}dd{margin:0;overflow-wrap:anywhere}.cues{padding-left:22px}
 .note{padding:12px 14px;border-radius:8px;background:#fff6e8;color:#773600;margin-bottom:9px}
+.note.blocked{background:#fff0f0;color:#91232b}.delivery{margin-top:12px;font-weight:700}
+.delivery.blocked{color:#91232b}.delivery.ready{color:var(--primary)}.delivery.limited{color:var(--warn)}
 footer{color:var(--muted);font-size:13px;overflow-wrap:anywhere}
 @media(max-width:550px){header,.panel{padding:16px}.track{grid-template-columns:1fr auto}
 .track span:nth-child(2){grid-row:2;grid-column:1/-1}.track span:last-child{grid-column:2;grid-row:1}}
@@ -60,11 +63,11 @@ def track_panel(track, song, has_video):
             ("原谱入口", f"第 {track['pdfPage']} 个物理页" if track["pdfPage"] else "无指定页"),
             ("动作提示", f"{track['cueRows']} 条")]
     if function := track.get("sectionFunction"):
-        status = track.get("sectionFunctionCheck")
+        function_status = track.get("sectionFunctionCheck")
         evidence = f"{function['name']} · 原谱第 {function['page']} 页"
-        if status in {"manual", "contradiction"}:
+        if function_status in {"manual", "contradiction"}:
             needs_review = True
-            evidence += " · 待人工复核" if status == "manual" else " · 与原谱矛盾"
+            evidence += " · 待人工复核" if function_status == "manual" else " · 与原谱矛盾"
         rows.append(("小节功能", evidence))
     if chapter := track["chapter"]:
         rows.append(("视频位置", f"{clock(chapter['start'])}–{clock(chapter['end'])}"))
@@ -93,16 +96,43 @@ def track_panel(track, song, has_video):
                           f'<div class="body"><dl>{content}</dl>{actions}</div></details>')
 
 
+def delivery_notes(items, heading, *, blocked=False):
+    if not items:
+        return ""
+    style = "note blocked" if blocked else "note"
+    notes = "".join(
+        f'<p class="{style}"><strong>{show(CHECK_NAMES.get(row["check"], row["check"]))}</strong>'
+        f' · {show(row["detail"])}</p>'
+        for row in items
+    )
+    return f'<section class="panel"><h2>{heading}</h2>{notes}</section>'
+
+
 def write_html(folder, manifest, report):
     tracks = report["tracks"]
     panels = [track_panel(track, song, bool(manifest.get("video"))) for track, song in zip(tracks, manifest["music"])]
-    alerts = "".join(f'<p class="note">{show(issue)}</p>' for issue in report["blockingIssues"])
-    alerts += "".join(f'<p class="note">条件通过 · {show(reason)}</p>'
-                      for check in report["checks"].values() for reason in check["conditions"])
-    alerts += "".join(f'<p class="note">编号间隔 T{number} · 请对照原谱确认。</p>' for number in report["sectionGaps"])
-    alerts += "".join(panel for problem, panel in panels if problem)
-    alerts = alerts or '<p class="muted">当前测量没有触发复核项。</p>'
+    delivery_sections = ""
+    review = "".join(panel for problem, panel in panels if problem)
+    if delivery := report.get("delivery"):
+        status, label = {"ready": ("ready", "可提交"),
+                         "readyWithLimitations": ("limited", "可提交 · 已核实原始资料限制"),
+                         "blocked": ("blocked", "待修订 · 暂不可提交")}[delivery["status"]]
+        verification = f'<p class="delivery {status}">{label}</p>'
+        delivery_sections += delivery_notes(delivery["blockers"], "交付前需要修正", blocked=True)
+        delivery_sections += delivery_notes(delivery["limitations"], "原始资料限制")
+    else:
+        verification = '<p class="delivery">离线质检 · 投稿资格待核验</p>'
+        review = ("".join(f'<p class="note blocked">{show(issue)}</p>' for issue in report["blockingIssues"])
+                  + "".join(f'<p class="note">{show(reason)}</p>'
+                            for check in report["checks"].values() for reason in check["conditions"])
+                  + review)
+    if review:
+        review = f'<section class="panel"><h2>需要复核的曲目和发现</h2>{review}</section>'
     normal = "".join(panel for problem, panel in panels if not problem)
+    gaps = ""
+    if report["sectionGaps"]:
+        numbers = "、".join(f"T{number}" for number in report["sectionGaps"])
+        gaps = f'<p class="muted">包内未使用的小节编号 · {show(numbers)}</p>'
     compact = BytesIO()
     with Image.open(folder / "3x3-overview.png") as source:
         source.convert("RGB").save(compact, format="JPEG", quality=85, optimize=True)
@@ -128,18 +158,17 @@ def write_html(folder, manifest, report):
     meta = " · ".join([report["credit"] or "未署名", f"版本 {report['revision']}",
                        report["releaseDate"] or "发行时间待核对",
                        f"{report['madeAtLabel']} {report['madeAt'][:19].replace('T', ' ')}"])
-    verification = {"passed": "离线媒体核验通过", "conditional": "离线媒体条件通过",
-                    "failed": "发现需修正的问题"}[report["qaStatus"]]
     html = f"""<!doctype html>
 <html lang="zh-Hans"><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{show(identity)} · SSplayer 资源包质检</title><style>{CSS}</style>
 <main>
 <header><div class="kicker">SSplayer · 离线资源包质检</div><h1>{show(identity)}</h1>
-<p>{show(meta)}</p><div class="stats">{stats}</div><p style="margin-top:12px">{verification}</p></header>
+<p>{show(meta)}</p><div class="stats">{stats}</div>{verification}</header>
+{delivery_sections}
 <section class="panel"><h2>九宫格总览</h2><img alt="九宫格质检图" src="data:image/jpeg;base64,{image}"></section>
 {subtitle_panel}
-<section class="panel"><h2>先核对这些项目</h2>{alerts}</section>
-<section class="panel"><h2>其他曲目</h2>{normal or '<p class="muted">曲目都已列在复核区。</p>'}</section>
+{review}
+<section class="panel"><h2>其他曲目</h2>{normal or '<p class="muted">曲目都已列在复核区。</p>'}{gaps}</section>
 <footer><p>本页使用包内文件进行离线检查。App 导入、播放和排课结果由实际安装验收确认。</p>
 <p>完整文件 SHA-256 {show(report['sha256'])}</p></footer>
 </main></html>

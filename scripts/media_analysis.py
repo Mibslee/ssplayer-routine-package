@@ -124,6 +124,7 @@ def balance_audio(source, destination, target, video=False):
     gain = min(target - integrated, -2.0 - peak, 12.0)
     if abs(gain) <= 0.5 and peak <= -1.5:
         return source, {"inputLUFS": integrated, "outputLUFS": integrated, "truePeakDBTP": peak, "gainDB": 0}
+    retry_mapping = None
     if video:
         duration, media = probe(source, "video")
         audio = [s for s in media["streams"] if s["codec_type"] == "audio"]
@@ -135,22 +136,44 @@ def balance_audio(source, destination, target, video=False):
         duration, media = probe(source, "audio")
         source_codec = next(s["codec_name"] for s in media["streams"] if s["codec_type"] == "audio")
         lossless = source_codec in {"alac", "flac", "wavpack"} or source_codec.startswith("pcm_")
-        audio_encoder = ["-c:a", "alac"] if lossless else ["-c:a", "aac", "-b:a", "256k"]
-        args = ["-map", "0:a:0", "-map_metadata", "0", *audio_encoder]
+        mapping = ["-map", "0:a:0", "-map_metadata", "0"]
+        if lossless:
+            args = [*mapping, "-c:a", "alac"]
+        else:
+            args = [*mapping, "-c:a", "aac", "-b:a", "256k"]
+            retry_mapping = mapping
         volume_option = "-af"
 
-    def encode(gain_db):
-        run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-i", str(source), *args,
+    def encode(gain_db, options):
+        run("ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-i", str(source), *options,
             volume_option, f"volume={gain_db:.6f}dB", str(destination))
         return measure(destination)
 
-    final_lufs, final_peak = encode(gain)
+    final_lufs, final_peak = encode(gain, args)
+    reduction = final_peak + 2.2
+    if final_peak > -1.4 and retry_mapping and reduction > 2.0:
+        # A different AAC encoder or bitrate can avoid the reconstructed peak at the same gain.
+        alternatives = [("aac", "192k")]
+        if sys.platform == "darwin":
+            encoders = run("ffmpeg", "-hide_banner", "-encoders").decode(errors="replace")
+            if "aac_at" in encoders:
+                alternatives.insert(0, ("aac_at", "256k"))
+        for encoder, bitrate in alternatives:
+            destination.unlink(missing_ok=True)
+            try:
+                alternative_lufs, alternative_peak = encode(
+                    gain, [*retry_mapping, "-c:a", encoder, "-b:a", bitrate])
+                alternative_duration, _ = probe(destination, "audio")
+            except ValueError:
+                continue
+            if (alternative_peak <= -1.4 and abs(alternative_lufs - integrated - gain) <= 1.0
+                    and abs(alternative_duration - duration) <= 0.20):
+                final_lufs, final_peak = alternative_lufs, alternative_peak
+                break
     if final_peak > -1.4:
-        # Some transients reconstruct far above the input peak after AAC.
-        # Use the measured result for one retry from the original recording.
-        gain -= final_peak + 2.2
-        destination.unlink()
-        final_lufs, final_peak = encode(gain)
+        gain -= reduction
+        destination.unlink(missing_ok=True)
+        final_lufs, final_peak = encode(gain, args)
     final_duration, final = probe(destination, "video" if video else "audio")
     if abs(final_duration - duration) > 0.20:
         raise ValueError(f"Audio balancing changed the duration of {source.name}")
@@ -620,6 +643,91 @@ def normalized_function_title(name):
     return " ".join(value.split())
 
 
+LOCAL_NUMBERED_HEADING = re.compile(
+    r"^(?:(?P<book>[A-Z][A-Z .&'’()\-]{1,45}\s+\d{1,4})\s*-\s*)?"
+    r"(?P<number>\d{1,3})(?P<segment>[A-Z]?)(?:\s+|\s*[.、):]\s*|$)(?P<title>.*)$", re.I)
+LOCAL_VARIANT = re.compile(r"(?:\s*\((备选|替换|加曲)(?:曲|版)?\)|\s+(备选曲|替换曲|加曲))$", re.I)
+LOCAL_COACHING_TABLE = re.compile(r"\bTIME\s+(?:CNTS?\s+)?EXER?CISE\b", re.I)
+
+
+def localized_heading(text, following_title=""):
+    if re.match(r"^\d{1,3}\s*[:.]\s*[0-5]\d(?:\s|$)", text):
+        return None
+    match = LOCAL_NUMBERED_HEADING.fullmatch(text)
+    if not match or not 1 <= int(match["number"]) <= 128:
+        return None
+    title = match["title"].strip() or following_title.strip()
+    if (not re.search(r"[\u3400-\u9fff]", title) or len(title) > 40
+            or re.search(r"\d{1,2}\s*:\s*\d{2}", title)):
+        return None
+    variant, evidence = "standard", "default"
+    if marker := LOCAL_VARIANT.search(title):
+        variant = "bonus" if (marker[1] or marker[2]) == "加曲" else "alternative"
+        evidence = "explicit"
+        title = title[:marker.start()].strip()
+    if title:
+        return SectionHeading(int(match["number"]), match["segment"].upper(), variant, evidence, title)
+    return None
+
+
+def localized_section_headings(words, width):
+    """Associate numbered roles with a localized action table on the same page."""
+    lines = [(row[0]["x0"], row[0]["top"], unicodedata.normalize("NFKC", " ".join(w["text"] for w in row)))
+             for row in row_lines(words)]
+    headings = []
+    first = 0
+    for index, (_, top, text) in enumerate(lines):
+        localized = len(text) <= 36 and re.search(r"(?:时间|时点|计时)", text) and re.search(r"(?:动作|练习)", text)
+        if not (localized or LOCAL_COACHING_TABLE.search(text)):
+            continue
+        candidates = []
+        for cursor in range(first, index):
+            left, heading_top, heading = lines[cursor]
+            if left >= width * 0.28 or not 0 < top - heading_top <= width * 0.44:
+                continue
+            following_title = ""
+            if cursor + 1 < index:
+                following_left, following_top, following = lines[cursor + 1]
+                if left < following_left and 0 < following_top - heading_top <= 18:
+                    following_title = following
+            if candidate := localized_heading(heading, following_title):
+                candidates.append(candidate)
+        if len(candidates) == 1:
+            headings.append(candidates[0])
+        first = index + 1
+    if not headings and lines and (cover := LOCAL_NUMBERED_HEADING.fullmatch(lines[0][2])) and cover["book"]:
+        # A free-form lesson may repeat its heading in the body instead of
+        # using a grid. Corroborate the exact role with the duration and at
+        # least two exercise intervals before treating it as a role source.
+        declared = localized_heading(lines[0][2])
+        repeated = declared and any(localized_heading(text) == declared for _, _, text in lines[1:7])
+        duration = any(re.match(r"^(?:训练时间|练习时间|训练时长|练习时长)\s*:", text) for _, _, text in lines[1:7])
+        intervals = sum(bool(re.match(r"^\d{1,2}[.、]\s+.+?\s+\d+(?:['′’][sS]?|秒)", text))
+                        for _, _, text in lines[1:])
+        if repeated and duration and intervals >= 2:
+            headings.append(declared)
+    return headings
+
+
+def choreography_headings(words, width, alignment, parsed):
+    if heading := section_heading(words, width, alignment, parsed):
+        return [heading]
+    return localized_section_headings(words, width)
+
+
+def heading_for_song(song, headings):
+    recording = recording_identity(song)
+    exact = [heading for heading in headings if heading.recording == recording]
+    if len(exact) == 1:
+        return exact[0]
+    same_number = [heading for heading in headings if heading.number == recording[0]]
+    if len(same_number) == 1:
+        return same_number[0]
+    if len(headings) == 1:
+        return headings[0]
+    return None
+
+
 def section_heading(words, width, alignment, parsed):
     """Read the numbered function title on a choreography table page."""
     if parsed is None and not alignment._has_cue_table_header(width, words):
@@ -696,8 +804,48 @@ def check_section_function(song, heading, conflicting=False):
     return "matched", None
 
 
+def named_grit_formats(text, page):
+    """Read course-qualified references without assuming the package's track numbering."""
+    header = re.compile(r"^GRIT\s+(ATHLETIC|CARDIO|STRENGTH)\s+FORMAT$", re.I)
+    row = re.compile(
+        r"^(\d{1,3})\s+GRIT\s+(ATHLETIC|CARDIO|STRENGTH)\s+(\d{1,4})"
+        r"\s*\(\s*TRACK\s+(\d{1,3})([A-Z]?)\s*\)\s+(.+)$", re.I)
+    total = re.compile(r"^Total\s+time\s*:\s*(\d{1,3}):([0-5]\d)$", re.I)
+    suggestions, kind, references = [], None, []
+    for raw in text.splitlines():
+        line = " ".join(unicodedata.normalize("NFKC", raw).split())
+        if match := header.fullmatch(line):
+            kind, references = match[1].lower(), []
+        elif kind and (match := row.fullmatch(line)):
+            position, course, release, number, suffix, name = match.groups()
+            if int(position) != len(references) + 1 or len(references) >= 64 or not 1 <= int(number) <= 128:
+                kind = None
+                continue
+            references.append({"position": int(position), "sourceCourse": f"GRIT {course.upper()}",
+                               "sourceRelease": str(int(release)), "sourceTrack": f"T{int(number)}{suffix.upper()}",
+                               "name": name})
+        elif kind and (match := total.fullmatch(line)):
+            seconds = int(match[1]) * 60 + int(match[2])
+            minutes = (seconds + 30) // 60
+            if len(references) >= 2 and 5 <= minutes <= 180:
+                suggestions.append({
+                    "key": f"grit-{kind}", "name": f"GRIT {kind.title()}", "minutes": minutes,
+                    "page": page, "sourcePages": [page], "slots": [],
+                    "sourceTotalSeconds": seconds, "sourceTrackReferences": references,
+                    "sourceReview": ["原谱按课型分别编号。请先按课型、期号和原谱曲号核对包内曲目，再填写排课小节。"],
+                    "approved": False,
+                })
+            kind = None
+        elif kind and references and line:
+            if line[0].isdigit() or "(" in line or ")" in line:
+                kind = None
+            elif len(references[-1]["name"]) + len(line) < 160:
+                references[-1]["name"] += " " + line
+    return suggestions
+
+
 def class_format_suggestions(path, pages=None):
-    """Read explicit duration tables. An agent still verifies order and omissions."""
+    """Read printed class tables. An agent still verifies order and omissions."""
     if path is None:
         return []
     import pdfplumber
@@ -816,7 +964,7 @@ def class_format_suggestions(path, pages=None):
                     slot["_bonus"] = line
         return [table for table in tables if table["slots"] or table.get("sourceReview")]
 
-    guesses = []
+    guesses, named = [], []
     with pdfplumber.open(path) as source:
         numbers = range(1, len(source.pages) + 1) if pages is None else sorted(set(pages))
         for number in numbers:
@@ -825,7 +973,7 @@ def class_format_suggestions(path, pages=None):
             page = source.pages[number - 1]
             text = page.extract_text() or ""
             normalized = unicodedata.normalize("NFKC", text)
-            has_english = "format" in text.lower()
+            has_english = "format" in normalized.lower()
             has_chinese = "分钟" in normalized
             if not (has_english or has_chinese or "课程结构" in normalized):
                 continue
@@ -839,6 +987,15 @@ def class_format_suggestions(path, pages=None):
             if has_english:
                 columns = find_tables(left, number) + find_tables(right, number)
                 guesses.extend(columns or find_tables(text, number))
+                named_columns = named_grit_formats(left, number) + named_grit_formats(right, number)
+                for template in named_columns or named_grit_formats(text, number):
+                    duplicate = next((item for item in named if item["key"] == template["key"]
+                                      and item["sourceTotalSeconds"] == template["sourceTotalSeconds"]
+                                      and item["sourceTrackReferences"] == template["sourceTrackReferences"]), None)
+                    if duplicate is None:
+                        named.append(template)
+                    elif number not in duplicate["sourcePages"]:
+                        duplicate["sourcePages"].append(number)
             if has_chinese:
                 columns = find_chinese_table(left, number) + find_chinese_table(right, number)
                 guesses.extend(columns or find_chinese_table(text, number))
@@ -867,7 +1024,7 @@ def class_format_suggestions(path, pages=None):
         if option:
             suffix = f"方案 {option}"
         template.update(key=f"{minutes}-{counts[minutes]}", name=f"{label} {suffix}".strip(), approved=False)
-    return guesses
+    return sorted([*guesses, *named], key=lambda item: item["page"])
 
 
 def inspect_section_functions(path, songs):
@@ -882,8 +1039,9 @@ def inspect_section_functions(path, songs):
             if index > len(pdf.pages):
                 raise ValueError(f"The actual PDF does not contain section function page {index}.")
             page = pdf.pages[index - 1]
-            headings[index] = section_heading(page.extract_words(), page.width, alignment, None)
-        return [check_section_function(song, headings[song["sectionFunction"]["page"]]) for song in claimed]
+            headings[index] = choreography_headings(page.extract_words(), page.width, alignment, None)
+        return [check_section_function(song, heading_for_song(song, headings[song["sectionFunction"]["page"]]))
+                for song in claimed]
 
 
 def extract_cues(path, songs, ocr=False):
@@ -901,12 +1059,13 @@ def extract_cues(path, songs, ocr=False):
             parsed = alignment.parse_cue_page_words(index, page.width, positioned)
             if parsed:
                 found.append(parsed)
-            if heading := section_heading(positioned, page.width, alignment, parsed):
-                headings[index] = heading
+            if page_headings := choreography_headings(positioned, page.width, alignment, parsed):
+                headings[index] = page_headings
         timelines, warnings = alignment._build_pdf_timelines(found)
         titles_by_recording = {}
-        for heading in headings.values():
-            titles_by_recording.setdefault(heading.recording, set()).add(normalized_function_title(heading.title))
+        for page_headings in headings.values():
+            for heading in page_headings:
+                titles_by_recording.setdefault(heading.recording, set()).add(normalized_function_title(heading.title))
         result = []
         for song in songs:
             recording = recording_identity(song)
@@ -930,12 +1089,13 @@ def extract_cues(path, songs, ocr=False):
             selected = set(song.get("pdfPages") or ())
             if song.get("pdfPage"):
                 selected.add(song["pdfPage"])
-            proposed = [(page, heading.title) for page, heading in headings.items()
+            proposed = [(page, heading.title) for page, page_headings in headings.items() for heading in page_headings
                         if heading.recording == recording and (not selected or page in selected)]
             if proposed and len({normalized_function_title(title) for _, title in proposed}) == 1:
                 page, title = proposed[0]
                 result[-1]["sectionFunction"] = {"name": title, "page": page, "approved": False}
             if function := song.get("sectionFunction"):
                 conflicting = len(titles_by_recording.get(recording, ())) > 1
-                result[-1]["sectionFunctionCheck"] = check_section_function(song, headings.get(function["page"]), conflicting)
+                heading = heading_for_song(song, headings.get(function["page"], ()))
+                result[-1]["sectionFunctionCheck"] = check_section_function(song, heading, conflicting)
         return len(pdf.pages), result, warnings

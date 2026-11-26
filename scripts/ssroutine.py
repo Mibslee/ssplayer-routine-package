@@ -20,6 +20,8 @@ from io import BytesIO
 from pathlib import Path
 from time import perf_counter
 
+from grit_evidence import check_grit_section_function, grit_source_evidence
+from grit_intervals import parse_grit_intervals, validate_interval_review
 from media_analysis import (alignment_module, audio_packet_hash, balance_audio, efficient_video, extract_cues,
                             class_format_suggestions, inspect_section_functions, locate_chapters, map_recordings, optimize_video, probe, run, timing_windows,
                             unresolved_repeat_times, video_info)
@@ -287,13 +289,24 @@ def attribution(args):
     print(json.dumps({"state": state, "credit": credit or None}, ensure_ascii=False))
 
 
+def public_credit(value):
+    name = value.strip()
+    if not name or not valid_text(name, 128, single_line=True):
+        raise argparse.ArgumentTypeError("Enter the public name, or use --no-credit for no attribution.")
+    return name
+
+
 def confirm_plan(args):
     config = read_json(args.input)
     config["projectName"] = args.project_name.strip()
     config["routineName"] = args.routine_name.strip()
     if args.credit is not None:
         config["credit"] = args.credit.strip() or None
-    require("credit" in config, "Choose a credit or explicitly select --no-credit.")
+    elif "credit" not in config and (credit := default_credit()) is not None:
+        config["credit"] = credit or None
+    require("credit" in config, "Enter the public name with --credit, or explicitly select --no-credit.")
+    require(not args.remember_credit or args.credit is not None,
+            "To save a new default, enter the public name with --credit or explicitly select --no-credit.")
     if args.cover or args.without_cover:
         set_cover_selection(config, args.cover)
     require(config.get("coverSelection"), "Confirm the artwork or use --without-cover.")
@@ -439,6 +452,26 @@ def plan(args):
                       "credit": value.get("credit"), "hasCreditChoice": "credit" in value}, ensure_ascii=False))
 
 
+def grit_interval_proposals(pdf, songs, evidence):
+    if not evidence:
+        return {}
+    import pdfplumber
+
+    results = {}
+    with pdfplumber.open(pdf) as document:
+        for song in songs:
+            record = evidence["tracks"].get(song["section"], {})
+            if song["variant"] != "standard":
+                continue
+            for page in reversed(record.get("exercisePages", [])):
+                text = document.pages[page - 1].extract_text(layout=True) or ""
+                suggestion = parse_grit_intervals(text, page, song["duration"])
+                if suggestion["status"] != "notFound":
+                    results[song["section"]] = suggestion
+                    break
+    return results
+
+
 def analyze(args):
     started = perf_counter()
     config = read_json(args.plan)
@@ -446,6 +479,7 @@ def analyze(args):
     validate_confirmation(config)
     cover = selected_cover(config)
     pdf = checked_pdf_path(config["pdf"]) if config.get("pdf") else None
+    require(not args.output.exists(), "Choose a new review path. Keep the previous review for comparison.")
     songs = config["music"]
     require(1 <= len(songs) <= 128, "Choose the music files in the plan")
     validate_slots(program, songs)
@@ -463,10 +497,25 @@ def analyze(args):
         page_count, cues, warnings = extract_cues(pdf, audio, ocr=args.ocr)
         review.update(pdf={"source": identity(pdf), "pageCount": page_count}, pdfWarnings=warnings)
         review["classTemplates"] = class_format_suggestions(pdf)
+        grit = grit_source_evidence(pdf, audio, config["routine"]) if program == "GRIT" else None
+        intervals = grit_interval_proposals(pdf, audio, grit)
+        if grit:
+            resolved_pages = {page for pages in grit["templatePages"].values() for page in pages}
+            review["classTemplates"] = [template for template in review["classTemplates"]
+                                        if not (template.get("sourceTrackReferences")
+                                                and resolved_pages.intersection(template["sourcePages"]))]
+            review["classTemplates"].extend(grit["templates"])
+            review["sourceStructureWarnings"] = grit["issues"]
         for song, record, rows in zip(songs, review["tracks"], cues):
             if function := rows.pop("sectionFunction", None):
                 record["sectionFunction"] = function
             record["cues"] = rows
+            if grit and song["variant"] == "standard" and (source := grit["tracks"].get(song["section"])):
+                record.update(pdfOpeningPage=source["pdfPage"], supplementary=source["supplement"])
+                if function := source.get("sectionFunction"):
+                    record["sectionFunction"] = function
+                if intervals_for_track := intervals.get(song["section"]):
+                    record["intervalReview"] = intervals_for_track
             stem = track_stem(Path(song["file"]).stem, program, config["routine"])
             if song["variant"] == "alternative" and re.match(r"(?i)^(?:EXPRESS|E)[ ._-]*\d+", stem):
                 number = int(re.search(r"\d+", song["section"])[0])
@@ -498,6 +547,8 @@ def analyze(args):
                       "audioMatched": sum(bool((x.get("chapter") or {}).get("approved")) for x in review["tracks"]),
                       "chaptersProposed": sum(bool(x.get("chapter")) for x in review["tracks"]),
                       "cueRowsProposed": sum(len(x.get("cues", {}).get("rows", [])) for x in review["tracks"]),
+                      "intervalCueRowsToReview": sum(len(x.get("intervalReview", {}).get("rows", []))
+                                                      for x in review["tracks"]),
                       "sectionFunctionsProposed": sum("sectionFunction" in record for record in review["tracks"]),
                       "classTemplatesProposed": sum(not item.get("sourceReview") for item in review.get("classTemplates", [])),
                       "classTemplateManualReview": [item["name"] for item in review.get("classTemplates", [])
@@ -656,13 +707,19 @@ def read_class_template_document(stream, pdf):
     return templates
 
 
-def check_class_template_sources(path, templates, *, include_omissions=False):
+def check_class_template_sources(path, templates, *, include_omissions=False, source_evidence=None):
     if not templates and not include_omissions:
         return []
     formats = class_format_suggestions(path, None if include_omissions else [template["page"] for template in templates])
+    expected = {row["key"]: row for row in source_evidence["templates"]} if source_evidence else {}
+    verified_pages = source_evidence["templatePages"] if source_evidence else {}
+    resolved_pages = {page for pages in verified_pages.values() for page in pages}
+    formats = [row for row in formats if not (row.get("sourceTrackReferences")
+                                              and resolved_pages.intersection(row["sourcePages"]))]
     grouped = {}
     for index, item in enumerate(formats):
-        grouped.setdefault(item["page"], []).append((index, item))
+        for page in item.get("sourcePages", [item["page"]]):
+            grouped.setdefault(page, []).append((index, item))
     manual = []
     matched = set()
 
@@ -672,7 +729,31 @@ def check_class_template_sources(path, templates, *, include_omissions=False):
                 slot.get("variantPreference") if slot.get("enforcesVariant") else None)
 
     for template in templates:
+        if template["key"] in expected:
+            original = expected[template["key"]]
+            require(template["page"] in verified_pages[template["key"]]
+                    and template["minutes"] == original["minutes"]
+                    and list(map(rule, template["slots"])) == list(map(rule, original["slots"])),
+                    f"{template['name']} · 课长、来源页或课型顺序与原谱不符。")
+            continue
         choices = grouped.get(template["page"], [])
+        named = [(index, item) for index, item in choices if item.get("sourceTrackReferences")]
+        course_name = " ".join(template["name"].casefold().split()) + " "
+        named_matches = [(index, item) for index, item in named
+                         if course_name.startswith(item["name"].casefold() + " ")]
+        choices = [(index, item) for index, item in choices if not item.get("sourceTrackReferences")]
+        if named_matches:
+            verified_shape = [(index, item) for index, item in named_matches
+                              if item["minutes"] == template["minutes"]
+                              and len(item["sourceTrackReferences"]) == len(template["slots"])]
+            require(verified_shape, f"{template['name']} · 课长或小节数量与原谱第 {template['page']} 页不符。")
+            index, item = verified_shape[0]
+            matched.add(index)
+            references = "、".join(f"{ref['sourceCourse'].removeprefix('GRIT ')} "
+                                  f"{ref['sourceRelease']} {ref['sourceTrack']}"
+                                  for ref in item["sourceTrackReferences"])
+            manual.append(f"{template['name']} · 原谱第 {template['page']} 页按来源课型核对曲目映射 · {references}")
+            continue
         if not choices:
             manual.append(f"{template['name']} · 原谱第 {template['page']} 页需人工核对课型。")
             continue
@@ -684,9 +765,17 @@ def check_class_template_sources(path, templates, *, include_omissions=False):
         require(matching, f"{template['name']} · 课长、选曲顺序或指定版本与原谱第 {template['page']} 页不符。")
         matched.add(next((index for index in matching if index not in matched), matching[0]))
     if include_omissions:
+        provided = {template["key"] for template in templates}
+        manual.extend(f"{row['name']} · 原谱第 {row['page']} 页的课型尚未写入包。"
+                      for key, row in expected.items() if key not in provided)
+        if source_evidence:
+            manual.extend(source_evidence["issues"])
         for index, item in enumerate(formats):
             location = f"{item['name']} · 原谱第 {item['page']} 页"
-            if item.get("sourceReview"):
+            if item.get("sourceTrackReferences"):
+                if index not in matched:
+                    manual.append(f"{location} 有可识别课型，待核对来源课型与包内曲目后补入。")
+            elif item.get("sourceReview"):
                 manual.append(f"{location} 有组合选曲需人工复核 · {' / '.join(item['sourceReview'])}")
             elif index not in matched:
                 manual.append(f"{location} 有可识别课型，包内未提供对应模板。")
@@ -792,7 +881,8 @@ def package(args):
                  for song, findings in zip(config["music"], review["tracks"])]
     pdf_path = same_source(checked_pdf_path(config["pdf"]), source_pdf["source"]) if source_pdf else None
     declared_sections = [{**song, "sectionFunction": function} for song, function in zip(config["music"], functions) if function]
-    checked_functions = inspect_section_functions(pdf_path, declared_sections)
+    grit = grit_source_evidence(pdf_path, config["music"], routine) if pdf_path and program == "GRIT" else None
+    checked_functions = section_function_checks(pdf_path, declared_sections, grit)
     manual_functions = require_matching_section_functions(checked_functions)
     approved_templates = [item for item in review.get("classTemplates", []) if item.get("approved") is True]
     require(not any(item.get("sourceReview") for item in approved_templates),
@@ -800,7 +890,7 @@ def package(args):
     templates = [{key: value for key, value in item.items() if key not in {"approved", "sourceReview"}}
                  for item in approved_templates]
     validate_class_templates(templates, source_pdf)
-    check_class_template_sources(pdf_path, templates)
+    check_class_template_sources(pdf_path, templates, source_evidence=grit)
     cover = selected_cover(config)
     if cover:
         require(review.get("cover") == cover, "Review no longer matches the confirmed cover image.")
@@ -835,6 +925,8 @@ def package(args):
                 path, levels = balance_audio(path, work / f"audio-{index}.m4a", args.lufs)
             duration, _ = probe(path, "audio")
             row = {key: song[key] for key in ("section", "variant", "catalogTrackID", "title", "pdfPage") if key in song}
+            if "pdfPage" not in row and findings.get("pdfOpeningPage") is not None:
+                row["pdfPage"] = findings["pdfOpeningPage"]
             row.update(asset=identity(path), duration=round(duration, 6))
             if (edition := findings.get("classEdition")) and edition.get("approved") is True:
                 row["classDurationMinutes"] = edition["minutes"]
@@ -964,6 +1056,15 @@ def require_matching_section_functions(checks):
     return [message for status, message in checks if status == "manual"]
 
 
+def section_function_checks(pdf, songs, grit=None):
+    songs = [song for song in songs if song.get("sectionFunction")]
+    checked = [check_grit_section_function(song, grit) if song["variant"] == "standard" else None
+               for song in songs]
+    generic_songs = [song for song, result in zip(songs, checked) if result is None]
+    generic = iter(inspect_section_functions(pdf, generic_songs)) if generic_songs else iter(())
+    return [result if result is not None else next(generic) for result in checked]
+
+
 def verify(path, *, manual_functions=None):
     before = path.stat()
     require(before.st_size <= MAX_PACKAGE, "Package too large")
@@ -985,10 +1086,12 @@ def verify(path, *, manual_functions=None):
             templates = read_class_template_document(class_file, manifest["pdf"])
         if pdf_asset is not None:
             pdf.seek(0)
-            manual_formats = check_class_template_sources(pdf, templates)
+            grit = grit_source_evidence(pdf, manifest["music"], manifest["routine"]) if manifest["program"] == "GRIT" else None
+            pdf.seek(0)
+            manual_formats = check_class_template_sources(pdf, templates, source_evidence=grit)
             if checks_functions:
                 pdf.seek(0)
-                manual_functions = require_matching_section_functions(inspect_section_functions(pdf, manifest["music"]))
+                manual_functions = require_matching_section_functions(section_function_checks(pdf, manifest["music"], grit))
     after = path.stat()
     require((before.st_ino, before.st_size, before.st_mtime_ns) ==
             (after.st_ino, after.st_size, after.st_mtime_ns), "Package changed during verification")
@@ -1011,6 +1114,29 @@ def extract_manifest(args):
     write_json(args.output, manifest)
 
 
+def rebalance_recording(source, manifest, work, selector, target):
+    section, separator, variant = selector.partition(":")
+    matches = [(index, song) for index, song in enumerate(manifest["music"])
+               if song["section"] == section.upper() and (not separator or song["variant"] == variant)]
+    require(len(matches) == 1, f"{selector} must identify one recording. Use SECTION:variant for a shared slot.")
+    index, song = matches[0]
+    asset = song["asset"]
+    beginning = source.tell()
+    offset = sum(row["asset"]["bytes"] for row in manifest["music"][:index])
+    source.seek(beginning + offset)
+    original = work / f"original-{index}.{asset['ext']}"
+    with original.open("xb") as stream:
+        consume(source, asset, destination=stream)
+    source.seek(beginning)
+    output, levels = balance_audio(original, work / f"balanced-{index}.m4a", target)
+    duration, _ = probe(output, "audio")
+    require(abs(duration - song["duration"]) <= 0.20, f"{section} duration changed beyond tolerance")
+    song.update(asset=identity(output), duration=round(duration, 6))
+    if (chapter := song.get("chapter")) and chapter["evidence"] == "audioMatched":
+        chapter["end"] = round(chapter["start"] + duration, 6)
+    return index, output, levels
+
+
 def revise(args):
     updated = read_json(args.manifest)
     program, routine, _ = read_identity(updated)
@@ -1031,11 +1157,6 @@ def revise(args):
         with args.class_templates.open("rb") as document:
             read_class_template_document(document, updated.get("pdf"))
         updated["classTemplatesFile"] = identity(args.class_templates)
-    assets = validate_manifest(updated)
-    encoded = json.dumps(updated, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
-    require(0 < len(encoded) <= MAX_MANIFEST and
-            12 + len(encoded) + sum(asset["bytes"] for asset in assets) <= MAX_PACKAGE,
-            "Package exceeds the format size limit")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     name = f"{program}_{routine}_{args.revision}.ssroutine"
     output = args.output_dir / name
@@ -1047,13 +1168,30 @@ def revise(args):
                 "A revision must retain the package identity and increase its version")
         old_assets = validate_manifest(old)
         require(old_assets == reviewed_assets, "Changing media requires building a new package from source")
+        replacements = {}
+        levels = None
+        if selector := getattr(args, "rebalance", None):
+            require(-24 <= args.lufs <= -12, "Select a loudness target between -24 and -12 LUFS")
+            index, audio, levels = rebalance_recording(source, updated, Path(directory), selector, args.lufs)
+            replacements[index] = audio
+        assets = validate_manifest(updated)
+        encoded = json.dumps(updated, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
+        require(0 < len(encoded) <= MAX_MANIFEST and
+                12 + len(encoded) + sum(asset["bytes"] for asset in assets) <= MAX_PACKAGE,
+                "Package exceeds the format size limit")
         temporary = Path(directory) / name
         with temporary.open("xb") as stream:
             os.chmod(temporary, 0o600)
             stream.write(MAGIC + struct.pack(">I", len(encoded)) + encoded)
             media_assets = old_assets[:len(old["music"]) + bool(old.get("video")) + bool(old.get("pdf"))]
-            for asset in media_assets:
-                consume(source, asset, destination=stream)
+            for index, asset in enumerate(media_assets):
+                if index in replacements:
+                    consume(source, asset)
+                    with replacements[index].open("rb") as audio:
+                        consume(audio, assets[index], destination=stream)
+                        require(not audio.read(1), "Balanced audio changed while packing")
+                else:
+                    consume(source, asset, destination=stream)
             if original_cover := old.get("cover"):
                 consume(source, original_cover, destination=None if replacing_cover else stream)
             if args.cover is not None:
@@ -1071,6 +1209,8 @@ def revise(args):
             os.fsync(stream.fileno())
         receipt = verify(temporary)
         os.link(temporary, output)
+    if levels is not None:
+        receipt["rebalanced"] = {"recording": selector, **levels}
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
 
 
@@ -1097,11 +1237,81 @@ def add_media_options(command):
     command.add_argument("--video-codec", choices=("hevc", "h264"), help="Require this codec when encoding (default: HEVC)")
 
 
+def add_delivery_location(command):
+    location = command.add_mutually_exclusive_group(required=True)
+    location.add_argument("--workspace", type=Path, help="Current project's workspace; deliver under its 交付 folder")
+    location.add_argument("--output-dir", type=Path, help="Delivery folder explicitly chosen for this batch")
+
+
+def review_problems(review, *, source_limited=False):
+    plan = review["plan"]
+    pdf, video = bool(plan.get("pdf")), bool(plan.get("video"))
+    problems = []
+    if not source_limited:
+        if not pdf:
+            problems.append("未选原谱。若原始资料确实没有，请先确认课程的交付范围。")
+        if not video:
+            problems.append("未选视频。若原始资料确实没有，请先确认课程的交付范围。")
+    for song, record in zip(plan["music"], review["tracks"], strict=True):
+        section = song["section"]
+        supplement = record.get("supplementary") is True
+        chapter = record.get("chapter") or {}
+        if video and not supplement and (chapter.get("evidence") != "audioMatched"
+                                         or chapter.get("approved") is not True):
+            problems.append(f"{section} · 教学视频的曲内时钟未核实。")
+        if pdf and (record.get("sectionFunction") or {}).get("approved") is not True:
+            problems.append(f"{section} · 尚未核实小节功能。")
+        cues = record.get("cues") or {}
+        if pdf and not (song.get("pdfPage") or record.get("pdfOpeningPage") or cues.get("rows")):
+            problems.append(f"{section} · 尚未指定原谱入口。")
+        has_clock_evidence = cues.get("rows") or record.get("intervalReview")
+        if (pdf and not supplement and (has_clock_evidence or not source_limited)
+                and (not cues.get("rows") or cues.get("approved") is not True)):
+            problems.append(f"{section} · 补齐并核实动作时间线。")
+        elif proposal := record.get("intervalReview"):
+            clock = record.get("intervalClock") or {}
+            anchor = clock.get("anchorSeconds")
+            positions = set()
+            if type(anchor) in (int, float) and math.isfinite(anchor):
+                for observation in clock.get("observations", ()):
+                    music_second = observation.get("musicSecond")
+                    score_second = observation.get("scoreSecond")
+                    if (type(music_second) in (int, float) and type(score_second) in (int, float)
+                            and 0 <= music_second < record["duration"]
+                            and abs(music_second - anchor - score_second) <= 1.25):
+                        positions.add(min(2, int(music_second / record["duration"] * 3)))
+            if positions != {0, 1, 2}:
+                problems.append(f"{section} · 核实开头、中段、尾段的原谱与曲内时钟，再确认分段时间。")
+            else:
+                status, reason = validate_interval_review(proposal, cues.get("rows") or [],
+                                                          observed_anchor_seconds=anchor)
+                if status != "matched":
+                    problems.append(f"{section} · {reason}")
+    for template in review.get("classTemplates", ()):
+        if template.get("approved") is not True:
+            problems.append(f"{template['name']} · 核实原谱顺序及实际录音后再确认课型。")
+    problems.extend(review.get("sourceStructureWarnings", ()))
+    return list(dict.fromkeys(problems))
+
+
+def check_review(args):
+    blockers = review_problems(read_json(args.review), source_limited=args.source_limited)
+    print(json.dumps({"readyToBuild": not blockers, "blockers": blockers}, ensure_ascii=False, indent=2))
+    if blockers:
+        raise SystemExit(2)
+
+
 def finish(args):
-    from batch_submission import submit
+    from batch_submission import delivery_batch_id, submit
 
     started = perf_counter()
     require(1 <= len(args.reviews) <= 256, "Select between 1 and 256 reviewed routines")
+    require(getattr(args, "screen_subtitles", None) is None or len(args.reviews) == 1,
+            "An explicit subtitle observation applies to one inspected package")
+    args.batch_id = delivery_batch_id(args)
+    for review in args.reviews:
+        blockers = review_problems(read_json(review), source_limited=getattr(args, "source_limited", False))
+        require(not blockers, f"{review.name} 暂缓交付，尚未开始编码。\n" + "\n".join(blockers))
     work = Path(tempfile.mkdtemp(prefix="ssroutine-production-"))
     outputs = []
     try:
@@ -1134,7 +1344,7 @@ def main():
     p.add_argument("--project-name")
     p.add_argument("--routine-name")
     credit = p.add_mutually_exclusive_group()
-    credit.add_argument("--credit", help="Confirmed public creator name")
+    credit.add_argument("--credit", type=public_credit, help="Confirmed public creator name")
     credit.add_argument("--no-credit", dest="credit", action="store_const", const="")
     p.add_argument("--release-date", help="A confirmed release date or quarter, such as 2024Q3")
     p.add_argument("--video-note", help="Known reason for intentionally missing or unlocated video")
@@ -1148,7 +1358,7 @@ def main():
     p.add_argument("--project-name", required=True)
     p.add_argument("--routine-name", required=True)
     credit = p.add_mutually_exclusive_group()
-    credit.add_argument("--credit", help="Use this public creator name for this package")
+    credit.add_argument("--credit", type=public_credit, help="Use this public creator name for this package")
     credit.add_argument("--no-credit", dest="credit", action="store_const", const="")
     p.add_argument("--remember-credit", action="store_true", help="Save this attribution choice as the local default")
     cover = p.add_mutually_exclusive_group()
@@ -1180,10 +1390,17 @@ def main():
     add_media_options(p)
     p = commands.add_parser("finish", help="Build reviewed routines and seal one verified submission in a single run")
     p.add_argument("reviews", type=Path, nargs="+")
-    p.add_argument("--output-dir", required=True, type=Path)
+    add_delivery_location(p)
     p.add_argument("--batch-id")
     p.add_argument("--font", type=Path, help="CJK font for the visual QA cards")
+    p.add_argument("--source-limited", action="store_true",
+                   help="Deliver a creator-confirmed limited scope when original materials are genuinely absent")
+    p.add_argument("--screen-subtitles", choices=("present", "absent"),
+                   help="Visual judgment after examining the frames of the output video")
     add_media_options(p)
+    p = commands.add_parser("check-review", help="List unfinished source checks before encoding")
+    p.add_argument("review", type=Path)
+    p.add_argument("--source-limited", action="store_true")
     p = commands.add_parser("verify")
     p.add_argument("package", type=Path)
     p = commands.add_parser("manifest", help="Extract a private editable copy of a package manifest")
@@ -1198,15 +1415,25 @@ def main():
     cover_options.add_argument("--cover", type=Path, help="Use an explicitly approved replacement cover")
     cover_options.add_argument("--without-cover", action="store_true", help="Remove the previous cover")
     p.add_argument("--class-templates", type=Path, help="Reviewed class-templates.json file to add or replace")
+    p.add_argument("--rebalance", metavar="SECTION[:VARIANT]",
+                   help="Rebalance the same recording in the existing package and keep the other bytes")
+    p.add_argument("--lufs", type=float, default=-16.0, help="Target used by --rebalance (default: -16 LUFS)")
     p = commands.add_parser("submit", help="Create a clean batch with verified packages, QA images and fingerprints")
     p.add_argument("packages", type=Path, nargs="+")
-    p.add_argument("--output-dir", required=True, type=Path)
+    add_delivery_location(p)
     p.add_argument("--batch-id")
     p.add_argument("--font", type=Path, help="CJK font for the visual QA cards")
+    p.add_argument("--source-limited", action="store_true",
+                   help="Deliver a creator-confirmed limited scope when original materials are genuinely absent")
     p.add_argument("--screen-subtitles", choices=("present", "absent"),
                    help="Visual judgment after examining the samples of a single exact package")
     args = parser.parse_args()
     try:
+        if args.command in {"finish", "submit"} and args.workspace is not None:
+            workspace = args.workspace.expanduser().resolve(strict=True)
+            require(workspace.is_dir(), "Choose the current project's workspace folder")
+            args.output_dir = workspace / "交付"
+            require(not args.output_dir.is_symlink(), "The workspace delivery folder points elsewhere. Confirm the destination explicitly.")
         if args.command == "doctor":
             doctor()
         elif args.command == "verify":
@@ -1217,7 +1444,7 @@ def main():
         else:
             {"plan": plan, "confirm-plan": confirm_plan, "text-cover": text_cover, "attribution": attribution,
              "select-cover": select_cover, "analyze": analyze, "build": package,
-             "manifest": extract_manifest, "revise": revise, "finish": finish}[args.command](args)
+             "manifest": extract_manifest, "revise": revise, "finish": finish, "check-review": check_review}[args.command](args)
     except (ValueError, KeyError, TypeError, OSError, ImportError, subprocess.SubprocessError) as error:
         parser.exit(1, f"{error}\n")
 

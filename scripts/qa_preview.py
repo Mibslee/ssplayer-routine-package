@@ -11,7 +11,6 @@ import hashlib
 import json
 from pathlib import Path
 import re
-from statistics import median
 import subprocess
 import struct
 import tempfile
@@ -71,26 +70,18 @@ def delivery_display(manifest, report, *keys):
     return state, outcome
 
 
-def inspect_loudness(report, target, *, keep_music=False):
+def inspect_loudness(report, target=None):
     tracks = [row for row in report["tracks"] if row["decoded"] and row["durationMatches"]]
-    if keep_music:
-        reference = None
+    if target is None:
         report["loudnessPolicy"] = "keepOriginalDynamics"
-    elif target is not None:
-        reference = target
-        label = "制作目标"
     else:
-        reference = median(row["lufs"] for row in tracks) if len(tracks) >= 3 else None
-        label = "包内中位响度"
-    if reference is not None:
-        report["loudnessReference"] = {
-            "lufs": reference, "source": "target" if target is not None else "packageMedian",
-        }
+        report["loudnessPolicy"] = "targetLoudness"
+        report["loudnessReference"] = {"lufs": target, "source": "target"}
     for row in tracks:
         title = section_title(row)
-        if reference is not None and abs(delta := round(row["lufs"] - reference, 2)) > 2.0:
+        if target is not None and abs(delta := round(row["lufs"] - target, 2)) > 2.0:
             add_condition(report, "audio",
-                          f"{title} 实测 {row['lufs']:.1f} LUFS，较{label} {reference:.1f} LUFS 偏差 {delta:+.1f} LU。")
+                          f"{title} 实测 {row['lufs']:.1f} LUFS，较制作目标 {target:.1f} LUFS 偏差 {delta:+.1f} LU。")
             row["loudnessReview"] = True
         if row["truePeakDBTP"] > 0:
             add_issue(report, "audio",
@@ -800,7 +791,7 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                 add_issue(report, "audio", f"{slot} 实际音乐时长与清单不符。")
             if song["status"] == "review":
                 add_issue(report, "video", f"{slot} 包内音画复测未通过。{timing_failure_detail(song)}。")
-        inspect_loudness(report, target_lufs, keep_music=keep_music)
+        inspect_loudness(report, target_lufs)
         if "video" in optional:
             try:
                 picture = video_info(optional["video"])
@@ -925,9 +916,9 @@ def main():
     parser.add_argument("--font", type=Path, help="Optional font with Chinese glyphs")
     loudness = parser.add_mutually_exclusive_group()
     loudness.add_argument("--target-lufs", type=float, metavar="LUFS",
-                          help="The producer's chosen loudness target; omit to compare tracks within the package")
+                          help="Verify against an explicitly selected target; omit to preserve original dynamics")
     loudness.add_argument("--keep-music", action="store_true",
-                          help="Preserve relative loudness; still check decoding and true peaks")
+                          help="Preserve relative loudness (default); still check decoding and true peaks")
     parser.add_argument("--source-limited", action="store_true",
                         help="Assess a creator-confirmed scope with genuinely absent original materials")
     parser.add_argument("--screen-subtitles", choices=("present", "absent"), metavar="RESULT",

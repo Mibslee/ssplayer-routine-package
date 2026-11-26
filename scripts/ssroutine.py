@@ -46,6 +46,7 @@ PROGRAM_ALIASES = {**PROGRAM_ALBUMS, **{f"LESMILLS{name}": code for name, code i
                    "莱美有氧": "BA", "莱美有氧训练": "BA"}
 NATIVE_PROGRAMS = {"BC", "BJ", "BP", "RPM"}
 VIDEO_PROFILES = {"efficient": (None, None), "ipad": (1080, 1800), "compact": (720, 950)}
+DEFAULT_LOUDNESS_TARGET = -16.0
 
 
 def require(condition, reason):
@@ -893,9 +894,13 @@ def package(args):
     require((program, routine) == author_identity(program, routine),
             "Use canonical project and routine identifiers in the plan.")
     validate_confirmation(config)
-    require(-24 <= args.lufs <= -12, "Select a loudness target between -24 and -12 LUFS")
+    requested_target = getattr(args, "lufs", None)
+    require(requested_target is None or -24 <= requested_target <= -12,
+            "Select a loudness target between -24 and -12 LUFS")
+    music_target = None if getattr(args, "keep_music", False) else requested_target
     repair_peaks = bool(getattr(args, "repair_music_peaks", False))
-    require(not repair_peaks or args.keep_music, "--repair-music-peaks requires --keep-music")
+    require(not repair_peaks or music_target is None,
+            "Choose peak repair with original audio or explicitly normalize to --lufs.")
     require(len(config["music"]) == len(review["tracks"]), "Review does not cover every music file")
     validate_slots(program, config["music"])
     require(review.get("programRoutine", [program, routine]) == [program, routine],
@@ -952,7 +957,7 @@ def package(args):
             original = same_source(song["file"], findings["source"])
             path = original
             output = work / f"audio-{index}.m4a"
-            if args.keep_music:
+            if music_target is None:
                 readings = measure(original)
                 if repair_peaks:
                     path, levels = balance_audio(original, output, None, measured=readings)
@@ -960,7 +965,7 @@ def package(args):
                     lufs, peak = readings
                     levels = {"inputLUFS": lufs, "outputLUFS": lufs, "truePeakDBTP": peak, "gainDB": 0}
             else:
-                path, levels = balance_audio(original, output, args.lufs)
+                path, levels = balance_audio(original, output, music_target)
             duration, _ = probe(path, "audio")
             row = {key: song[key] for key in ("section", "variant", "catalogTrackID", "title", "pdfPage") if key in song}
             if "pdfPage" not in row and findings.get("pdfOpeningPage") is not None:
@@ -988,15 +993,16 @@ def package(args):
             if levels["truePeakDBTP"] > 0:
                 preflight_problems.append(f"{label} · 实测真峰值 {levels['truePeakDBTP']:+.1f} dBTP，高于 0 dBTP。"
                                           "选择保留相对响度并仅降峰，或重新均衡。")
-            if not args.keep_music and abs(round(levels["outputLUFS"] - args.lufs, 2)) > 2:
+            if music_target is not None and abs(round(levels["outputLUFS"] - music_target, 2)) > 2:
                 preflight_problems.append(f"{label} · 保护峰值后为 {levels['outputLUFS']:.1f} LUFS，"
-                                          f"与目标 {args.lufs:.1f} LUFS 相差超过 2 LU。")
+                                          f"与目标 {music_target:.1f} LUFS 相差超过 2 LU。")
         audio_seconds = perf_counter() - started
         if config.get("video"):
             path = same_source(config["video"], review["video"]["source"])
             original_picture = video_info(path)
             if args.balance_video:
-                path, levels = balance_audio(path, work / "video.mp4", args.lufs, video=True)
+                video_target = DEFAULT_LOUDNESS_TARGET if requested_target is None else requested_target
+                path, levels = balance_audio(path, work / "video.mp4", video_target, video=True)
                 loudness.append({"section": "video", **levels})
             print(f"{name} · 编码前复测各小节音画时钟", file=sys.stderr, flush=True)
             check_started = perf_counter()
@@ -1055,7 +1061,7 @@ def package(args):
     receipt.update(output=str(output.resolve()), loudness=loudness, videoQuality=video_quality,
                    seconds=round(perf_counter() - started, 2), audioSeconds=round(audio_seconds, 2),
                    videoSeconds=round(video_seconds, 2), mediaPreflightSeconds=round(preflight_seconds, 2),
-                   musicPolicy="keepOriginalDynamics" if args.keep_music else "targetLoudness")
+                   musicPolicy="keepOriginalDynamics" if music_target is None else "targetLoudness")
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
     return output
 
@@ -1283,11 +1289,14 @@ def doctor():
 
 
 def add_media_options(command):
-    command.add_argument("--lufs", type=float, default=-16.0)
-    command.add_argument("--keep-music", action="store_true", help="Do not normalize relative loudness")
+    command.add_argument("--lufs", type=float, metavar="LUFS",
+                         help="Explicitly normalize each music recording to LUFS")
+    command.add_argument("--keep-music", action="store_true",
+                         help="Preserve original music (default); takes precedence over --lufs for music")
     command.add_argument("--repair-music-peaks", action="store_true",
-                         help="With --keep-music, attenuate only recordings above 0 dBTP")
-    command.add_argument("--balance-video", action="store_true")
+                         help="Attenuate only recordings above 0 dBTP while otherwise keeping original music")
+    command.add_argument("--balance-video", action="store_true",
+                         help="Explicitly normalize the video audio track to --lufs or -16 LUFS")
     command.add_argument("--video-quality", choices=("efficient", "original", "ipad", "compact"), default="efficient")
     command.add_argument("--video-max-height", type=int, help="Override the selected preset's height limit")
     command.add_argument("--video-bitrate-kbps", type=int, help="Override the selected preset's video bitrate")
@@ -1488,7 +1497,7 @@ def main():
                    help="Normalize this recording, leaving other media unchanged. Repeat to select more.")
     p.add_argument("--reduce-peak", action="append", metavar="SECTION[:VARIANT]",
                    help="Attenuate this recording only if its peak exceeds 0 dBTP. Repeat to select more.")
-    p.add_argument("--lufs", type=float, default=-16.0, help="Target used by --rebalance (default: -16 LUFS)")
+    p.add_argument("--lufs", type=float, default=DEFAULT_LOUDNESS_TARGET, help="Target used by --rebalance (default: -16 LUFS)")
     p = commands.add_parser("submit", help="Create a clean batch with verified packages, QA images and fingerprints")
     p.add_argument("packages", type=Path, nargs="+")
     add_delivery_location(p)
@@ -1500,7 +1509,7 @@ def main():
                    help="Visual judgment after examining the samples of a single exact package")
     loudness = p.add_mutually_exclusive_group()
     loudness.add_argument("--keep-music", action="store_true",
-                          help="Keep relative loudness; still verify decoding and peaks")
+                          help="Use original audio as the reference (default); verify decoding and peaks")
     loudness.add_argument("--target-lufs", type=float,
                           help="Verify against the producer's chosen loudness target")
     args = parser.parse_args()

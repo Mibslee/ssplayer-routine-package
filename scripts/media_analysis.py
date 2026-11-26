@@ -117,13 +117,20 @@ def measure(path):
     return integrated, peak
 
 
-def balance_audio(source, destination, target, video=False):
-    """Apply constant gain with headroom. Preserve the picture bitstream."""
-    integrated, peak = measure(source)
+def balance_audio(source, destination, target, video=False, *, measured=None):
+    """Apply constant gain with headroom. None only attenuates a peak above 0 dBTP."""
+    integrated, peak = measure(source) if measured is None else measured
+    receipt = {"inputLUFS": integrated, "outputLUFS": integrated, "truePeakDBTP": peak, "gainDB": 0}
+    if target is None and peak <= 0:
+        return source, receipt
     # This extra headroom leaves room for the encoder's reconstructed peaks.
-    gain = min(target - integrated, -2.0 - peak, 12.0)
+    gain = -2.0 - peak if target is None else min(target - integrated, -2.0 - peak, 12.0)
+    initial_gain = gain
+    # Peak-only repairs preserve the creator's levels while leaving a small
+    # measured margin. Target normalization continues to require full headroom.
+    peak_limit = -0.2 if target is None else -1.4
     if abs(gain) <= 0.5 and peak <= -1.5:
-        return source, {"inputLUFS": integrated, "outputLUFS": integrated, "truePeakDBTP": peak, "gainDB": 0}
+        return source, receipt
     retry_mapping = None
     if video:
         duration, media = probe(source, "video")
@@ -151,7 +158,7 @@ def balance_audio(source, destination, target, video=False):
 
     final_lufs, final_peak = encode(gain, args)
     reduction = final_peak + 2.2
-    if final_peak > -1.4 and retry_mapping and reduction > 2.0:
+    if final_peak > peak_limit and retry_mapping and reduction > 2.0:
         # A different AAC encoder or bitrate can avoid the reconstructed peak at the same gain.
         alternatives = [("aac", "192k")]
         if sys.platform == "darwin":
@@ -166,14 +173,20 @@ def balance_audio(source, destination, target, video=False):
                 alternative_duration, _ = probe(destination, "audio")
             except ValueError:
                 continue
-            if (alternative_peak <= -1.4 and abs(alternative_lufs - integrated - gain) <= 1.0
+            if (alternative_peak <= peak_limit and abs(alternative_lufs - integrated - gain) <= 1.0
                     and abs(alternative_duration - duration) <= 0.20):
                 final_lufs, final_peak = alternative_lufs, alternative_peak
                 break
-    if final_peak > -1.4:
+    if final_peak > peak_limit:
         gain -= reduction
         destination.unlink(missing_ok=True)
         final_lufs, final_peak = encode(gain, args)
+    if retry_mapping and (final_peak > peak_limit or abs(final_lufs - integrated - gain) > 1.0):
+        # A lossy codec can reconstruct clipped peaks even at reduced gain.
+        # Preserve the attenuated samples in the existing supported M4A container.
+        destination.unlink(missing_ok=True)
+        gain = initial_gain
+        final_lufs, final_peak = encode(gain, [*retry_mapping, "-c:a", "alac"])
     final_duration, final = probe(destination, "video" if video else "audio")
     if abs(final_duration - duration) > 0.20:
         raise ValueError(f"Audio balancing changed the duration of {source.name}")
@@ -189,7 +202,7 @@ def balance_audio(source, destination, target, video=False):
         final_audio = next(s for s in final["streams"] if s["codec_type"] == "audio")
         if abs(float(initial_audio.get("start_time", 0)) - float(final_audio.get("start_time", 0))) > 0.05:
             raise ValueError(f"Video balancing moved the embedded audio clock in {source.name}")
-    if final_peak > -1.4 or abs(final_lufs - integrated - gain) > 1.0:
+    if final_peak > peak_limit or abs(final_lufs - integrated - gain) > 1.0:
         raise ValueError(f"Post-encode loudness check failed for {source.name}")
     return destination, {"inputLUFS": integrated, "outputLUFS": final_lufs, "truePeakDBTP": final_peak,
                          "gainDB": round(gain, 3)}
@@ -423,6 +436,19 @@ def timing_windows(song, audio, video, alignment):
     if passes(alternate):
         return {"status": "measured", "windows": alternate}
     return {"status": "review", "windows": windows}
+
+
+def timing_failure_detail(evidence):
+    windows = evidence["windows"]
+    if not windows:
+        return "没有能与视频音轨匹配的窗口"
+    measurements = " / ".join(f"{window['position']:.0%} {window['offsetMS']:+.1f} ms"
+                              f"（相关 {window['correlation']:.3f}，次峰差 {window['runnerUpGap']:.3f}）"
+                              for window in windows)
+    if len(windows) > 1:
+        values = [window["offsetMS"] for window in windows]
+        measurements += f" · 跨段偏差 {max(values) - min(values):.1f} ms"
+    return measurements
 
 
 def locate_chapters(video, rows, duration, audio_duration):
@@ -728,9 +754,33 @@ def heading_for_song(song, headings):
     return None
 
 
+def has_track_narrative(words):
+    """Recognize a coaching page even when its guidance is untimed prose."""
+    lines = [" ".join(word["text"] for word in line) for line in row_lines(words)]
+    for index, line in enumerate(lines):
+        if re.match(r"^(?:TRACK FOCUS|教学重点|训练重点|本节重点)\b", line, re.I):
+            return sum(len(re.findall(r"[^\W\d_]", body)) >= 12
+                       for body in lines[index + 1:]) >= 3
+    return False
+
+
+def has_printed_action_clock(words, width, alignment):
+    if alignment._has_cue_table_header(width, words):
+        return True
+    for line in row_lines(words):
+        text = unicodedata.normalize("NFKC", " ".join(word["text"] for word in line))
+        # An isolated recording duration, e.g. 5:57mins, is not an action.
+        if re.search(r"(?<!\d)\d{1,3}\s*[:.]\s*[0-5]\d\b(?!\s*(?:min(?:ute)?s?|分钟)\b)", text, re.I):
+            return True
+        if re.search(r"\b\d+\s*(?:secs?(?:onds?)?|mins?(?:utes?)?)\b|\d+\s*(?:秒|分钟)", text, re.I):
+            if not re.fullmatch(r"\d{1,3}:[0-5]\d\s*(?:min(?:ute)?s?|分钟)", text, re.I):
+                return True
+    return False
+
+
 def section_heading(words, width, alignment, parsed):
-    """Read the numbered function title on a choreography table page."""
-    if parsed is None and not alignment._has_cue_table_header(width, words):
+    """Read a function from a choreography table or a numbered coaching page."""
+    if parsed is None and not alignment._has_cue_table_header(width, words) and not has_track_narrative(words):
         return None
     if alignment._has_modern_technique_and_coaching_heading(words):
         return None
@@ -1062,6 +1112,7 @@ def extract_cues(path, songs, ocr=False):
             if page_headings := choreography_headings(positioned, page.width, alignment, parsed):
                 headings[index] = page_headings
         timelines, warnings = alignment._build_pdf_timelines(found)
+        named_pages = sorted(headings)
         titles_by_recording = {}
         for page_headings in headings.values():
             for heading in page_headings:
@@ -1086,6 +1137,22 @@ def extract_cues(path, songs, ocr=False):
                 status = "needsExpansion" if repeats else "review"
             result.append({"rows": rows, "pages": list(pages), "approved": False,
                            "status": status, "structuralRepeatTimes": repeats})
+            # A timed course may have one untimed section. Verify the exact
+            # numbered opening and its continuation pages, never the whole PDF.
+            opening = song.get("pdfPage") or (song.get("sectionFunction") or {}).get("page")
+            if opening in headings and not rows and not candidates and has_track_narrative(words[opening]):
+                matched_headings = [heading for heading in headings[opening]
+                                    if heading.recording == recording and heading.variant_source != "ambiguous"]
+                if len(matched_headings) == len(headings[opening]) == 1:
+                    following = next((index for index in named_pages if index > opening
+                                      and not any(heading.recording == recording for heading in headings[index])),
+                                     len(pdf.pages) + 1)
+                    related = set(range(opening, following))
+                    related.update(index for index, items in headings.items()
+                                   if any(heading.recording == recording for heading in items))
+                    if all(words[index] and not has_printed_action_clock(words[index], pdf.pages[index - 1].width, alignment)
+                           for index in related):
+                        result[-1]["untimedScorePage"] = opening
             selected = set(song.get("pdfPages") or ())
             if song.get("pdfPage"):
                 selected.add(song["pdfPage"])

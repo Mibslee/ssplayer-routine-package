@@ -88,7 +88,7 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 用 `finish` 处理一套或多套已核对的方案。进度会显示音乐、视频和质检阶段；完成后可以看到各阶段耗时。已有成品可从本机工作区选出并直接提交。
 
-先根据 `check-review` 指出的曲目补齐证据。用 `build` 加 `qa_preview.py` 可以生成本机草稿和查看图。正式批次只会接收已核实的包，失败批次没有可签注指纹。制作者明确选择适用于原始资料的有限范围后，可对 `check-review`、`finish` 或 `submit` 传 `--source-limited`。质检仍会核对已提供的素材。
+先根据 `check-review` 指出的曲目补齐证据。修正视频时间后，运行 `check-review reviewed.json --measure-video` 原样复测。工具会列出各窗口的有符号偏差和整个小节的漂移。偏差从负变正时，单独挪动起点通常无法解决，要核对录音版本、速度和时钟来源。正式构建会在启动长视频编码前再核对实际采用的音频。正式批次只会接收已核实的包，失败批次没有可签注指纹。制作者明确选择适用于原始资料的有限范围后，可对 `check-review`、`finish` 或 `submit` 传 `--source-limited`。质检仍会核对已提供的素材。
 
 让智能体直接显示 `finish` 的标准错误进度，或写入日志后按需查看。长视频会报告编码百分比。已完成的资源包使用 `submit` 接续，省去重新编码。生成正式批次时，`finish` 已包含 `submit` 和九宫格质检。
 
@@ -103,8 +103,11 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 | `check-review` 未通过 | 根据列出的小节找对应动作、音画或课型证据，补齐后再检查。 |
 | 包已生成，批次验收失败 | 使用工具报告的保留路径，对同一成品运行 `qa_preview.py ... --strict`，打开报告及抽样帧。只有字幕判定变化时，对同一成品用 `submit --screen-subtitles present` 或 `absent`。 |
 | 动作、打开页或章节要改 | 提取旧包清单，校正字段，用 `revise` 提高修订号，复核后重新 `submit`。旧版视频和音频会直接复用。 |
-| 已入包的同一录音需要修正响度 | 使用 `revise --rebalance T15` 选中曲目并提高修订号。其余素材保留原字节，修订后重新核对时钟与响度。 |
+| 已入包的录音峰值超出 0 dBTP，制作者选择保留相对响度 | 使用 `revise --reduce-peak T15` 或 `--reduce-peak T1:bonus` 指定曲目。选项可以重复。沿用同一份已核验的视频和其他录音，再用 `submit --keep-music` 复核。 |
+| 已入包的同一录音需要按目标均衡 | 使用 `revise --rebalance T15` 选中曲目并提高修订号。其余素材保留原字节，修订后再核对时钟和响度。 |
 | 换了一首录音、视频或原谱 | 重新匹配对应来源，生成新复核文件后构建。 |
+
+从源文件开始时，`finish --keep-music` 保留录音相对响度。只有制作者同意单独处理超峰时，再加 `--repair-music-peaks`。使用 `qa_preview.py --keep-music` 或 `submit --keep-music` 延续该选择。质检仍会测量实际 LUFS 和真峰值，报告会注明采用的策略。
 
 [命令与修订字段](format.md#correcting-an-already-shared-package)
 

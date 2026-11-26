@@ -23,7 +23,7 @@ from delivery_policy import assess_delivery
 from grit_evidence import check_grit_section_function, grit_source_evidence
 from grit_intervals import validate_interval_review
 from media_analysis import (SAMPLE_POSITIONS, alignment_module, extract_cues, map_recordings, measure,
-                            probe, timing_windows, video_info)
+                            probe, timing_failure_detail, timing_windows, video_info)
 from qa_phone import (FONT_PATHS, PhonePreview, clock, score_metadata, section_title, select_preview_tracks,
                       timeline_sample, video_position, wrapped_lines)
 from report_html import write_html
@@ -71,9 +71,12 @@ def delivery_display(manifest, report, *keys):
     return state, outcome
 
 
-def inspect_loudness(report, target):
+def inspect_loudness(report, target, *, keep_music=False):
     tracks = [row for row in report["tracks"] if row["decoded"] and row["durationMatches"]]
-    if target is not None:
+    if keep_music:
+        reference = None
+        report["loudnessPolicy"] = "keepOriginalDynamics"
+    elif target is not None:
         reference = target
         label = "制作目标"
     else:
@@ -90,7 +93,8 @@ def inspect_loudness(report, target):
                           f"{title} 实测 {row['lufs']:.1f} LUFS，较{label} {reference:.1f} LUFS 偏差 {delta:+.1f} LU。")
             row["loudnessReview"] = True
         if row["truePeakDBTP"] > 0:
-            add_condition(report, "audio", f"{title} 实测真峰值 {row['truePeakDBTP']:+.1f} dBTP。")
+            add_issue(report, "audio",
+                      f"{title} 实测真峰值 {row['truePeakDBTP']:+.1f} dBTP，高于 0 dBTP。")
             row["loudnessReview"] = True
 
 
@@ -290,18 +294,18 @@ class Card:
         if not marker_only:
             self.text(x + 43, y + 7, name, 24, color)
 
-    def rows(self, values):
+    def rows(self, values, *, top=180):
         columns = 2 if len(values) > 10 else 1
         width = 520 if columns == 2 else 1070
         visible = values[:20]
         for index, (label, detail) in enumerate(visible):
             column, row = divmod(index, 10)
-            x, y = 48 + column * 552, 180 + row * 51
+            x, y = 48 + column * 552, top + row * 51
             self.draw.rounded_rectangle((x, y, x + width, y + 43), 8, fill=PANEL)
             self.text(x + 13, y + 7, label, 23, ACCENT, 170)
             self.text(x + 177, y + 7, detail, 23, PRIMARY, width - 195)
         if len(values) > len(visible):
-            self.text(50, 701, f"另有 {len(values) - len(visible)} 项，见完整报告", 24, SECONDARY)
+            self.text(50, top + 521, f"另有 {len(values) - len(visible)} 项，见完整报告", 24, SECONDARY)
 
     def media(self, image, box=(48, 180, 1104, 515)):
         if image:
@@ -656,7 +660,9 @@ def screenshot_cards(manifest, files, report, font_path):
         if row.get("loudnessReview"):
             detail += " · 待听"
         level_rows.append((section_title(row), detail))
-    volume.rows(level_rows)
+    if report.get("loudnessPolicy") == "keepOriginalDynamics":
+        volume.text(43, 172, "保留音乐相对响度 · 核对解码与真峰值", 20, SECONDARY)
+    volume.rows(level_rows, top=204 if report.get("loudnessPolicy") == "keepOriginalDynamics" else 180)
     decorate(volume, 85, "audio")
     yield "08-loudness.png", volume.image
 
@@ -708,6 +714,8 @@ def screenshot_cards(manifest, files, report, font_path):
 
 def generate(args, *, sealed_copy=None, overview_only=False):
     target_lufs = getattr(args, "target_lufs", None)
+    keep_music = bool(getattr(args, "keep_music", False))
+    require(not keep_music or target_lufs is None, "Choose original dynamics or a loudness target.")
     require(target_lufs is None or -24 <= target_lufs <= -12,
             "Select a loudness reference between -24 and -12 LUFS")
     root = args.output_dir
@@ -738,13 +746,11 @@ def generate(args, *, sealed_copy=None, overview_only=False):
         output = Path(report_staging) / "evidence"
         output.mkdir()
         tracks = report["tracks"]
-        grit, untimed = None, False
+        grit = None
         if "pdf" in optional:
             try:
                 if manifest["program"] == "GRIT":
                     grit = grit_source_evidence(optional["pdf"], manifest["music"], manifest["routine"])
-                if report["sourceLimited"] and any(not track["cueRows"] for track in tracks):
-                    untimed = readable_untimed_score(optional["pdf"], tracks)
             except (ValueError, OSError):
                 add_issue(report, "pdf", "无法读取原谱，不能核实小节资料的覆盖范围。")
         supplemental = {section for section, record in grit["tracks"].items() if record["supplement"]} if grit else set()
@@ -768,16 +774,10 @@ def generate(args, *, sealed_copy=None, overview_only=False):
             add_condition(report, "video", f"{sections_for(missing_chapters)} 无可靠小节定位。可按整段视频观看。")
         if uncertain_chapters:
             add_condition(report, "video", f"{sections_for(uncertain_chapters)} 仅有近似或画面位置，音画时钟未对齐。")
-        if missing_cues:
-            text = ("本包未附动作时间线。" if len(missing_cues) == len(tracks)
-                    else f"{sections_for(missing_cues)} 未提供可用动作时间线。")
-            if untimed:
-                add_source_limitation(report, "timeline", "no_timed_score",
-                                      text + "可读原谱中没有分段时间。")
-            elif "pdf" in optional:
-                add_condition(report, "timeline", text + "请核对原谱中的时间表或分段时长。")
-            else:
-                add_source_limitation(report, "timeline", "no_timed_source", text + "音乐仍可播放和排课。")
+        if missing_cues and "pdf" not in optional:
+            detail = ("本包未附动作时间线。" if len(missing_cues) == len(tracks)
+                      else f"{sections_for(missing_cues)} 未提供可用动作时间线。")
+            add_source_limitation(report, "timeline", "no_timed_source", detail + "音乐仍可播放和排课。")
         for track in tracks:
             if is_supplement(track):
                 track["supplementary"] = True
@@ -799,8 +799,8 @@ def generate(args, *, sealed_copy=None, overview_only=False):
             elif not song["durationMatches"]:
                 add_issue(report, "audio", f"{slot} 实际音乐时长与清单不符。")
             if song["status"] == "review":
-                add_issue(report, "video", f"{slot} 声明为按音乐定位，但包内三段复测未通过。")
-        inspect_loudness(report, target_lufs)
+                add_issue(report, "video", f"{slot} 包内音画复测未通过。{timing_failure_detail(song)}。")
+        inspect_loudness(report, target_lufs, keep_music=keep_music)
         if "video" in optional:
             try:
                 picture = video_info(optional["video"])
@@ -824,6 +824,26 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                     require(len(document) == manifest["pdf"]["pageCount"], "Original PDF page count does not match")
                     report["pdfPageCount"] = len(document)
                 _, proposals, _ = extract_cues(optional["pdf"], manifest["music"])
+                if missing_cues:
+                    unmatched_cues = missing_cues
+                    if report["sourceLimited"]:
+                        unknown = []
+                        for source, track in zip(proposals, tracks, strict=True):
+                            if track not in missing_cues:
+                                continue
+                            if page := source.get("untimedScorePage"):
+                                add_source_limitation(report, "timeline", "no_timed_score",
+                                    f"{section_title(track)} 原谱第 {page} 页为教学说明，没有分段时点。")
+                            else:
+                                unknown.append(track)
+                        if len(unknown) == len(tracks) and readable_untimed_score(optional["pdf"], tracks):
+                            add_source_limitation(report, "timeline", "no_timed_score",
+                                                  "本包未附动作时间线。可读原谱中没有分段时间。")
+                            unknown = []
+                        unmatched_cues = unknown
+                    if unmatched_cues:
+                        add_condition(report, "timeline",
+                            f"{sections_for(unmatched_cues)} 未提供可用动作时间线。请核对原谱中的时间表或分段时长。")
                 intervals = grit_interval_proposals(optional["pdf"], manifest["music"], grit)
                 templates = []
                 if source_file := optional.get("classTemplatesFile"):
@@ -903,8 +923,11 @@ def main():
     parser.add_argument("--credit", help="Display credit for this evidence set")
     parser.add_argument("--made-at", help="Verified creation time in ISO 8601; omit to use evidence generation time")
     parser.add_argument("--font", type=Path, help="Optional font with Chinese glyphs")
-    parser.add_argument("--target-lufs", type=float, metavar="LUFS",
-                        help="The producer's chosen loudness target; omit to compare tracks within the package")
+    loudness = parser.add_mutually_exclusive_group()
+    loudness.add_argument("--target-lufs", type=float, metavar="LUFS",
+                          help="The producer's chosen loudness target; omit to compare tracks within the package")
+    loudness.add_argument("--keep-music", action="store_true",
+                          help="Preserve relative loudness; still check decoding and true peaks")
     parser.add_argument("--source-limited", action="store_true",
                         help="Assess a creator-confirmed scope with genuinely absent original materials")
     parser.add_argument("--screen-subtitles", choices=("present", "absent"), metavar="RESULT",

@@ -23,7 +23,7 @@ from time import perf_counter
 from grit_evidence import check_grit_section_function, grit_source_evidence
 from grit_intervals import parse_grit_intervals, validate_interval_review
 from media_analysis import (alignment_module, audio_packet_hash, balance_audio, efficient_video, extract_cues,
-                            class_format_suggestions, inspect_section_functions, locate_chapters, map_recordings, optimize_video, probe, run, timing_windows,
+                            class_format_suggestions, inspect_section_functions, locate_chapters, map_recordings, measure, optimize_video, probe, run, timing_failure_detail, timing_windows,
                             unresolved_repeat_times, video_info)
 
 
@@ -859,6 +859,32 @@ def validate_manifest(value):
     return assets
 
 
+def chapter_preflight(songs, paths, video, video_duration):
+    matches = [(song, path) for song, path in zip(songs, paths, strict=True)
+               if song.get("chapter", {}).get("evidence") == "audioMatched"]
+    if not matches:
+        return []
+    alignment = alignment_module()
+
+    def inspect(item):
+        song, path = item
+        chapter = song["chapter"]
+        label = f"{song['section']} · {song['variant']}"
+        start, end = chapter["start"], chapter["end"]
+        if not 0 <= start < end <= video_duration + 0.05:
+            return f"{label} · 音画章节超出视频时长。"
+        try:
+            evidence = timing_windows(song, path, video, alignment)
+        except (ValueError, OSError) as error:
+            return f"{label} · 无法读取音画复测窗口（{error}）。"
+        if evidence["status"] != "measured":
+            return f"{label} · 音画复测未通过。{timing_failure_detail(evidence)}。"
+        return None
+
+    return [failure for failure in map_recordings(inspect, matches) if failure]
+
+
+
 def package(args):
     started = perf_counter()
     review = read_json(args.review)
@@ -868,6 +894,8 @@ def package(args):
             "Use canonical project and routine identifiers in the plan.")
     validate_confirmation(config)
     require(-24 <= args.lufs <= -12, "Select a loudness target between -24 and -12 LUFS")
+    repair_peaks = bool(getattr(args, "repair_music_peaks", False))
+    require(not repair_peaks or args.keep_music, "--repair-music-peaks requires --keep-music")
     require(len(config["music"]) == len(review["tracks"]), "Review does not cover every music file")
     validate_slots(program, config["music"])
     require(review.get("programRoutine", [program, routine]) == [program, routine],
@@ -914,20 +942,31 @@ def package(args):
                 manifest[key] = config[key]
         files = []
         loudness = []
+        preflight_problems = []
         video_quality = None
+        preflight_seconds = 0.0
         print(f"{name} · 检查与处理 {len(timelines)} 首音乐", file=sys.stderr, flush=True)
 
         def prepare_audio(item):
             index, (song, findings, timeline, function) = item
-            path = same_source(song["file"], findings["source"])
-            levels = None
-            if not args.keep_music:
-                path, levels = balance_audio(path, work / f"audio-{index}.m4a", args.lufs)
+            original = same_source(song["file"], findings["source"])
+            path = original
+            output = work / f"audio-{index}.m4a"
+            if args.keep_music:
+                readings = measure(original)
+                if repair_peaks:
+                    path, levels = balance_audio(original, output, None, measured=readings)
+                else:
+                    lufs, peak = readings
+                    levels = {"inputLUFS": lufs, "outputLUFS": lufs, "truePeakDBTP": peak, "gainDB": 0}
+            else:
+                path, levels = balance_audio(original, output, args.lufs)
             duration, _ = probe(path, "audio")
             row = {key: song[key] for key in ("section", "variant", "catalogTrackID", "title", "pdfPage") if key in song}
             if "pdfPage" not in row and findings.get("pdfOpeningPage") is not None:
                 row["pdfPage"] = findings["pdfOpeningPage"]
-            row.update(asset=identity(path), duration=round(duration, 6))
+            row.update(asset=findings["source"] if path == original else identity(path),
+                       duration=round(duration, 6))
             if (edition := findings.get("classEdition")) and edition.get("approved") is True:
                 row["classDurationMinutes"] = edition["minutes"]
             if (chapter := findings.get("chapter")) and chapter.get("approved") is True:
@@ -944,29 +983,29 @@ def package(args):
         for path, song, levels in map_recordings(prepare_audio, enumerate(tracks)):
             files.append(path)
             manifest["music"].append(song)
-            if levels is not None:
-                loudness.append({"section": song["section"], **levels})
+            loudness.append({"section": song["section"], "variant": song["variant"], **levels})
+            label = f"{song['section']} · {song['variant']}"
+            if levels["truePeakDBTP"] > 0:
+                preflight_problems.append(f"{label} · 实测真峰值 {levels['truePeakDBTP']:+.1f} dBTP，高于 0 dBTP。"
+                                          "选择保留相对响度并仅降峰，或重新均衡。")
+            if not args.keep_music and abs(round(levels["outputLUFS"] - args.lufs, 2)) > 2:
+                preflight_problems.append(f"{label} · 保护峰值后为 {levels['outputLUFS']:.1f} LUFS，"
+                                          f"与目标 {args.lufs:.1f} LUFS 相差超过 2 LU。")
         audio_seconds = perf_counter() - started
         if config.get("video"):
-            print(f"{name} · 处理视频（{args.video_quality}）", file=sys.stderr, flush=True)
             path = same_source(config["video"], review["video"]["source"])
             original_picture = video_info(path)
-            changed_matches = [(song, audio) for song, audio, finding in zip(manifest["music"], files, review["tracks"])
-                               if song.get("chapter", {}).get("evidence") == "audioMatched"
-                               and song["asset"] != finding["source"]]
-            if changed_matches:
-                alignment = alignment_module()
-
-                def verify_balanced_clock(item):
-                    song, audio = item
-                    evidence = timing_windows(song, audio, path, alignment)
-                    return None if evidence["status"] == "measured" else song["section"]
-
-                failed = [slot for slot in map_recordings(verify_balanced_clock, changed_matches) if slot]
-                require(not failed, f"{', '.join(failed)} · 音量处理后音画复测未通过。核对原始录音，或保留原音乐。")
             if args.balance_video:
                 path, levels = balance_audio(path, work / "video.mp4", args.lufs, video=True)
                 loudness.append({"section": "video", **levels})
+            print(f"{name} · 编码前复测各小节音画时钟", file=sys.stderr, flush=True)
+            check_started = perf_counter()
+            preflight_problems.extend(chapter_preflight(manifest["music"], files, path, original_picture["duration"]))
+            preflight_seconds = perf_counter() - check_started
+        require(not preflight_problems,
+                f"{name} 暂缓制作，尚未开始视频编码。\n" + "\n".join(preflight_problems))
+        if config.get("video"):
+            print(f"{name} · 处理视频（{args.video_quality}）", file=sys.stderr, flush=True)
             if args.video_quality != "original":
                 height, bitrate = VIDEO_PROFILES[args.video_quality]
                 encode = efficient_video if args.video_quality == "efficient" else optimize_video
@@ -984,7 +1023,7 @@ def package(args):
             video_quality = {"preset": args.video_quality, "source": original_picture, "output": encoded_picture}
             manifest["video"] = {"asset": identity(path), "duration": round(encoded_picture["duration"], 6)}
             files.append(path)
-        video_seconds = perf_counter() - started - audio_seconds
+        video_seconds = perf_counter() - started - audio_seconds - preflight_seconds
         if pdf_path:
             manifest["pdf"] = {"asset": source_pdf["source"], "pageCount": source_pdf["pageCount"]}
             files.append(pdf_path)
@@ -1015,7 +1054,8 @@ def package(args):
         os.link(pending, output)
     receipt.update(output=str(output.resolve()), loudness=loudness, videoQuality=video_quality,
                    seconds=round(perf_counter() - started, 2), audioSeconds=round(audio_seconds, 2),
-                   videoSeconds=round(video_seconds, 2))
+                   videoSeconds=round(video_seconds, 2), mediaPreflightSeconds=round(preflight_seconds, 2),
+                   musicPolicy="keepOriginalDynamics" if args.keep_music else "targetLoudness")
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
     return output
 
@@ -1114,15 +1154,20 @@ def extract_manifest(args):
     write_json(args.output, manifest)
 
 
-def rebalance_recording(source, manifest, work, selector, target):
+def recording_index(songs, selector):
     section, separator, variant = selector.partition(":")
-    matches = [(index, song) for index, song in enumerate(manifest["music"])
+    matches = [index for index, song in enumerate(songs)
                if song["section"] == section.upper() and (not separator or song["variant"] == variant)]
     require(len(matches) == 1, f"{selector} must identify one recording. Use SECTION:variant for a shared slot.")
-    index, song = matches[0]
-    asset = song["asset"]
+    return matches[0]
+
+
+def rebalance_recording(source, source_manifest, song, work, index, target):
+    section = song["section"]
+    source_songs = source_manifest["music"]
+    asset = source_songs[index]["asset"]
     beginning = source.tell()
-    offset = sum(row["asset"]["bytes"] for row in manifest["music"][:index])
+    offset = sum(row["asset"]["bytes"] for row in source_songs[:index])
     source.seek(beginning + offset)
     original = work / f"original-{index}.{asset['ext']}"
     with original.open("xb") as stream:
@@ -1134,7 +1179,7 @@ def rebalance_recording(source, manifest, work, selector, target):
     song.update(asset=identity(output), duration=round(duration, 6))
     if (chapter := song.get("chapter")) and chapter["evidence"] == "audioMatched":
         chapter["end"] = round(chapter["start"] + duration, 6)
-    return index, output, levels
+    return output, levels
 
 
 def revise(args):
@@ -1169,11 +1214,19 @@ def revise(args):
         old_assets = validate_manifest(old)
         require(old_assets == reviewed_assets, "Changing media requires building a new package from source")
         replacements = {}
-        levels = None
-        if selector := getattr(args, "rebalance", None):
-            require(-24 <= args.lufs <= -12, "Select a loudness target between -24 and -12 LUFS")
-            index, audio, levels = rebalance_recording(source, updated, Path(directory), selector, args.lufs)
+        repairs = []
+        normalizing = getattr(args, "rebalance", None) or []
+        reducing_peaks = getattr(args, "reduce_peak", None) or []
+        if isinstance(normalizing, str):
+            normalizing = [normalizing]
+        require(not normalizing or -24 <= args.lufs <= -12, "Select a loudness target between -24 and -12 LUFS")
+        selections = [(item, args.lufs) for item in normalizing] + [(item, None) for item in reducing_peaks]
+        for selector, target in selections:
+            index = recording_index(updated["music"], selector)
+            require(index not in replacements, f"{selector} was selected more than once.")
+            audio, levels = rebalance_recording(source, old, updated["music"][index], Path(directory), index, target)
             replacements[index] = audio
+            repairs.append({"recording": selector, "policy": "peakOnly" if target is None else "targetLoudness", **levels})
         assets = validate_manifest(updated)
         encoded = json.dumps(updated, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
         require(0 < len(encoded) <= MAX_MANIFEST and
@@ -1209,8 +1262,10 @@ def revise(args):
             os.fsync(stream.fileno())
         receipt = verify(temporary)
         os.link(temporary, output)
-    if levels is not None:
-        receipt["rebalanced"] = {"recording": selector, **levels}
+    if repairs:
+        receipt["musicRepairs"] = repairs
+        if len(repairs) == 1 and repairs[0]["policy"] == "targetLoudness":
+            receipt["rebalanced"] = {key: value for key, value in repairs[0].items() if key != "policy"}
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
 
 
@@ -1229,7 +1284,9 @@ def doctor():
 
 def add_media_options(command):
     command.add_argument("--lufs", type=float, default=-16.0)
-    command.add_argument("--keep-music", action="store_true")
+    command.add_argument("--keep-music", action="store_true", help="Do not normalize relative loudness")
+    command.add_argument("--repair-music-peaks", action="store_true",
+                         help="With --keep-music, attenuate only recordings above 0 dBTP")
     command.add_argument("--balance-video", action="store_true")
     command.add_argument("--video-quality", choices=("efficient", "original", "ipad", "compact"), default="efficient")
     command.add_argument("--video-max-height", type=int, help="Override the selected preset's height limit")
@@ -1295,7 +1352,17 @@ def review_problems(review, *, source_limited=False):
 
 
 def check_review(args):
-    blockers = review_problems(read_json(args.review), source_limited=args.source_limited)
+    review = read_json(args.review)
+    blockers = review_problems(review, source_limited=args.source_limited)
+    if getattr(args, "measure_video", False) and review["plan"].get("video"):
+        video = same_source(review["plan"]["video"], review["video"]["source"])
+        songs, paths = [], []
+        for song, record in zip(review["plan"]["music"], review["tracks"], strict=True):
+            chapter = record.get("chapter") or {}
+            if chapter.get("approved") is True and chapter.get("evidence") == "audioMatched":
+                paths.append(same_source(song["file"], record["source"]))
+                songs.append({**song, "duration": record["duration"], "chapter": chapter})
+        blockers.extend(chapter_preflight(songs, paths, video, review["video"]["duration"]))
     print(json.dumps({"readyToBuild": not blockers, "blockers": blockers}, ensure_ascii=False, indent=2))
     if blockers:
         raise SystemExit(2)
@@ -1401,6 +1468,8 @@ def main():
     p = commands.add_parser("check-review", help="List unfinished source checks before encoding")
     p.add_argument("review", type=Path)
     p.add_argument("--source-limited", action="store_true")
+    p.add_argument("--measure-video", action="store_true",
+                   help="Remeasure approved video chapters against the selected source files")
     p = commands.add_parser("verify")
     p.add_argument("package", type=Path)
     p = commands.add_parser("manifest", help="Extract a private editable copy of a package manifest")
@@ -1415,8 +1484,10 @@ def main():
     cover_options.add_argument("--cover", type=Path, help="Use an explicitly approved replacement cover")
     cover_options.add_argument("--without-cover", action="store_true", help="Remove the previous cover")
     p.add_argument("--class-templates", type=Path, help="Reviewed class-templates.json file to add or replace")
-    p.add_argument("--rebalance", metavar="SECTION[:VARIANT]",
-                   help="Rebalance the same recording in the existing package and keep the other bytes")
+    p.add_argument("--rebalance", action="append", metavar="SECTION[:VARIANT]",
+                   help="Normalize this recording, leaving other media unchanged. Repeat to select more.")
+    p.add_argument("--reduce-peak", action="append", metavar="SECTION[:VARIANT]",
+                   help="Attenuate this recording only if its peak exceeds 0 dBTP. Repeat to select more.")
     p.add_argument("--lufs", type=float, default=-16.0, help="Target used by --rebalance (default: -16 LUFS)")
     p = commands.add_parser("submit", help="Create a clean batch with verified packages, QA images and fingerprints")
     p.add_argument("packages", type=Path, nargs="+")
@@ -1427,6 +1498,11 @@ def main():
                    help="Deliver a creator-confirmed limited scope when original materials are genuinely absent")
     p.add_argument("--screen-subtitles", choices=("present", "absent"),
                    help="Visual judgment after examining the samples of a single exact package")
+    loudness = p.add_mutually_exclusive_group()
+    loudness.add_argument("--keep-music", action="store_true",
+                          help="Keep relative loudness; still verify decoding and peaks")
+    loudness.add_argument("--target-lufs", type=float,
+                          help="Verify against the producer's chosen loudness target")
     args = parser.parse_args()
     try:
         if args.command in {"finish", "submit"} and args.workspace is not None:

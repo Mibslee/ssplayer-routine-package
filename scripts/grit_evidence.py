@@ -233,17 +233,18 @@ def grit_source_evidence(path, songs, routine):
         issues.append(f"{'、'.join(ambiguous)} 对应同号或同名的多条 GRIT 录音，需要核对来源课型。")
 
     def propose(course, references, minutes, sources, seconds=None):
-        name = f"GRIT {course.title()} {routine}"
+        name = f"GRIT {course.title()}"
+        source_name = f"{name} {routine}"
         missing = [f"{source.title()} T{number}" for source, number in references
                    if (source, number) not in matched]
         if missing:
-            issues.append(f"{name} · 原谱第 {sources[0]} 页缺少可唯一核对的录音 · {'、'.join(missing)}")
+            issues.append(f"{source_name} · 原谱第 {sources[0]} 页缺少可唯一核对的录音 · {'、'.join(missing)}")
             return
         slots = []
         for identity in references:
             section = matched[identity]
             if not (package := re.fullmatch(r"T([1-9]\d{0,2})[A-Z]?", section)):
-                issues.append(f"{name} · 包内小节 {section} 无法映射。")
+                issues.append(f"{source_name} · 包内小节 {section} 无法映射。")
                 return
             slot = {"sectionNumbers": [int(package[1])]}
             if section[-1].isalpha():
@@ -251,6 +252,8 @@ def grit_source_evidence(path, songs, routine):
             if function := tracks[section].get("sectionFunction"):
                 slot["name"] = function["name"]
             slots.append(slot)
+        # Keep the original release-specific verification key and physical
+        # source page. The visible format is shared across equivalent releases.
         key = f"grit-{course.lower()}-{routine}"
         templates.append({"key": key, "name": name, "minutes": minutes, "page": sources[0],
                           "slots": slots, "approved": True})

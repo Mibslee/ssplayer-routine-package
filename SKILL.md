@@ -3,7 +3,7 @@ name: ssplayer-package-creator
 description: "Create and verify local SSplayer routine packages from music, video, choreography PDF and artwork. Resolve source identity, recording variants, exercise timing, original pages and class formats before preparing a contribution batch."
 metadata:
   display-name: ssplayer_package_creator
-  version: "1.7.5"
+  version: "1.7.6"
 ---
 
 # ssplayer_package_creator
@@ -27,7 +27,7 @@ The [setup guide](references/agent-setup.md) explains installation and copyable 
 3. Use absolute timestamps as starts. Treat printed durations, beat counts, held poses and overlapping exercises according to the layout. Accumulate consecutive duration rows only, with a verified recording anchor. Compare early, middle and late points against the exact audio or video. Expand explicit repeats and preserve direction, counts, coaching notes and colors. Keep an open-ended AMRAP group together at its measured start. If tools suggest no cues, look for a readable exercise table, continuation or other evidence before concluding the source lacks timing.
    Compare the visual action and CTS columns row by row. Preserve each count, including blank cells next to instructions and variants. Use `actionRows` when every count can be matched to an action line from the layout. Keep independent count lines and avoid assigning unsupported positions when alignment is ambiguous. Inspect detached captions and teaching footnotes separately from the last timed group.
 4. Verify video chapters against the individual recording and time base. Follow the [audio and video clock guide](references/video-clock.md) for a fixed offset, clock drift, a different recording or a chapter that can only be verified visually. Keep the documented evidence level. Verify each printed class format against its required roles and the actual packaged slots, including reused tracks, exact A/B sequences, alternatives and Express recordings.
-   For scheduling, use the same printed name for the same course family and duration across releases. Give each slot a meaningful function label independent of its T number. Keep the exact ordered codes, choices, optional slots and recording rules from that release. The app groups matching functions for display and uses the selected routine's original mapping for prefill.
+   For scheduling, use the same course name and duration across routines that share the same format, such as `GRIT Strength`. Keep the routine number in the package identity and retain duration and variant labels that describe the class itself. Give each slot a meaningful function label independent of its T number. Keep the exact ordered codes, choices, optional slots and recording rules from each release so the app can group the format and prefill from the selected routine.
 5. Treat extracted rows and formats as drafts. When a result looks wrong, inspect its page, column or recording and correct the affected recording, page selection, rows or slot order in the review. Check a format against the available recordings before starting video encoding. Run `check-review` and use the [quality checklist](references/quality-check.md) for duration tables, mixed formats and split recordings. Use `--source-limited` only when the creator accepts a limitation that the source evidence establishes. Keep parser uncertainty eligible for repair.
 
 ## Build or resume the right step

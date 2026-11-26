@@ -33,7 +33,7 @@ from score_evidence import ocr_languages
 
 
 MAGIC = b"SSRT0001"
-VERSION = "1.7.5"
+VERSION = "1.7.6"
 MIB = 1024 * 1024
 MAX_MANIFEST = 4 * MIB
 MAX_PACKAGE = 12 * 1024 * MIB

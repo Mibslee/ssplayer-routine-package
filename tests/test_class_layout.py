@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 from test_mixed_pdf import write_pdf
+from grit_evidence import grit_source_evidence
 from media_analysis import class_format_suggestions
 from qa_preview import class_recording_conditions
 from ssroutine import check_class_template_sources
@@ -16,6 +17,43 @@ def section_order(template):
 
 
 class ClassLayoutTests(unittest.TestCase):
+    def test_grit_name_is_reusable_and_existing_qualified_titles_keep_exact_source_checks(self):
+        songs = [{"section": "T1", "title": "First Song", "variant": "standard"},
+                 {"section": "T3", "title": "Second Song", "variant": "standard"}]
+        with tempfile.TemporaryDirectory() as directory:
+            for routine in ("57", "58"):
+                with self.subTest(routine=routine):
+                    score = Path(directory) / f"grit-{routine}.pdf"
+                    write_pdf(score, [
+                        [(100, f"LES MILLS GRIT {routine}")],
+                        [(100, "GRIT STRENGTH"), (125, "MUSIC"),
+                         (150, "01. WARM-UP"), (175, "02. STRENGTH"), (220, "DECLARATION OF INTENT")],
+                        [(90, "01. WARM-UP"), (150, "30-minute HIIT workout"), (200, "EXERCISE")],
+                        [(100, "01. First Song 3:20 mins"), (130, "TECHNIQUE AND COACHING")],
+                        [(90, "02. STRENGTH"), (150, "EXERCISE")],
+                        [(100, "02. Second Song 3:20 mins"), (130, "TECHNIQUE AND COACHING")],
+                        [(100, "GRIT ATHLETIC FORMAT"),
+                         (125, f"1 GRIT STRENGTH {routine} (TRACK 2) Strength"),
+                         (150, f"2 GRIT STRENGTH {routine} (TRACK 1) Warm-up"),
+                         (175, "Total time: 29:41")],
+                    ])
+                    evidence = grit_source_evidence(score, songs, routine)
+                    expected = evidence["templates"]
+                    self.assertEqual([item["name"] for item in expected], ["GRIT Strength", "GRIT Athletic"])
+                    self.assertEqual([item["key"] for item in expected],
+                                     [f"grit-strength-{routine}", f"grit-athletic-{routine}"])
+                    self.assertEqual([section_order(item) for item in expected],
+                                     [[["T1"], ["T3"]], [["T3"], ["T1"]]])
+                    self.assertEqual([item["page"] for item in expected], [2, 7])
+                    self.assertEqual(check_class_template_sources(score, expected, include_omissions=True,
+                                                                  source_evidence=evidence), [])
+                    old_titles = [{**item, "name": f"{item['name']} {routine}"} for item in expected]
+                    self.assertEqual(check_class_template_sources(score, old_titles, include_omissions=True,
+                                                                  source_evidence=evidence), [])
+                    bad = {**old_titles[0], "slots": list(reversed(old_titles[0]["slots"]))}
+                    with self.assertRaisesRegex(ValueError, "原谱不符"):
+                        check_class_template_sources(score, [bad], source_evidence=evidence)
+
     def test_asymmetric_columns_keep_four_formats_and_real_ab_order(self):
         with tempfile.TemporaryDirectory() as directory:
             score = Path(directory) / "class-formats.pdf"

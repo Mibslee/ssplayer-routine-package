@@ -17,6 +17,7 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
+from bodypump import block_boundaries, expand_blocks, phrase_words
 from score_evidence import (ScorePageReader, header_labels, normalized_label, numbered_ocr_heading,
                             row_lines)
 
@@ -394,14 +395,26 @@ def timing_windows(song, audio, video, alignment):
                 and max(offsets) - min(offsets) <= 120)
 
     discovered = max(triples(windows + measure_positions((0.11, 0.41, 0.88))), key=strength, default=())
-    if not discovered:
-        return {"status": "review", "windows": windows}
-    checked = alternate + measure_positions((0.22, 0.59, 0.94))
-    if has_clock_conflict():
-        return {"status": "review", "windows": windows}
-    verified = max((items for items in triples(checked) if agrees(discovered, items)), key=strength, default=())
-    if verified:
-        return {"status": "measured", "windows": list(verified)}
+    if discovered:
+        checked = alternate + measure_positions((0.22, 0.59, 0.94))
+        if has_clock_conflict():
+            return {"status": "review", "windows": windows}
+        verified = max((items for items in triples(checked) if agrees(discovered, items)), key=strength, default=())
+        if verified:
+            return {"status": "measured", "windows": list(verified)}
+
+    # Longer windows distinguish a steady video clock from the adjacent repeat
+    # when instructor audio and a strongly repetitive backing track compete.
+    # Preserve the same two independent triples and the same quality gates.
+    if length >= 150:
+        width = min(9.0, length * .06)
+        discovery = tuple(triples(measure_positions((.06, .14, .18, .34, .43, .70, .79))))
+        confirmation = tuple(triples(measure_positions((.10, .25, .32, .52, .61, .72, .86, .91, .93))))
+        if not has_clock_conflict():
+            verified = max((check for guess in discovery for check in confirmation if agrees(guess, check)),
+                           key=strength, default=())
+            if verified:
+                return {"status": "measured", "windows": list(verified)}
     return {"status": "review", "windows": windows}
 
 
@@ -553,6 +566,11 @@ def score_action_rows(actions, count_lines):
 def read_page_rows(page, words, page_number, parse_time, definitions=None):
     if definitions is None:
         definitions = {}
+    bodypump_score = any(
+        re.search(r"\bBODY\s*PUMP\s*(?:[™®]\s*)?(?:\d+|UNITED)\b",
+                  " ".join(word["text"] for word in line), re.I)
+        for line in row_lines(words) if line[0]["top"] < page.height * .14
+        or line[0]["top"] > page.height * .86)
     for line in row_lines(words):
         headers = {}
         for word in line:
@@ -560,7 +578,8 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
                 headers[label] = word
         if "MUSIC" not in headers or "EXERCISE" not in headers:
             continue
-        if not any(h in headers for h in ("CTS", "REPS", "LEVEL")):
+        bp_layout = bodypump_score and any("SEQUENCE/EXERCISE" in word["text"].upper() for word in line)
+        if not bp_layout and not any(h in headers for h in ("CTS", "REPS", "LEVEL")):
             continue
         def leading(key):
             return headers[key]["x0"] - 4 if key in headers else page.width
@@ -579,18 +598,24 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
         floor = line[0]["top"] + 5
         # Captions and copyright at the bottom are outside the choreography table.
         words = [w for w in words if floor < w["top"] < page.height * 0.92]
-        marks = sorted((w["top"], parse_time(w["text"])) for w in words
-                       if w["x0"] < music and parse_time(w["text"]) is not None)
+        def source_time(text):
+            if bp_layout and re.fullmatch(r"\d{1,2}\.[0-5]\d", text):
+                text = text.replace(".", ":")
+            return parse_time(text)
+        marks = sorted((w["top"], source_time(w["text"])) for w in words
+                       if w["x0"] < music and source_time(w["text"]) is not None)
+        blocks = block_boundaries(page, words, marks, exercise) if bp_layout else {}
         rows = []
         for i, (top, time) in enumerate(marks):
             limit = marks[i + 1][0] - 3 if i + 1 < len(marks) else page.height * 0.92
             body = [w for w in words if top - 3 <= w["top"] < limit]
             if i == len(marks) - 1:
                 body = detached_score_footer(body, exercise, counts, page)
+            phrase = phrase_words(body, top, exercise) if bp_layout else []
             def column_lines(begin, end, top_bound=None, bottom_bound=None):
                 return row_lines([w for w in body if begin <= w["x0"] < end
                                   and (top_bound is None or w["top"] >= top_bound)
-                                  and (bottom_bound is None or w["top"] < bottom_bound)])
+                                  and (bottom_bound is None or w["top"] < bottom_bound) and w not in phrase])
             def column(begin, end, top_bound=None, bottom_bound=None):
                 return "\n".join(" ".join(w["text"] for w in line)
                                  for line in column_lines(begin, end, top_bound, bottom_bound))
@@ -609,6 +634,10 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
                        "music": column(music, min(sequence_left, counts)),
                        "counts": column(counts, count_end),
                        "repetitions": column(reps, level)}
+                if bp_layout and len(phrase) == 1:
+                    cue["counts"] = phrase[0]["text"]
+                if time in blocks:
+                    cue["block"] = blocks[time]
                 if expanded := expand_sequence(action, definitions):
                     cue["action"], qualifier = expanded
                     if qualifier:
@@ -649,7 +678,7 @@ def recording_identity(song):
 def normalized_function_title(name):
     value = unicodedata.normalize("NFKC", name).casefold()
     value = re.sub(r"\s*[\u2010-\u2014\u2212-]\s*", "-", value)
-    return " ".join(value.split())
+    return re.sub(r"\s*/\s*", " / ", " ".join(value.split()))
 
 
 LOCAL_NUMBERED_HEADING = re.compile(
@@ -723,6 +752,16 @@ def localized_section_headings(words, width):
 
 def choreography_headings(words, width, alignment, parsed):
     if heading := section_heading(words, width, alignment, parsed):
+        text = " ".join(word["text"] for line in row_lines(words) for word in line)
+        if re.search(r"\bBODY\s*PUMP\s*(?:[™®]\s*)?(?:\d+|UNITED)\b", text, re.I):
+            combined = normalized_function_title(heading.title) in {"triceps / biceps", "lunges / shoulders"}
+            if combined and heading.variant_source in {"default", "structured"}:
+                heading = SectionHeading(heading.number, heading.segment, "combo45", "explicit", heading.title)
+            if (heading.variant in {"standard", "combo45"}
+                    and re.search(rf"same choreography when teaching Track\s+0*{heading.number}\b", text, re.I)
+                    and re.search(r"alternative song|replacement", text, re.I)):
+                alternate = "combo45Alternative" if heading.variant == "combo45" else "alternative"
+                return [heading, SectionHeading(heading.number, heading.segment, alternate, "explicit", heading.title)]
         return [heading]
     return localized_section_headings(words, width)
 
@@ -1023,6 +1062,10 @@ def class_format_suggestions(path, pages=None):
                 if match[2]:
                     slot.update(variantPreference="alternative", enforcesVariant=True,
                                 requiredDurationMinutes=current["minutes"])
+                elif edition := re.match(r"^\((\d{2})(?:\s*MIN)?\)\s*(.*)$", rest, re.I):
+                    slot["requiredDurationMinutes"] = int(edition[1])
+                    if edition[2]:
+                        slot["name"] = edition[2]
                 current["slots"].append(slot)
             elif current is not None and (re.match(r"^TRACK\s*\(", line, re.I)
                                           or (raw.ocr_words and re.match(r"^TRACK\b", line, re.I))):
@@ -1138,6 +1181,9 @@ def class_format_suggestions(path, pages=None):
             suffix = ""
         elif any(slot.get("enforcesVariant") for slot in template["slots"]):
             label += " Express"
+        elif any(slot.get("requiredDurationMinutes") == minutes for slot in template["slots"]):
+            label += " 组合"
+            suffix = ""
         if option:
             suffix = f"方案 {option}"
         template.update(key=f"{minutes}-{counts[minutes]}", name=f"{label} {suffix}".strip(), approved=False)
@@ -1231,11 +1277,17 @@ def extract_cues(path, songs, ocr=False, *, page_numbers=None):
             valid = all(0 <= row["time"] <= song["duration"] for row in rows)
             valid = valid and all(a["time"] <= b["time"] for a, b in zip(rows, rows[1:]))
             repeats = unresolved_repeat_times(rows)
+            expansion = []
+            if valid and repeats and any("block" in row for row in rows):
+                rows, expansion = expand_blocks(rows, song["duration"])
+            pending = unresolved_repeat_times(rows)
             status = "unresolved"
             if valid and rows:
-                status = "needsExpansion" if repeats else "review"
+                status = "needsExpansion" if pending else "review"
             result.append({"rows": rows, "pages": list(pages), "approved": False,
                            "status": status, "structuralRepeatTimes": repeats})
+            if expansion:
+                result[-1]["blockExpansion"] = expansion
             selected = set(song.get("pdfPages") or ())
             if song.get("pdfPage"):
                 selected.add(song["pdfPage"])

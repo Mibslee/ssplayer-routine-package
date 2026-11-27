@@ -184,7 +184,9 @@ def inspect_tracks(manifest, paths, optional):
         return {"section": song["section"], "variant": song["variant"], "title": song.get("title"),
                 "duration": song["duration"], "pdfPage": song.get("pdfPage")
                 or (song["cues"][0]["page"] if rows else None), "cueRows": rows,
-                "sectionFunction": song.get("sectionFunction"), "chapter": chapter, **measured, **timing}
+                "sectionFunction": song.get("sectionFunction"), "chapter": chapter,
+                "sourceVariantWithoutVideo": song.get("sourceVariantWithoutVideo"),
+                "visualClockSightings": song.get("visualClockSightings"), **measured, **timing}
 
     return map_recordings(inspect, zip(manifest["music"], paths))
 
@@ -685,8 +687,10 @@ def generate(args, *, sealed_copy=None, overview_only=False):
         def is_supplement(track):
             return track["variant"] == "standard" and track["section"] in supplemental
 
-        missing_chapters = [track for track in tracks if not track["chapter"] and not is_supplement(track)]
-        uncertain_chapters = [track for track in tracks if track["status"] in {"approximate", "visuallyConfirmed"}]
+        missing_chapters = [track for track in tracks if not track["chapter"] and not is_supplement(track)
+                            and not track.get("sourceVariantWithoutVideo")]
+        uncertain_chapters = [track for track in tracks if track["status"] in {"approximate", "visuallyConfirmed"}
+                              and not track.get("visualClockSightings")]
         missing_cues = [track for track in tracks if not track["cueRows"] and not is_supplement(track)]
         missing_functions = [track for track in tracks if not track["sectionFunction"]]
         if missing_functions:
@@ -707,6 +711,12 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                       else f"{sections_for(missing_cues)} 未提供可用动作时间线。")
             add_source_limitation(report, "timeline", "no_timed_source", detail + "音乐仍可播放和排课。")
         for track in tracks:
+            if track.get("visualClockSightings"):
+                add_source_limitation(report, "video", "source_visual_clock",
+                                      f"{section_title(track)} 已复核前中尾画面时钟，按视频自身计时定位。")
+            if track.get("sourceVariantWithoutVideo"):
+                add_source_limitation(report, "video", "source_variant_audio_only",
+                                      f"{section_title(track)} 为音频备选版，原教学视频无此录音。")
             if is_supplement(track):
                 track["supplementary"] = True
                 label = section_title(track)

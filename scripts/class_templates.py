@@ -91,7 +91,8 @@ def format_columns(words, width, row_lines, source_row):
                if any(is_header for _, is_header in group) or len(group) >= 3]
     # Adjacent annotations and table borders can sit just to the left of a
     # row label. Leave that margin with the column it belongs to.
-    left_edges = [0, *(x - gap for x in anchors[1:])]
+    first_lane = anchors[0] - gap if anchors[0] >= width * .40 else 0
+    left_edges = [first_lane, *(x - gap for x in anchors[1:])]
     limit = min((x - gap / 2 for x, _, _ in sidebars if x - anchors[-1] >= width * 0.12), default=width)
     right_edges = [*left_edges[1:], limit]
     return [list(map(FormatLine.positioned, row_lines([word for word in words if start <= word["x0"] < end])))

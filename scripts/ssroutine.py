@@ -33,7 +33,7 @@ from score_evidence import ocr_languages
 
 
 MAGIC = b"SSRT0001"
-VERSION = "1.7.6"
+VERSION = "1.7.7"
 MIB = 1024 * 1024
 MAX_MANIFEST = 4 * MIB
 MAX_PACKAGE = 12 * 1024 * MIB
@@ -539,7 +539,9 @@ def analyze(args):
                 if intervals_for_track := intervals.get(song["section"]):
                     record["intervalReview"] = intervals_for_track
             stem = track_stem(Path(song["file"]).stem, program, config["routine"])
-            if song["variant"] == "alternative" and re.match(r"(?i)^(?:EXPRESS|E)[ ._-]*\d+", stem):
+            if song["variant"] == "combo45" and (record.get("sectionFunction") or {}).get("page"):
+                record["classEdition"] = {"minutes": 45, "page": record["sectionFunction"]["page"], "approved": False}
+            elif song["variant"] == "alternative" and re.match(r"(?i)^(?:EXPRESS|E)[ ._-]*\d+", stem):
                 number = int(re.search(r"\d+", song["section"])[0])
                 editions = {(slot["requiredDurationMinutes"], template["page"])
                             for template in review["classTemplates"] for slot in template["slots"]
@@ -586,6 +588,32 @@ def same_source(value, expected):
 
 def source_selection(song):
     return {key: song[key] for key in ("section", "variant", "catalogTrackID", "pdfPages") if key in song}
+
+
+def confirmed_visual_clock(chapter, sightings, duration):
+    """Accept distinct early, middle and late sightings of the printed video clock."""
+    if not chapter or chapter.get("evidence") != "visuallyConfirmed" or not isinstance(sightings, list):
+        return False
+    if not 3 <= len(sightings) <= 15 or not isinstance(duration, (int, float)) or duration <= 0:
+        return False
+    covered = set()
+    for row in sightings:
+        if not isinstance(row, dict):
+            return False
+        observed, video_at = row.get("trackSecond"), row.get("videoSecond")
+        if (type(observed) not in (int, float) or type(video_at) not in (int, float)
+                or not 0 <= observed < duration or not chapter["start"] <= video_at <= chapter["end"]
+                or abs(video_at - chapter["start"] - observed) > 1.1):
+            return False
+        covered.add(min(2, int(observed * 3 / duration)))
+    return len(covered) == 3
+
+
+def audio_only_score_variant(song, findings):
+    return (song["variant"] in {"alternative", "bonus", "combo45Alternative", "combo45Bonus"}
+            and findings.get("sourceVariantWithoutVideo") is True
+            and findings.get("chapter", {}).get("approved") is not True
+            and findings.get("sectionFunction", {}).get("approved") is True)
 
 
 def approved_timeline(song, findings):
@@ -851,6 +879,14 @@ def validate_manifest(value):
                     f"Invalid original PDF opening page for {item['section']}")
         if (function := item.get("sectionFunction")) is not None:
             validate_section_function(function, pdf, item["section"])
+        if sightings := item.get("visualClockSightings"):
+            require(confirmed_visual_clock(item.get("chapter"), sightings, item["duration"]),
+                    f"{item['section']} does not have consistent early, middle and late video clock evidence")
+        if item.get("sourceVariantWithoutVideo") is not None:
+            require(item["sourceVariantWithoutVideo"] is True and video and not item.get("chapter")
+                    and item.get("sectionFunction")
+                    and item["variant"] in {"alternative", "bonus", "combo45Alternative", "combo45Bonus"},
+                    "Only a reviewed alternate recording may omit its chapter")
         rows = item.get("cues")
         require(rows is None or (pdf and isinstance(rows, list) and 1 <= len(rows) <= 4096),
                 "Cues require a bounded source PDF")
@@ -1037,6 +1073,10 @@ def package(args, *, review=None, content=None):
                 row["chapter"] = {key: chapter[key] for key in ("start", "end", "evidence")}
                 if chapter["evidence"] == "audioMatched":
                     row["chapter"]["end"] = round(chapter["start"] + duration, 6)
+                elif confirmed_visual_clock(chapter, findings.get("visualClockSightings"), duration):
+                    row["visualClockSightings"] = findings["visualClockSightings"]
+            if audio_only_score_variant(song, findings):
+                row["sourceVariantWithoutVideo"] = True
             if timeline:
                 row["cues"] = timeline
             if function:
@@ -1338,8 +1378,9 @@ def review_problems(review, *, source_limited=False):
         section = song["section"]
         supplement = record.get("supplementary") is True
         chapter = record.get("chapter") or {}
-        if video and not supplement and (chapter.get("evidence") != "audioMatched"
-                                         or chapter.get("approved") is not True):
+        video_clock = chapter.get("approved") is True and (chapter.get("evidence") == "audioMatched"
+            or confirmed_visual_clock(chapter, record.get("visualClockSightings"), record["duration"]))
+        if video and not supplement and not audio_only_score_variant(song, record) and not video_clock:
             problems.append(f"{section} · 教学视频的曲内时钟未核实。")
         if pdf and (record.get("sectionFunction") or {}).get("approved") is not True:
             problems.append(f"{section} · 尚未核实小节功能。")

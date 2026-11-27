@@ -41,3 +41,8 @@ ffmpeg -v error -ss 657.5 -i "/path/to/source.mp4" -t 10 -map 0:a:0 -ac 1 -ar 40
 - 正式带视频的共创包仍要求普通音乐小节通过曲内时钟门禁。只有视觉或近似证据时，先交代哪些小节可以按视频跳转、哪些不能跟随，并保留复核记录。已有视频按实际素材记录。`--source-limited` 的范围是经确认的原始资料缺项，已提供视频仍需核验曲内时钟。修正证据后再走正式投稿和签注。
 
 见[共创包字段](format.md#music-and-analysis)及[制作和质检](quality-check.md)。
+
+
+## 原视频的独立计时
+
+同一发行版若可读到画面自带的小节名称和计时器，逐一比对开头、中段和尾段。保留 original 视频、音乐与时间基准，在相应小节的审阅中设 `chapter.evidence: "visuallyConfirmed"`，记录至少三个不同分段的 `visualClockSightings`。每条记录包含 `videoSecond`（整段视频的取帧时刻）与 `trackSecond`（画面计时器读数）。检查这些读数是否支持同一个小节起点，并保留相应证据帧备查。质检按视频自身时钟标注该曲。原视频确实没有拍摄的备选录音可标 `sourceVariantWithoutVideo`，仍需核对该录音、动作和原谱入口。

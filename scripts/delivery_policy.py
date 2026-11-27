@@ -11,6 +11,8 @@ SUPPLEMENTARY_CHECKS = {"video", "timeline", "pdf", "structure"}
 def accepted_limitation(manifest, check, code, source_limited):
     if code == "supplementary_outro":
         return check in SUPPLEMENTARY_CHECKS
+    if code in {"source_variant_audio_only", "source_visual_clock"}:
+        return check == "video" and bool(manifest.get("video"))
     if not source_limited:
         return False
     if code == "no_timed_score":

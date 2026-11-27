@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -17,7 +18,7 @@ import tempfile
 import unicodedata
 from pathlib import Path
 
-from bodypump import block_boundaries, expand_blocks, phrase_words
+from bodypump import block_boundaries, expand_blocks, phrase_size, phrase_words, mirror
 from score_evidence import (ScorePageReader, header_labels, normalized_label, numbered_ocr_heading,
                             row_lines)
 
@@ -27,8 +28,9 @@ SAMPLE_POSITIONS = ((0.14, "前段"), (0.48, "中段"), (0.80, "尾段"))
 STRUCTURAL_REPEAT = re.compile(
     r"\b(?:REPEAT|RPT)\s+(?:(?:THE\s+|LUNGE\s+)?(?:BLOCKS?|SEQUENCES?|COMBOS?|SECTIONS?|PARTS?)\s+"
     r"(?:\d+|[A-Z][0-9¹²³⁴⁵⁶⁷⁸⁹⁰]*)(?!\w)|[A-Z][0-9]*\s*(?:[-–—&+]|AND|TO)\s*[A-Z][0-9]*\b)"
+    r"|^(?:(?:REPEAT|RPT)\s+)?SEQ\s*UENCES?\s+[A-Z][0-9]{0,2}(?=\s*(?:,|AND\b))"
     r"|(?:重复|重做)\s*(?:第\s*)?(?:段落|部分|组合|区块|小节|段)\s*[A-Z0-9一二三四五六七八九十]",
-    re.IGNORECASE,
+    re.IGNORECASE | re.MULTILINE,
 )
 
 
@@ -130,8 +132,14 @@ def original_peak_notice(label, peak):
 
 
 def picture_stream(media):
-    return next(stream for stream in media["streams"] if stream["codec_type"] == "video"
-                and not stream.get("disposition", {}).get("attached_pic"))
+    pictures = [stream for stream in media["streams"] if stream["codec_type"] == "video"
+                and not stream.get("disposition", {}).get("attached_pic")]
+    if len(pictures) == 1:
+        return pictures[0]
+    preferred = [stream for stream in pictures if stream.get("disposition", {}).get("default") == 1]
+    if len(preferred) == 1:
+        return preferred[0]
+    raise ValueError("视频包含多个画面版本且未标记唯一默认轨，请先对比并选择可用的画面轨。")
 
 
 def video_info(path):
@@ -147,8 +155,8 @@ def video_info(path):
             "closedCaptions": picture.get("closed_captions") == 1}
 
 
-def video_timestamps(path):
-    packets = run("ffprobe", "-v", "error", "-select_streams", "V:0", "-show_packets",
+def video_timestamps(path, picture_index):
+    packets = run("ffprobe", "-v", "error", "-select_streams", str(picture_index), "-show_packets",
                   "-show_entries", "packet=pts_time", "-of", "csv=p=0", str(path))
     return sorted(float(line.split(b",")[0]) for line in packets.splitlines() if line.strip())
 
@@ -158,11 +166,35 @@ def stream_hashes(path, stream):
                "-c", "copy", "-f", "streamhash", "-hash", "sha256", "-").strip()
 
 
+def timed_text_packets(path, ordinal):
+    """MP4 remuxing may add empty samples where displayed subtitles end."""
+    packets = json.loads(run("ffprobe", "-v", "error", "-select_streams", f"s:{ordinal}",
+                             "-show_packets", "-show_entries", "packet=pts_time,duration_time,data_hash",
+                             "-show_data_hash", "sha256", "-of", "json", str(path))).get("packets", [])
+    empty = "SHA256:" + hashlib.sha256(b"\0\0").hexdigest()
+    return [packet for packet in packets if packet.get("data_hash") != empty]
+
+
+def same_subtitle_display(source, destination, streams):
+    for ordinal, stream in enumerate(streams):
+        if stream["codec_name"] != "mov_text":
+            return False
+        if timed_text_packets(source, ordinal) != timed_text_packets(destination, ordinal):
+            return False
+        command = ("ffmpeg", "-nostdin", "-v", "error")
+        output = ("-map", f"0:s:{ordinal}", "-f", "srt", "-")
+        if run(*command, "-i", str(source), *output) != run(*command, "-i", str(destination), *output):
+            return False
+    return True
+
+
 def video_quality_samples(source, encoded, duration, width, height):
     length = min(2.0, duration / 3)
     normalize = "format=yuv420p,settb=AVTB,setpts=PTS-STARTPTS"
-    graph = (f"[0:V:0]scale={width}:{height},{normalize}[reference];"
-             f"[1:V:0]{normalize}[test];"
+    before = picture_stream(probe(source, "video")[1])["index"]
+    after = picture_stream(probe(encoded, "video")[1])["index"]
+    graph = (f"[0:{before}]scale={width}:{height},{normalize}[reference];"
+             f"[1:{after}]{normalize}[test];"
              "[reference][test]ssim=stats_file=-:shortest=1[comparison]")
     scores = []
     for position in (0.12, 0.50, 0.84):
@@ -184,24 +216,11 @@ def efficient_video(source, destination, maximum_height, bitrate_kbps, codec):
     compatible = original["codec"] == codec and (codec != "hevc" or original.get("codecTag") == "hvc1")
     if maximum_height is None and bitrate_kbps is None and compatible:
         return source, {**original, "compression": "alreadyEfficient"}
-    if bitrate_kbps is None and codec == "hevc":
-        if existing_rate := original["pictureBitrateKbps"]:
-            bitrate_kbps = max(250, round(existing_rate * 0.85))
-    scores = []
-    try:
-        output, candidate = optimize_video(source, destination, maximum_height, bitrate_kbps, codec)
-        if candidate["bytes"] > original["bytes"] * 0.90:
-            raise ValueError("Video size savings were below 10%.")
-        scores = video_quality_samples(source, output, original["duration"],
-                                       candidate["width"], candidate["height"])
-        if min(scores) < 0.96:
-            raise ValueError("A sampled section did not meet the picture quality threshold.")
-    except ValueError as error:
+    output, candidate = optimize_video(source, destination, maximum_height, bitrate_kbps, codec)
+    scores = video_quality_samples(source, output, original["duration"], candidate["width"], candidate["height"])
+    if min(scores) < 0.96:
         destination.unlink(missing_ok=True)
-        picture = {**original, "compression": "keptOriginal", "reason": str(error)}
-        if scores:
-            picture["sampleSSIM"] = [round(score, 5) for score in scores]
-        return source, picture
+        raise ValueError("编码抽检发现画质下降。请调整编码质量后复测。")
     return output, {**candidate, "compression": "optimized", "sampleSSIM": [round(score, 5) for score in scores]}
 
 
@@ -210,11 +229,7 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
     if destination.exists() or destination.is_symlink():
         raise FileExistsError("Choose a new filename for the encoded video.")
     duration, before = probe(source, "video")
-    pictures = [stream for stream in before["streams"] if stream["codec_type"] == "video"
-                and not stream.get("disposition", {}).get("attached_pic")]
-    if len(pictures) != 1:
-        raise ValueError("Choose one camera stream or export with original video quality.")
-    picture = pictures[0]
+    picture = picture_stream(before)
     if picture.get("color_transfer") in {"smpte2084", "arib-std-b67"} or picture.get("pix_fmt") not in {
         "yuv420p", "yuvj420p", "nv12", "yuv422p", "yuv444p",
     }:
@@ -230,7 +245,7 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
         if picture["height"] > maximum_height or picture["height"] % 2:
             filter_graph = f"scale=-2:'trunc(min(ih,{maximum_height})/2)*2',{filter_graph}"
     arguments = ["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-n", "-copyts", "-i", str(source),
-                 "-map", "0:V:0", "-map", "0:a?", "-map", "0:s?", "-map_metadata", "0", "-map_chapters", "0",
+                 "-map", f"0:{picture['index']}", "-map", "0:a?", "-map", "0:s?", "-map_metadata", "0", "-map_chapters", "0",
                  "-c:a", "copy", "-c:s", "copy", "-vf", filter_graph, "-fps_mode", "passthrough",
                  "-avoid_negative_ts", "disabled", "-movflags", "+faststart"]
     if bitrate_kbps is not None:
@@ -263,9 +278,24 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
                 raise
             print(f"{error}\n将尝试软件编码", file=sys.stderr, flush=True)
 
+    verified = verify_video_conversion(source, destination, maximum_height, codec)
+    return destination, {**verified, "encoder": encoder}
+
+
+def video_chapters(path):
+    record = json.loads(run("ffprobe", "-v", "error", "-show_chapters", "-of", "json", str(path)))
+    return [(float(chapter["start_time"]), float(chapter["end_time"]), chapter.get("tags", {}).get("title"))
+            for chapter in record.get("chapters", ())]
+
+
+def verify_video_conversion(source, destination, maximum_height, codec):
+    """Recheck a candidate against the exact input before replacing packaged video."""
+    duration, before = probe(source, "video")
+    picture = picture_stream(before)
     final_duration, after = probe(destination, "video")
-    old_pts, new_pts = video_timestamps(source), video_timestamps(destination)
     new_picture = picture_stream(after)
+    old_pts = video_timestamps(source, picture["index"])
+    new_pts = video_timestamps(destination, new_picture["index"])
     if maximum_height is None:
         dimensions_match = ((new_picture["width"], new_picture["height"]) ==
                             (picture["width"], picture["height"]))
@@ -273,7 +303,8 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
         dimensions_match = new_picture["height"] <= maximum_height
     if (abs(duration - final_duration) > 0.06 or not old_pts or len(old_pts) != len(new_pts)
             or max(abs(first - second) for first, second in zip(old_pts, new_pts)) > 0.005
-            or not dimensions_match or new_picture["codec_name"] != codec):
+            or not dimensions_match or new_picture["codec_name"] != codec
+            or (codec == "hevc" and new_picture.get("codec_tag_string") != "hvc1")):
         raise ValueError("Compression moved the video clock or missed the quality limit.")
     for kind, stream in (("audio", "a"), ("subtitle", "s")):
         old_streams = [stream for stream in before["streams"] if stream["codec_type"] == kind]
@@ -286,8 +317,15 @@ def optimize_video(source, destination, maximum_height, bitrate_kbps, codec):
         ):
             raise ValueError(f"Compression changed a {kind} track or its start time.")
         if old_streams and stream_hashes(source, stream) != stream_hashes(destination, stream):
-            raise ValueError(f"Compression changed the original {kind} packets.")
-    return destination, {**video_info(destination), "encoder": encoder, "framesVerified": len(old_pts)}
+            if kind != "subtitle" or not same_subtitle_display(source, destination, old_streams):
+                raise ValueError(f"Compression changed the original {kind} packets.")
+    previous, encoded = video_chapters(source), video_chapters(destination)
+    if len(previous) != len(encoded) or any(
+        left[2] != right[2] or abs(left[0] - right[0]) > 0.015 or abs(left[1] - right[1]) > 0.015
+        for left, right in zip(previous, encoded)
+    ):
+        raise ValueError("Compression changed the video chapter titles or boundaries.")
+    return {**video_info(destination), "framesVerified": len(old_pts), "chaptersVerified": len(encoded)}
 
 
 def map_recordings(function, recordings):
@@ -296,16 +334,16 @@ def map_recordings(function, recordings):
         return list(pool.map(function, recordings))
 
 
-def decoded_window(path, start, seconds):
+def decoded_window(path, start, seconds, *, band=(170, 1650), audio_stream=0):
     import numpy as np
 
     data = run("ffmpeg", "-nostdin", "-v", "error", "-ss", f"{start:.6f}", "-i", str(path),
-               "-t", f"{seconds:.6f}", "-map", "0:a:0", "-ac", "1", "-ar", "4000", "-af",
-               "highpass=f=170,lowpass=f=1650", "-f", "f32le", "-")
+               "-t", f"{seconds:.6f}", "-map", f"0:a:{audio_stream}", "-ac", "1", "-ar", "4000", "-af",
+               f"highpass=f={band[0]},lowpass=f={band[1]}", "-f", "f32le", "-")
     return np.frombuffer(data, dtype="<f4").astype(np.float64)
 
 
-def timing_windows(song, audio, video, alignment):
+def match_clock_on_stream(song, audio, video, alignment, *, audio_stream=0):
     chapter = song.get("chapter")
     if not chapter or chapter["evidence"] != "audioMatched":
         return {"status": chapter["evidence"] if chapter else "unlocated", "windows": []}
@@ -316,13 +354,16 @@ def timing_windows(song, audio, video, alignment):
     margin = 2.5
     opposing = []
 
-    def measure_positions(positions):
+    def measure_positions(positions, *, band=None, length_override=None):
         windows = []
+        sample_width = length_override or width
+        options = {"band": band} if band else {}
         for part in positions:
             inside = length * part
             actual_margin = min(margin, start + inside)
-            a = decoded_window(audio, inside, width)
-            b = decoded_window(video, start + inside - actual_margin, width + 2 * actual_margin)
+            a = decoded_window(audio, inside, sample_width, **options)
+            video_options = {**options, "audio_stream": audio_stream} if audio_stream else options
+            b = decoded_window(video, start + inside - actual_margin, sample_width + 2 * actual_margin, **video_options)
             if len(a) < 600 or len(b) < len(a):
                 continue
             try:
@@ -415,7 +456,53 @@ def timing_windows(song, audio, video, alignment):
                            key=strength, default=())
             if verified:
                 return {"status": "measured", "windows": list(verified)}
+    if length >= 150 and not has_clock_conflict():
+        # Narration can dominate the usual band. Require strong bass matches
+        # and confirm the same clock with untouched windows above the bass.
+        long_width = min(15.0, length * .08)
+        bass = measure_positions((.10, .42, .71), band=(40, 145), length_override=long_width)
+        high = measure_positions((.26, .56, .86), band=(850, 1750), length_override=long_width)
+        if (len(bass) == len(high) == 3
+                and all(row["correlation"] >= .33 and row["runnerUpGap"] >= .075 for row in bass)
+                and all(row["correlation"] >= .07 and row["runnerUpGap"] >= .035 for row in high)
+                and max(abs(row["offsetMS"]) for row in bass + high) <= 35
+                and not has_clock_conflict()):
+            return {"status": "measured", "windows": bass + high, "method": "splitBands"}
+        if not has_clock_conflict():
+            # Prefer more independent music phrases when the announcer masks
+            # the entire upper band. Six clear peaks on distinct phrases
+            # provide two independent witnesses in every third of the track.
+            music_windows = measure_positions((.08, .15, .24, .36, .44, .52, .60, .68, .76, .84, .90),
+                                              band=(40, 145), length_override=long_width)
+            strong = [row for row in music_windows if abs(row["offsetMS"]) <= 35
+                      and row["correlation"] >= .22 and row["runnerUpGap"] >= .06]
+            by_region = [[row for row in strong if min(2, int(row["position"] * 3)) == part]
+                         for part in range(3)]
+            independent = [tuple(row for row in group) for region in by_region
+                           for group in combinations(region, 2)
+                           if abs(group[0]["position"] - group[1]["position"]) * length >= long_width]
+            for group in combinations(independent, 3):
+                confirmed = sorted((row for pair in group for row in pair), key=lambda row: row["position"])
+                if (len({min(2, int(row["position"] * 3)) for row in confirmed}) == 3
+                        and all((b["position"] - a["position"]) * length >= long_width
+                                for a,b in zip(confirmed, confirmed[1:]))
+                        and max(row["offsetMS"] for row in confirmed) - min(row["offsetMS"] for row in confirmed) <= 30
+                        and not has_clock_conflict()):
+                    return {"status": "measured", "windows": confirmed, "method": "independentBassWindows"}
     return {"status": "review", "windows": windows}
+
+
+def timing_windows(song, audio, video, alignment):
+    first = match_clock_on_stream(song, audio, video, alignment)
+    if first["status"] != "review" or not Path(video).is_file():
+        return first
+    _, metadata = probe(Path(video), "video")
+    audio_count = sum(stream["codec_type"] == "audio" for stream in metadata["streams"])
+    for stream in range(1, audio_count):
+        result = match_clock_on_stream(song, audio, video, alignment, audio_stream=stream)
+        if result["status"] == "measured":
+            return {**result, "videoAudioStream": stream}
+    return first
 
 
 def timing_failure_detail(evidence):
@@ -507,30 +594,46 @@ def visible_level(page, position, top):
 
 
 SEQUENCE_CODE = r"[A-Z][0-9¹²³⁴⁵⁶⁷⁸⁹⁰]{0,2}"
-SEQUENCE_ITEM = re.compile(rf"({SEQUENCE_CODE})(?:\s*\((\d+\s*[x×])\))?")
-SEQUENCE_REPEAT = re.compile(r"^(?:REPEAT|RPT)\s+(?:LUNGE\s+)?SEQUENCES?\s+(.+)$", re.S)
+SEQUENCE_ITEM = re.compile(
+    rf"({SEQUENCE_CODE})(?:\s*\(?(\d+\s*[x×]|[x×]\s*\d+)\)?)?"
+    r"(?:\s*\((on [LR] side first)\))?", re.I)
+SEQUENCE_REPEAT = re.compile(r"^(?:(?:REPEAT|RPT)\s+(?:LUNGE\s+)?)?SEQ\s*UENCES?\s+(.+)$", re.S | re.I)
 
 
 def expand_sequence(action, definitions):
-    match = SEQUENCE_REPEAT.fullmatch(action)
-    if not match:
+    lines = action.splitlines()
+    start = next((index for index, line in enumerate(lines) if SEQUENCE_REPEAT.fullmatch(line)), None)
+    if start is None:
         return None
+    before, repeat = lines[:start], " ".join(lines[start:])
+    match = SEQUENCE_REPEAT.fullmatch(repeat)
     expression = " ".join(match[1].split())
-    detail = re.search(r"[.,]\s*([LR] foot B|Leading [LR] hand first)\s*\.?$", expression, re.I)
-    modifier = detail[1] if detail else ""
-    identifiers = expression[:detail.start()] if detail else expression.rstrip(".")
-    references = [SEQUENCE_ITEM.fullmatch(item.strip()) for item in identifiers.split(",")]
+    detail = re.search(r"[.,–—]\s*([LR] foot B|Leading [LR] hand first|other leg)\s*\.?$"
+                       r"|\s*(\(Cross [^()]+\))$", expression, re.I)
+    modifier = (detail[1] or detail[2]) if detail else ""
+    side_note = re.search(r"\s+(to [LR] side\. .+)$", expression, re.I) if not detail else None
+    if side_note:
+        modifier = side_note[1]
+    ending = detail or side_note
+    identifiers = expression[:ending.start()] if ending else expression.rstrip(".")
+    identifiers = re.sub(r"\b([A-Z])and(?=\s)", r"\1 and", identifiers, flags=re.I)
+    references = [SEQUENCE_ITEM.fullmatch(item.strip())
+                  for item in re.split(r",|\s+AND\s+", identifiers, flags=re.I)]
     if not all(references):
         return None
-    result = []
+    result = list(before)
     for item in references:
-        source = definitions.get(unicodedata.normalize("NFKC", item[1]))
+        source = definitions.get(unicodedata.normalize("NFKC", item[1]).upper())
         if not source or unresolved_repeat_times([{"time": 0, "action": source}]):
             return None
         if modifier.lower().startswith("leading "):
             side = modifier.split()[1]
             source = re.sub(r"\bLeading [LR] hand\b", f"Leading {side} hand", source, flags=re.I)
-        result.append(f"{source} ({item[2]})" if item[2] else source)
+        elif modifier.lower() == "other leg" or re.match(r"to [LR] side\.", modifier, re.I):
+            source = mirror(source)
+        if display := " · ".join(filter(None, item.groups()[1:])):
+            source = f"{source} ({display})"
+        result.append(source)
     return "\n".join(result), modifier
 
 
@@ -571,6 +674,11 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
                   " ".join(word["text"] for word in line), re.I)
         for line in row_lines(words) if line[0]["top"] < page.height * .14
         or line[0]["top"] > page.height * .86)
+    bodyattack_score = any(re.search(r"\bBODY\s*ATTACK\s*\d+\b", word["text"], re.I)
+                           for word in words) or any(
+        re.search(r"\bBODY\s*ATTACK\s*\d+\b",
+                  " ".join(word["text"] for word in line), re.I)
+        for line in row_lines(word for word in words if word["top"] > page.height * .86))
     for line in row_lines(words):
         headers = {}
         for word in line:
@@ -604,7 +712,8 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
             return parse_time(text)
         marks = sorted((w["top"], source_time(w["text"])) for w in words
                        if w["x0"] < music and source_time(w["text"]) is not None)
-        blocks = block_boundaries(page, words, marks, exercise) if bp_layout else {}
+        blocks = (block_boundaries(page, words, marks, exercise, split_lanes=bodyattack_score)
+                  if bp_layout or bodyattack_score else {})
         rows = []
         for i, (top, time) in enumerate(marks):
             limit = marks[i + 1][0] - 3 if i + 1 < len(marks) else page.height * 0.92
@@ -612,6 +721,9 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
             if i == len(marks) - 1:
                 body = detached_score_footer(body, exercise, counts, page)
             phrase = phrase_words(body, top, exercise) if bp_layout else []
+            ba_phrases = ([word for word in body if music <= word["x0"] < exercise
+                           and abs(word["top"] - top) <= 5 and phrase_size(word["text"]) is not None]
+                          if blocks and bodyattack_score else [])
             def column_lines(begin, end, top_bound=None, bottom_bound=None):
                 return row_lines([w for w in body if begin <= w["x0"] < end
                                   and (top_bound is None or w["top"] >= top_bound)
@@ -623,12 +735,14 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
             count_end = exercise if counts < exercise else min(reps, level)
             action = column(exercise, action_end)
             if action:
-                codes = sorted((w for w in body if sequence_left <= w["x0"] < exercise
+                code_left = exercise - 32 if bodyattack_score and sequence is None else sequence_left
+                codes = sorted((w for w in body if code_left <= w["x0"] < exercise
                                 and re.fullmatch(SEQUENCE_CODE, w["text"])), key=lambda w: w["top"])
                 for j, code in enumerate(codes):
                     start = code["top"] - 3
                     end = codes[j + 1]["top"] - 3 if j + 1 < len(codes) else limit
-                    if text := column(exercise, action_end, start, end):
+                    if (text := column(exercise, action_end, start, end)) and not unresolved_repeat_times(
+                            [{"time": time, "action": text}]):
                         definitions[unicodedata.normalize("NFKC", code["text"])] = text
                 cue = {"time": time, "page": page_number, "action": action,
                        "music": column(music, min(sequence_left, counts)),
@@ -636,6 +750,8 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
                        "repetitions": column(reps, level)}
                 if bp_layout and len(phrase) == 1:
                     cue["counts"] = phrase[0]["text"]
+                if len(ba_phrases) == 1:
+                    cue["_phraseCounts"] = ba_phrases[0]["text"]
                 if time in blocks:
                     cue["block"] = blocks[time]
                 if expanded := expand_sequence(action, definitions):
@@ -654,7 +770,7 @@ def read_page_rows(page, words, page_number, parse_time, definitions=None):
 
 
 def pdf_recording_variant(variant):
-    return {"alternate": "alternative", "45-minute": "combo45"}.get(variant, variant)
+    return {"alternate": "alternative", "express": "alternative", "45-minute": "combo45"}.get(variant, variant)
 
 
 @dataclass(frozen=True)
@@ -664,6 +780,8 @@ class SectionHeading:
     variant: str
     variant_source: str
     title: str
+    replacement: str | None = None
+    through_block: int | None = None
 
     @property
     def recording(self):
@@ -750,9 +868,35 @@ def localized_section_headings(words, width):
     return headings
 
 
-def choreography_headings(words, width, alignment, parsed):
+def replacement_on_shared_score(text):
+    """Read a named replacement where the score explicitly shares its choreography."""
+    return re.search(r"\bPlease\s+use\s+([^!?]{1,160}?)\s+"
+                     r"with\s+the\s+same\s+choreography\b", text, re.I)
+
+
+def recording_title(title):
+    return re.sub(r"[^\w]", "", normalized_function_title(title))
+
+
+def heading_matches_recording(heading, song):
+    return (heading.recording == recording_identity(song)
+            and (heading.through_block is None or song.get("classDurationMinutes")
+                 or re.match(r"^(?:EXPRESS|E)[ ._-]*0*\d+", Path(song.get("file", "")).stem, re.I))
+            and (heading.replacement is None or
+                 recording_title(heading.replacement) == recording_title(song.get("title", ""))))
+
+
+def choreography_headings(words, width, alignment, parsed, *, page_text=""):
     if heading := section_heading(words, width, alignment, parsed):
         text = " ".join(word["text"] for line in row_lines(words) for word in line)
+        if heading.variant == "standard" and (replacement := replacement_on_shared_score(page_text)):
+            return [heading, SectionHeading(heading.number, heading.segment, "alternative", "explicit",
+                                            heading.title, replacement[1].strip())]
+        if heading.variant == "standard" and (express := re.search(
+                rf"please\s+use\s+the\s+Express\s+0*{heading.number}\s+music\s+track\.\s+"
+                r"The\s+choreography\s+finishes\s+after\s+Block\s+(\d+)\b", page_text, re.I)):
+            return [heading, SectionHeading(heading.number, heading.segment, "alternative", "explicit",
+                                            heading.title, through_block=int(express[1]))]
         if re.search(r"\bBODY\s*PUMP\s*(?:[™®]\s*)?(?:\d+|UNITED)\b", text, re.I):
             combined = normalized_function_title(heading.title) in {"triceps / biceps", "lunges / shoulders"}
             if combined and heading.variant_source in {"default", "structured"}:
@@ -768,9 +912,10 @@ def choreography_headings(words, width, alignment, parsed):
 
 def heading_for_song(song, headings):
     recording = recording_identity(song)
-    exact = [heading for heading in headings if heading.recording == recording]
+    exact = [heading for heading in headings if heading_matches_recording(heading, song)]
     if len(exact) == 1:
         return exact[0]
+    headings = [heading for heading in headings if heading.replacement is None]
     same_number = [heading for heading in headings if heading.number == recording[0]]
     if len(same_number) == 1:
         return same_number[0]
@@ -854,7 +999,7 @@ def section_heading(words, width, alignment, parsed):
         title = title.split(" - ", 1)[0]
     title = re.sub(r"^(?:ALT\.?|ALTERNATE|BONUS|45[-–]MIN(?:UTE)?)[ :–-]+", "", title, flags=re.I)
     title = re.sub(r"\s+(?:\(?CONTINUED\)?|\(?CONT\.\)?)$", "", title, flags=re.I)
-    title = re.sub(r"\s+\((?:ALT|ALTERNATE|BONUS)\)$", "", title, flags=re.I)
+    title = re.sub(r"\s+\((?:ALT|ALTERNATE|BONUS)\)$|\s*[-–—]\s*EXPRESS$", "", title, flags=re.I)
     if not title or len(title) > 68 or len(title.encode("utf-8")) > 240:
         return None
     return SectionHeading(int(number["number"]), (number["segment"] or "").upper(),
@@ -875,6 +1020,8 @@ def check_section_function(song, heading):
         return "manual", f"{location} 的功能或录音对应需人工复核。"
     declared = normalized_function_title(function["name"])
     printed = normalized_function_title(heading.title)
+    if declared.replace(" ", "") == printed.replace(" ", ""):
+        printed = declared
     if declared != printed:
         possibly_partial = (declared.startswith(printed + " ") or printed.startswith(declared + " ")
                             or declared in printed.split(" / "))
@@ -931,7 +1078,8 @@ def class_format_suggestions(path, pages=None):
         return []
     import pdfplumber
     from class_templates import (FormatLine, TOTAL_LINE, combine_equivalent_pages, format_columns,
-                                 format_header, line_text, matches_printed_role, recheck_ocr_track_labels)
+                                 format_header, join_wrapped_track_labels, line_text, matches_printed_role,
+                                 recheck_ocr_track_labels)
     from score_evidence import ScorePageReader
     token = r"0*\d{1,3}[A-Z]?"
     consecutive = rf"{token}(?:\s*[&+]\s*(?:TRACK\s*)?(?:{token}|[A-Z])\b)*"
@@ -1008,7 +1156,7 @@ def class_format_suggestions(path, pages=None):
 
     def read_table_column(column, page, tables, current):
         previous = row_left = unnumbered = None
-        for raw in column:
+        for raw in join_wrapped_track_labels(column):
             line = unicodedata.normalize("NFKC", raw.text).strip()
             preceding, previous = previous, raw
             if header := format_header(line):
@@ -1017,6 +1165,9 @@ def class_format_suggestions(path, pages=None):
                            "_kind": kind, "_option": option, "_top": raw.top}
                 tables.append(current)
                 row_left = unnumbered = None
+            elif current is not None and not current["slots"] and (option := re.fullmatch(
+                    r"(?:FORMAT\s+)?OPTION\s+(\d{1,2})", line, re.I)):
+                current["_option"] = option[1]
             elif re.match(r"^(?:Approx\.?\s*Time|PLEASE NOTE|TECHNICAL TEAM CREDIT|RELEASE FEEDBACK|"
                           r"GENERAL FEEDBACK|KEY|CLAVE|DANOS TU FEEDBACK|NOTA|TENGA EN CUENTA)\b|^请注意|^套路反馈", line, re.I):
                 current = None
@@ -1184,7 +1335,7 @@ def class_format_suggestions(path, pages=None):
         elif any(slot.get("requiredDurationMinutes") == minutes for slot in template["slots"]):
             label += " 组合"
             suffix = ""
-        if option:
+        if option and sum(t["minutes"] == minutes for t in guesses) <= 1:
             suffix = f"方案 {option}"
         template.update(key=f"{minutes}-{counts[minutes]}", name=f"{label} {suffix}".strip(), approved=False)
     return sorted([*guesses, *named], key=lambda item: item["page"])
@@ -1203,7 +1354,8 @@ def inspect_section_functions(path, songs):
             if not 1 <= index <= len(pdf.pages):
                 raise ValueError(f"The actual PDF does not contain section function page {index}.")
             page = pdf.pages[index - 1]
-            headings[index] = choreography_headings(reader.words(page, index), page.width, alignment, None)
+            headings[index] = choreography_headings(reader.words(page, index), page.width, alignment, None,
+                                                   page_text=page.extract_text(x_tolerance=1) or "")
         return [check_section_function(song, heading_for_song(song, headings[song["sectionFunction"]["page"]]))
                 for song in claimed]
 
@@ -1226,12 +1378,39 @@ def _source_timelines(song, timelines, parsed_pages):
     return identified if len(identified) == 1 else standard
 
 
+def printed_recording_heading(words, page, alignment):
+    headings = [match for word in words if 85 <= word["top"] <= 125 and word["x0"] < page.width * .25
+                if (match := alignment.PDF_TRACK_RE.fullmatch(word["text"])
+                    or alignment.PDF_INLINE_TRACK_RE.fullmatch(word["text"]))]
+    if len(headings) != 1:
+        return None
+    match = headings[0]
+    return (int(match["number"]), (match["segment"] or "").upper(),
+            pdf_recording_variant(alignment.classify_pdf_variant(words, page.width)))
+
+
+def has_continuation_clock(words, page, parse_time):
+    return sum(word["x0"] < page.width * .17 and word["top"] > 115 and
+               parse_time(word["text"]) is not None for word in words) >= 3
+
+
 def _rows_on_pages(document, words, pages, parse_time):
     rows, definitions = [], {}
+    prior_header = prior_recording = prior_page = None
+    alignment = alignment_module()
     for number in pages:
         if type(number) is not int or number not in words:
             raise ValueError(f"Invalid physical PDF page {number}")
-        rows.extend(read_page_rows(document.pages[number - 1], words[number], number, parse_time, definitions))
+        page, positioned = document.pages[number - 1], words[number]
+        recording = printed_recording_heading(positioned, page, alignment)
+        header = next((line for line in row_lines(positioned)
+                       if {"MUSIC", "EXERCISE"} <= {name for word in line for name in header_labels(word["text"])}), None)
+        if (header is None and prior_header and prior_page + 1 == number and recording
+                and recording == prior_recording and has_continuation_clock(positioned, page, parse_time)):
+            header = prior_header
+            positioned = [*positioned, *({**word, "top": 120, "bottom": 124} for word in header)]
+        rows.extend(read_page_rows(page, positioned, number, parse_time, definitions))
+        prior_page, prior_recording, prior_header = number, recording, header
     return rows
 
 
@@ -1254,7 +1433,10 @@ def extract_cues(path, songs, ocr=False, *, page_numbers=None):
             parsed = alignment.parse_cue_page_words(index, page.width, positioned)
             if parsed:
                 found.append(parsed)
-            if page_headings := choreography_headings(positioned, page.width, alignment, parsed):
+            page_text = page.extract_text(x_tolerance=1) or "" if any(
+                song["variant"] == "alternative" for song in songs) else ""
+            if page_headings := choreography_headings(positioned, page.width, alignment, parsed,
+                                                       page_text=page_text):
                 headings[index] = page_headings
         timelines, warnings = alignment._build_pdf_timelines(found)
         parsed_pages = {page.page_number: page for page in found}
@@ -1263,8 +1445,26 @@ def extract_cues(path, songs, ocr=False, *, page_numbers=None):
         for song in songs:
             recording = recording_identity(song)
             candidates = _source_timelines(song, timelines, parsed_pages)
-            pages = song.get("pdfPages", candidates[0].pages if len(candidates) == 1 else [])
+            if not candidates and recording[2] == "alternative":
+                shared = {page: heading for page, items in headings.items() for heading in items
+                          if (heading.replacement or heading.through_block) and heading_matches_recording(heading, song)}
+                candidates = [timeline for timeline in timelines if timeline.variant == "standard"
+                              and set(shared).intersection(timeline.pages)]
+            else:
+                shared = {}
+            pages = list(song.get("pdfPages", candidates[0].pages if len(candidates) == 1 else []))
+            if pages and "pdfPages" not in song:
+                while ((following := pages[-1] + 1) in words and following not in parsed_pages
+                       and printed_recording_heading(words[following], pdf.pages[following - 1], alignment) == recording
+                       and has_continuation_clock(words[following], pdf.pages[following - 1], alignment.parse_timestamp)):
+                    pages.append(following)
             rows = _rows_on_pages(pdf, words, pages, alignment.parse_timestamp)
+            through = {shared[page].through_block for page in pages if page in shared and shared[page].through_block}
+            if len(through) == 1:
+                final_block = through.pop()
+                last = next((index for index, row in enumerate(rows)
+                             if row.get("block", 0) > final_block), None)
+                rows = rows[:last] if any(row.get("block") == final_block for row in rows[:last]) else []
             pinned = sorted({row["page"] for row in song.get("cues") or ()})
             if ("pdfPages" not in song and len(rows) >= 3 and pinned and
                     all(number in words and number not in parsed_pages for number in pinned)):
@@ -1279,7 +1479,10 @@ def extract_cues(path, songs, ocr=False, *, page_numbers=None):
             repeats = unresolved_repeat_times(rows)
             expansion = []
             if valid and repeats and any("block" in row for row in rows):
-                rows, expansion = expand_blocks(rows, song["duration"])
+                phrase_key = "_phraseCounts" if any("_phraseCounts" in row for row in rows) else "counts"
+                rows, expansion = expand_blocks(rows, song["duration"], phrase_key=phrase_key)
+            for row in rows:
+                row.pop("_phraseCounts", None)
             pending = unresolved_repeat_times(rows)
             status = "unresolved"
             if valid and rows:
@@ -1292,7 +1495,7 @@ def extract_cues(path, songs, ocr=False, *, page_numbers=None):
             if song.get("pdfPage"):
                 selected.add(song["pdfPage"])
             proposed = [(page, heading.title) for page, page_headings in headings.items() for heading in page_headings
-                        if heading.recording == recording and (not selected or page in selected)]
+                        if heading_matches_recording(heading, song) and (not selected or page in selected)]
             if proposed and len({normalized_function_title(title) for _, title in proposed}) == 1:
                 page, title = proposed[0]
                 result[-1]["sectionFunction"] = {"name": title, "page": page, "approved": False}

@@ -3,6 +3,7 @@
 from argparse import Namespace
 from contextlib import redirect_stderr, redirect_stdout
 from io import StringIO
+import hashlib
 import json
 import math
 import shutil
@@ -18,7 +19,7 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 
 from delivery_policy import assess_delivery
-from media_analysis import optimize_video, stream_hashes, video_info
+from media_analysis import optimize_video, picture_stream, stream_hashes, timed_text_packets, video_info
 from qa_preview import inspect_loudness
 from ssroutine import chapter_preflight, digest, identity, package as build_package, read_manifest
 
@@ -169,7 +170,7 @@ class OriginalAudioCLITests(unittest.TestCase):
             self.assertGreater(max(levels) - min(levels), 9.0)
             self.assertFalse(any(item["check"] == "audio" for item in result["delivery"]["limitations"]))
             html = (evidence / "report.html").read_text(encoding="utf-8")
-            self.assertIn("原音频峰值观察", html)
+            self.assertIn("音频与视频观察", html)
             self.assertIn("Mix「歌单响度一致化」", html)
 
             corrupt = folder / package.name
@@ -201,7 +202,7 @@ class OriginalAudioCLITests(unittest.TestCase):
             self.assertEqual(len(audio.splitlines()), 2)
             self.assertEqual(audio, stream_hashes(source, "a"))
 
-    def test_default_quality_can_keep_compatible_source_but_explicit_codec_is_enforced(self):
+    def test_default_quality_rejects_h264_fallback_but_explicit_original_keeps_it(self):
         encoders = subprocess.check_output(["ffmpeg", "-hide_banner", "-encoders"], text=True)
         if "libx264" not in encoders:
             self.skipTest("FFmpeg H.264 encoder required")
@@ -224,17 +225,33 @@ class OriginalAudioCLITests(unittest.TestCase):
             fallback = {**video_info(video), "compression": "keptOriginal", "reason": "Picture sample failed"}
             with (patch("ssroutine.efficient_video", return_value=(video, fallback)),
                   redirect_stdout(StringIO()), redirect_stderr(StringIO())):
+                with self.assertRaisesRegex(ValueError, "成品视频编码与交付要求不符"):
+                    build_package(options, review=review)
+                self.assertFalse(list(options.output_dir.glob("*.ssroutine")))
+                options.video_quality = "original"
                 result = build_package(options, review=review)
                 with result.open("rb") as stream:
                     _, manifest = read_manifest(stream)
                     self.assertEqual(manifest["video"]["asset"]["sha256"], digest(video))
                     stream.seek(manifest["music"][0]["asset"]["bytes"], 1)
                     self.assertEqual(stream.read(manifest["video"]["asset"]["bytes"]), video.read_bytes())
-                options.output_dir = root / "strict"
-                options.video_codec = "hevc"
-                with self.assertRaisesRegex(ValueError, "Could not package H.265"):
-                    build_package(options, review=review)
-                self.assertFalse(list(options.output_dir.glob("*.ssroutine")))
+
+    def test_multiple_picture_versions_require_a_unique_default(self):
+        streams = [
+            {"index": 0, "codec_type": "video", "disposition": {"default": 0}},
+            {"index": 1, "codec_type": "video", "disposition": {"default": 1}},
+            {"index": 2, "codec_type": "video", "disposition": {"default": 1, "attached_pic": 1}},
+        ]
+        self.assertEqual(picture_stream({"streams": streams})["index"], 1)
+        streams[1]["disposition"]["default"] = 0
+        with self.assertRaisesRegex(ValueError, "唯一默认轨"):
+            picture_stream({"streams": streams})
+
+    def test_subtitle_packet_audit_skips_empty_samples_but_retains_exact_text_timing(self):
+        empty = {"pts_time": "1.200000", "data_hash": "SHA256:" + hashlib.sha256(b"\0\0").hexdigest()}
+        text = {"pts_time": "1.200000", "duration_time": "0.850000", "data_hash": "SHA256:" + "0" * 64}
+        with patch("media_analysis.run", return_value=json.dumps({"packets": [empty, text]}).encode()):
+            self.assertEqual(timed_text_packets(Path("video.mp4"), 0), [text])
 
     def test_legacy_edit_options_reject_before_writing_output(self):
         cases = [

@@ -5,6 +5,7 @@ from contextlib import closing
 import csv
 from hashlib import sha256
 from io import BytesIO, StringIO
+import json
 import os
 from pathlib import Path
 import re
@@ -129,6 +130,41 @@ class ScorePageReader:
             return found
         self.warnings.append(f"原谱第 {number} 页 OCR 未取得可复核的文字，请打开原页核对。")
         return words
+
+
+def export_score_pages(source, numbers, destination):
+    """Render the original physical pages alongside positioned text observations."""
+    import pdfplumber
+    import pypdfium2
+
+    data = source.read_bytes()
+    reader = ScorePageReader(BytesIO(data))
+    entries = []
+    with pdfplumber.open(BytesIO(data)) as score, pypdfium2.PdfDocument(data) as picture:
+        if any(number < 1 or number > len(score.pages) for number in numbers):
+            raise ValueError(f"Choose physical pages from 1 to {len(score.pages)}.")
+        destination.mkdir(parents=True)
+        for number in numbers:
+            page = score.pages[number - 1]
+            stem = f"page-{number:04}"
+            overview, observations = destination / f"{stem}.png", destination / f"{stem}.txt"
+            words = reader.words(page, number)
+            with closing(picture[number - 1]) as visible:
+                scale = min(2.5, 2400 / max(visible.get_size()))
+                with closing(visible.render(scale=scale)) as bitmap:
+                    bitmap.to_pil().save(overview)
+            lines = row_lines(words)
+            text = "\n".join(f"y={line[0]['top']:.1f}  " + "  ".join(
+                f"[x={word['x0']:.1f}] {word['text']}" for word in line) for line in lines)
+            observations.write_text(text + ("\n" if text else ""), encoding="utf-8")
+            entries.append({"page": number, "image": overview.name, "text": observations.name,
+                            "textSource": ("ocr" if any(word.get("ocr") for word in words)
+                                           else "pdfText" if words else "none")})
+        evidence = {"sourceSHA256": sha256(data).hexdigest(), "pageCount": len(score.pages),
+                    "pages": entries, "warnings": reader.warnings}
+    index = destination / "index.json"
+    index.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return index
 
 
 def numbered_ocr_heading(words, width, pattern, inline_pattern):

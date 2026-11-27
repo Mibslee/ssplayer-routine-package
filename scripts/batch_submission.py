@@ -68,7 +68,7 @@ def package_header(source):
     return f"{program}_{routine}_{revision}.ssroutine", encoded, manifest
 
 
-def seal_package(source, header, work, font, source_limited, observation, observations):
+def seal_package(source, header, work, font, source_limited, observation, observations, allow_non_hevc):
     from qa_preview import generate
 
     name, encoded, manifest = header
@@ -81,7 +81,8 @@ def seal_package(source, header, work, font, source_limited, observation, observ
     print(f"质检 {name}", file=sys.stderr, flush=True)
     with redirect_stdout(StringIO()):
         passed = generate(Namespace(package=source, output_dir=work, credit=None, made_at=None,
-                                    font=font, screen_subtitles=observation, source_limited=source_limited),
+                                    font=font, screen_subtitles=observation, source_limited=source_limited,
+                                    allow_non_hevc=allow_non_hevc),
                           sealed_copy=package, overview_only=True)
     evidence = work / (stem + ".qa")
     report = read_json(evidence / "qa.json")
@@ -142,7 +143,10 @@ def submit(args, *, blocked=None):
             with tempfile.TemporaryDirectory(dir=work, prefix="item-") as item:
                 try:
                     fingerprint, package, overview = seal_package(source, header, Path(item), args.font,
-                        source_limited, observation, observations)
+                        source_limited, observation, observations,
+                        getattr(args, "allow_non_hevc", False) or
+                        getattr(args, "video_quality", None) == "original" or
+                        getattr(args, "video_codec", None) == "h264")
                 except ITEM_ERRORS as error:
                     record_block(blocked, source, "包内质检", error, keep_going)
                     continue

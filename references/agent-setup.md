@@ -78,18 +78,22 @@ Windows PowerShell 可用 `py -3 -m venv .venv`，后两条命令的 Python 路�
 
 首次选择公开署名时，请制作者填写实际显示的名字。若本轮已经给出确切署名，直接沿用。选择「公开并设为默认」时如姓名留空，先补问姓名，再运行 `confirm-plan --credit "已确认的署名" --remember-credit`。默认不署名用 `--no-credit --remember-credit`。以后只需在批次确认里显示已存选择，制作者可以沿用或修改。仅本批改名或留空时，用 `--credit` 或 `--no-credit`。用 `python scripts/ssroutine.py attribution --reset` 清除本机默认。配置默认位于 `~/.config/ssplayer_package_creator/attribution.json`，支持 `XDG_CONFIG_HOME`。
 
-制作者没有封面时，生成文字预览并展示。确认使用后，把 PNG 交给同一个 `--cover` 选项。图片会进入资源包和九宫格首图。可以从计划读取名称，也可以用下面的参数应用本轮改名。当前字体缺少字符时，用 `--font` 指定支持课程文字的字体，例如 Noto Sans CJK。
+制作者没有封面时，生成文字预览并展示。确认使用后，把 PNG 交给同一个 `--cover` 选项。图片会进入资源包、九宫格首图和所有支持封面标签的音乐副本。可以从计划读取名称，也可以用下面的参数应用本轮改名。当前字体缺少字符时，用 `--font` 指定支持课程文字的字体，例如 Noto Sans CJK。
 
     python scripts/ssroutine.py text-cover plan.json --project-name "综合训练" --routine-name "第 26 期" --output cover-preview.png
     python scripts/ssroutine.py confirm-plan plan.json --project-name "综合训练" --routine-name "第 26 期" --cover cover-preview.png --no-credit --output confirmed-plan.json
 
 制作者选择留空时使用 `--without-cover`。旧版已核验的计划和资源包仍可处理。更改项目或套路身份、显示名称、版本、发行时间、封面或本批署名后，重新记录确认。采用文字封面时，改名也需要重新生成 PNG。
 
-先核对 `plan.json` 中的资料和归属，再运行 `analyze`。通过音画复测的小节会自动确认同步定位。对需要复核的章节和 PDF 动作，比较原始资料后再批准。确认里显示「音乐：原样保留」。能点选的智能体可用「确认开始」「调整选项」「输入要求」。制作者可以直接回复调整画质、署名或当批素材范围。见[制作和质检](quality-check.md)。
+先核对 `plan.json` 中的资料和归属，再运行 `analyze`。通过音画复测的小节会自动确认同步定位。对需要复核的章节和 PDF 动作，比较原始资料后再批准。确认里显示「音频原样，封面标签统一」。能点选的智能体可用「确认开始」「调整选项」「输入要求」。制作者可以直接回复调整画质、署名或当批素材范围。见[制作和质检](quality-check.md)。
 
 修改小节、曲目版本、目录槽位或动作提取页后，更新计划，运行 `analyze --output review-v2.json`。保留之前的复核文件，对新结果重新核实受影响的小节。独立的原谱打开页可在核对后填写。同名成品内容不一致时使用新修订号。
 
 选定多份候选原谱中的一份时，用 `plan --score-pdf "/原始资料/中文.pdf"`。双语合册可用 `--cue-pages 6-34 --class-format-pages 5` 指定实际 PDF 中的物理页。范围以本册为准，续页也要纳入。跨布局或不同语言时，先认清是动作表、课型表、技术说明还是图例，再确认动作与录音的关系。少量水印文字的扫描页会自动进入 OCR。抽取结果待视觉核实，确认后写入复核文件。
+
+只需要复核几页时，用 `inspect-score` 本地导出所选物理页的 PNG、带位置的文字及原谱摘要。用新目录存这次证据。对同一份谱，把表头、跨页处和动作来源页一起看，减少因整页 OCR 串栏造成的来回修改。
+
+    python scripts/ssroutine.py inspect-score "/资料/原谱.pdf" --pages 5,9,31-33 --output-dir "/工作区/原谱复核"
 
 ## 提交一批
 
@@ -125,6 +129,14 @@ BP/
 
 完成后返回本地批次目录。每套成品对应一张同名九宫格 PNG，整批只需一份指纹文件。用户明确指定上传的批次和目的地后，再分享有权分发的文件。若要核对网盘副本，从网盘读回包执行 `verify`，把输出里的完整 SHA-256 与批次指纹比较。原始素材、计划、完整报告和测试文件留在本机。
 
+### 批次接手与中断恢复
+
+- 核对已确认的套路清单、封面、署名、音视频选择、视频规格和交付根目录。确认这些选择未变时，直接沿用。先读取实际 Skill 与 Python 的绝对路径并运行 `doctor`。
+- 每期分别保留计划、复核文件、`check-review` 结果和短日志。碰到一套的来源或排课争议，继续分析和核验其他期。进程退出后检查退出码、实际产物及日志尾部，确认旧进程已停止再恢复。
+- 先运行 `check-review`，有疑难音画时用 `--measure-video`。对通过的长批次可逐套执行 `build REVIEW --output-dir LOCAL_BUILD`，每套成品都用 `verify` 核验并保留路径。若只有字幕或投稿检查失败，复用同一成品继续 `submit`。
+- 网络盘素材随机读取慢时，可先把已选视频复制到本地工作盘。保留源文件，核对字节数与 SHA-256 后把复核中的视频读取路径指向副本。原音轨与字幕内容仍由编码核验和最终质检回读。
+- 所有通过的包一起交给 `submit`。最终交付前比较已确认的期号清单、批次指纹和交付目录。尚有未通过的期号时，汇报逐项原因和已验证的交付范围。
+
 ### 失败恢复与局部修订
 
 | 情况 | 下一步 |
@@ -133,10 +145,10 @@ BP/
 | 包已生成，批次验收失败 | 使用工具报告的保留路径，对同一成品运行 `qa_preview.py ... --strict`，打开报告及抽样帧。只有字幕判定变化时，对同一成品用 `submit --screen-subtitles present` 或 `absent`。 |
 | 动作、打开页或章节要改 | 提取旧包清单，校正字段，用 `revise` 提高修订号，复核后重新 `submit`。旧版视频和音频会直接复用。 |
 | 源录音真峰值超出 0 dBTP | 如实记录在哪一首、峰值是多少。沿用原音频字节，Mix 播放时在 App 的「歌单响度一致化」处理。 |
-| 旧包里的录音曾经被改过音量或速度 | 从已核实的原始录音重新制作。每首录音核对原文件与包内文件的 SHA-256。 |
+| 旧包里的录音曾经被改过音量或速度 | 从已核实的原始录音重新制作。逐首比对音频包的摘要和录音时长。确认替换的封面标签与本期一致。 |
 | 换了一首原始录音、视频或原谱 | 重新匹配对应来源，生成新复核文件后构建。 |
 
-`finish`、`build` 和 `revise` 都保留所用音乐的原始字节。旧脚本里的降峰、响度归一和视频音轨均衡参数要从制包命令移除。质检会给出解码、时长、LUFS 和真峰值。单独的源峰值提示不降低交付结论。
+`finish`、`build` 和 `revise` 都保留所用音乐的原始音频包。确认封面后可更新支持的音乐标签。旧脚本里的降峰、响度归一和视频音轨均衡参数要从制包命令移除。质检会给出解码、时长、LUFS 和真峰值。单独的源峰值提示不降低交付结论。
 
 把老 CD 和新发行混排在同一份 Mix 时，在 App 试听交接点。需要处理音量或峰值时，使用歌单音量栏旁的「歌单响度一致化」，按这份 Mix 的播放情况调整。
 
@@ -151,7 +163,7 @@ BP/
 | `--video-quality ipad` | HEVC，最高 1080p，视频目标码率 1800 kb/s |
 | `--video-quality compact` | HEVC，最高 720p，视频目标码率 950 kb/s |
 
-按素材细节调整 `--video-max-height` 和 `--video-bitrate-kbps`。需要指定编码时用 `--video-codec hevc` 或 `h264`。降低分辨率时保持比例，已低于上限的画面沿用原分辨率或向下取偶。默认压缩档尝试 H.265，要求视频体积至少减少 10%，头、中、尾三个画面样本的平均 SSIM 均达到 0.96，并验证音轨、独立字幕和时钟。默认方案且没有指定编码、分辨率或码率时，未通过的压缩尝试可保留兼容的原视频，构建日志显示原因。明确指定的参数继续约束输出。质检首图显示实际打包的编码。
+按素材细节调整 `--video-max-height` 和 `--video-bitrate-kbps`。默认交付 H.265（HEVC，hvc1），在片头、中段、末段抽查画质，检查视频时间戳、章节、原音轨和独立字幕。画质和媒体验证优先于体积节省。必要时提高视频码率并复测，无需重跑已通过的原谱与动作识别。只有用户明确选择时才用 `--video-quality original` 或 `--video-codec h264`。已验证的特殊 H.264 批次可用 `submit --allow-non-hevc`。质检首图展示实际封装编码。
 
     python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality ipad
     python scripts/ssroutine.py build review.json --output-dir "/成品" --video-quality compact --video-max-height 540 --video-bitrate-kbps 750

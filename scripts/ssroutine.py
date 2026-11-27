@@ -22,18 +22,20 @@ from io import BytesIO
 from pathlib import Path
 from time import perf_counter
 
+from cover_artwork import music_with_cover, prominent_qr
 from delivery_policy import class_recording_conditions
 from grit_evidence import check_grit_section_function, grit_source_evidence
 from grit_intervals import parse_grit_intervals, validate_interval_review
 from media_analysis import (alignment_module, audio_packet_hash, class_format_suggestions,
                             efficient_video, extract_cues, inspect_section_functions, locate_chapters,
                             map_recordings, measure, optimize_video, original_peak_notice, probe, run,
-                            timing_failure_detail, timing_windows, unresolved_repeat_times, video_info)
-from score_evidence import ocr_languages
+                            timing_failure_detail, timing_windows, unresolved_repeat_times, verify_video_conversion,
+                            video_info, video_quality_samples)
+from score_evidence import export_score_pages, ocr_languages
 
 
 MAGIC = b"SSRT0001"
-VERSION = "1.7.7"
+VERSION = "1.7.10"
 MIB = 1024 * 1024
 MAX_MANIFEST = 4 * MIB
 MAX_PACKAGE = 12 * 1024 * MIB
@@ -193,7 +195,8 @@ def list_cover_candidates(files, songs, embedded, plan_path):
             asset = cover_asset(path)
         except (ValueError, OSError):
             continue
-        candidates.setdefault(asset["sha256"], {"file": str(path), "source": "image"})
+        candidates.setdefault(asset["sha256"], {"file": str(path), "source": "image",
+                                                "prominentQRCode": prominent_qr(path.read_bytes())})
     for song in songs:
         for index in embedded.get(song["file"], ()):
             try:
@@ -201,7 +204,11 @@ def list_cover_candidates(files, songs, embedded, plan_path):
                            "-c:v", "copy", "-frames:v", "1", "-f", "image2pipe", "-")
                 require(0 < len(data) <= 8 * MIB, "Embedded artwork is too large.")
                 sha = hashlib.sha256(data).hexdigest()
+                recording = {"section": song["section"], "variant": song["variant"]}
                 if sha in candidates:
+                    recordings = candidates[sha].setdefault("recordings", [])
+                    if recording not in recordings:
+                        recordings.append(recording)
                     continue
                 ext = cover_extension(BytesIO(data))
             except (ValueError, OSError):
@@ -214,7 +221,8 @@ def list_cover_candidates(files, songs, embedded, plan_path):
             else:
                 with path.open("xb") as output:
                     output.write(data)
-            candidates[sha] = {"file": str(path), "source": "embedded", "section": song["section"]}
+            candidates[sha] = {"file": str(path), "source": "embedded", "section": song["section"],
+                               "prominentQRCode": prominent_qr(data), "recordings": [recording]}
     return list(candidates.values())
 
 
@@ -225,6 +233,7 @@ def set_cover_selection(config, choice):
         return None
     path = choice.resolve(strict=True)
     asset = cover_asset(path, (config.get("projectName"), config.get("routineName")))
+    require(not prominent_qr(path.read_bytes()), "封面主体包含二维码。查找同一期官方图，展示并确认后再选用。")
     config["cover"] = str(path)
     config["coverSelection"] = {"sha256": asset["sha256"]}
     return asset
@@ -238,6 +247,7 @@ def selected_cover(config):
         asset = cover_asset(Path(path), (config.get("projectName"), config.get("routineName")))
         require(selected == {"sha256": asset["sha256"]},
                 "The confirmed artwork changed. Show it again and run select-cover.")
+        require(not prominent_qr(Path(path).read_bytes()), "已选封面主体包含二维码，请重新确认同一期官方图。")
         return asset
     if config.get("coverCandidates") or selected:
         require(selected == {"omit": True},
@@ -546,8 +556,10 @@ def analyze(args):
                 editions = {(slot["requiredDurationMinutes"], template["page"])
                             for template in review["classTemplates"] for slot in template["slots"]
                             if slot.get("requiredDurationMinutes") and number in slot["sectionNumbers"]}
-                if len(editions) == 1:
-                    minutes, page = next(iter(editions))
+                durations = {minutes for minutes, _ in editions}
+                if len(durations) == 1:
+                    minutes = durations.pop()
+                    page = min(source_page for _, source_page in editions)
                     record["classEdition"] = {"minutes": minutes, "page": page, "approved": False}
     if config.get("video"):
         video = Path(config["video"]).resolve(strict=True)
@@ -612,7 +624,7 @@ def confirmed_visual_clock(chapter, sightings, duration):
 def audio_only_score_variant(song, findings):
     return (song["variant"] in {"alternative", "bonus", "combo45Alternative", "combo45Bonus"}
             and findings.get("sourceVariantWithoutVideo") is True
-            and findings.get("chapter", {}).get("approved") is not True
+            and (findings.get("chapter") or {}).get("approved") is not True
             and findings.get("sectionFunction", {}).get("approved") is True)
 
 
@@ -674,6 +686,14 @@ def validate_section_function(function, pdf, section):
             f"Use the printed single-line section function for {section}.")
     require(pdf and type(page) is int and 1 <= page <= pdf["pageCount"],
             f"Section function for {section} requires a physical page in the source PDF.")
+
+
+def validate_section_function_review(evidence, function, section):
+    require(function and isinstance(evidence, dict)
+            and evidence.get("page") == function["page"]
+            and all(isinstance(evidence.get(key), str) and evidence[key].strip()
+                    and valid_text(evidence[key], 1000) for key in ("observedHeading", "recordingBasis")),
+            f"{section}: manual function review needs the physical page, visible heading and recording evidence.")
 
 
 def approved_section_function(song, findings, pdf):
@@ -879,6 +899,8 @@ def validate_manifest(value):
                     f"Invalid original PDF opening page for {item['section']}")
         if (function := item.get("sectionFunction")) is not None:
             validate_section_function(function, pdf, item["section"])
+        if evidence := item.get("sectionFunctionReview"):
+            validate_section_function_review(evidence, function, item["section"])
         if sightings := item.get("visualClockSightings"):
             require(confirmed_visual_clock(item.get("chapter"), sightings, item["duration"]),
                     f"{item['section']} does not have consistent early, middle and late video clock evidence")
@@ -985,7 +1007,14 @@ def inspect_review_sources(review, *, for_delivery=False):
     functions = [approved_section_function(song, findings, source_pdf)
                  for song, findings in zip(config["music"], review["tracks"])]
     pdf_path = same_source(checked_pdf_path(config["pdf"]), source_pdf["source"]) if source_pdf else None
-    declared_sections = [{**song, "sectionFunction": function} for song, function in zip(config["music"], functions) if function]
+    declared_sections = []
+    for song, findings, function in zip(config["music"], review["tracks"], functions, strict=True):
+        if function:
+            entry = {**song, "sectionFunction": function}
+            if evidence := findings.get("sectionFunctionReview"):
+                validate_section_function_review(evidence, function, song["section"])
+                entry["sectionFunctionReview"] = evidence
+            declared_sections.append(entry)
     grit = grit_source_evidence(pdf_path, config["music"], routine) if pdf_path and program == "GRIT" else None
     checked_functions = section_function_checks(pdf_path, declared_sections, grit)
     manual_functions = require_matching_section_functions(checked_functions)
@@ -1057,8 +1086,10 @@ def package(args, *, review=None, content=None):
         preflight_seconds = 0.0
         print(f"{name} · 检查并保留 {len(content.timelines)} 首原始音乐", file=sys.stderr, flush=True)
 
+        artwork = same_source(config["cover"], content.cover) if content.cover else None
+
         def prepare_audio(item):
-            song, findings, timeline, function = item
+            index, (song, findings, timeline, function) = item
             path = same_source(song["file"], findings["source"])
             lufs, peak = measure(path)
             duration, _ = probe(path, "audio")
@@ -1066,7 +1097,9 @@ def package(args, *, review=None, content=None):
             row = {key: song[key] for key in ("section", "variant", "catalogTrackID", "title", "pdfPage") if key in song}
             if "pdfPage" not in row and findings.get("pdfOpeningPage") is not None:
                 row["pdfPage"] = findings["pdfOpeningPage"]
-            row.update(asset=findings["source"], duration=round(duration, 6))
+            if artwork:
+                path = music_with_cover(path, work / f"music-{index}.{extension(path)}", artwork)
+            row.update(asset=identity(path), duration=round(duration, 6))
             if (edition := findings.get("classEdition")) and edition.get("approved") is True:
                 row["classDurationMinutes"] = edition["minutes"]
             if (chapter := findings.get("chapter")) and chapter.get("approved") is True:
@@ -1081,10 +1114,12 @@ def package(args, *, review=None, content=None):
                 row["cues"] = timeline
             if function:
                 row["sectionFunction"] = function
+                if evidence := findings.get("sectionFunctionReview"):
+                    row["sectionFunctionReview"] = evidence
             return path, row, levels
 
         tracks = zip(config["music"], review["tracks"], content.timelines, content.functions, strict=True)
-        for path, song, levels in map_recordings(prepare_audio, tracks):
+        for path, song, levels in map_recordings(prepare_audio, enumerate(tracks)):
             files.append(path)
             manifest["music"].append(song)
             loudness.append({"section": song["section"], "variant": song["variant"], **levels})
@@ -1109,22 +1144,11 @@ def package(args, *, review=None, content=None):
                 codec = args.video_codec or "hevc"
                 path, encoded_picture = encode(path, work / "encoded.mp4",
                     args.video_max_height or height, args.video_bitrate_kbps or bitrate, codec)
-                used_fallback = encoded_picture.get("compression") == "keptOriginal"
-                compatible = (encoded_picture["codec"] == "h264" or
-                              (encoded_picture["codec"] == "hevc" and encoded_picture.get("codecTag") == "hvc1"))
-                required_size = args.video_max_height is not None or args.video_bitrate_kbps is not None
-                use_source_video = used_fallback and args.video_codec is None and not required_size and compatible
-                if use_source_video:
-                    reason = encoded_picture["reason"]
-                    print(f"{name} · 保留源视频与字幕轨。{reason}", file=sys.stderr, flush=True)
-                elif encoded_picture["codec"] != codec or (used_fallback and (required_size or not compatible)):
-                    name_for_codec = "H.265 (HEVC)" if codec == "hevc" else "H.264"
-                    reason = encoded_picture.get("reason", "Output codec did not match.")
-                    raise ValueError(f"Could not package {name_for_codec} video. {reason} "
-                                     "Choose an iPad or compact profile to adjust the encode, "
-                                     "or explicitly choose original quality to keep the source codec.")
             else:
                 encoded_picture = video_info(path)
+            if args.video_quality != "original":
+                require(encoded_picture["codec"] == codec and (codec != "hevc" or encoded_picture["codecTag"] == "hvc1"),
+                        "成品视频编码与交付要求不符。请调整编码并重新验证。")
             video_quality = {"preset": args.video_quality, "source": original_picture, "output": encoded_picture}
             manifest["video"] = {"asset": identity(path), "duration": round(encoded_picture["duration"], 6)}
             files.append(path)
@@ -1132,10 +1156,9 @@ def package(args, *, review=None, content=None):
         if content.pdf_path:
             manifest["pdf"] = {"asset": content.source_pdf["source"], "pageCount": content.source_pdf["pageCount"]}
             files.append(content.pdf_path)
-        if content.cover:
-            path = same_source(config["cover"], content.cover)
+        if artwork:
             manifest["cover"] = content.cover
-            files.append(path)
+            files.append(artwork)
         if content.templates:
             path = work / "class-templates.json"
             write_json(path, {"schemaVersion": 1, "templates": content.templates})
@@ -1160,7 +1183,7 @@ def package(args, *, review=None, content=None):
     receipt.update(output=str(output.resolve()), loudness=loudness, videoQuality=video_quality,
                    seconds=round(perf_counter() - started, 2), audioSeconds=round(audio_seconds, 2),
                    videoSeconds=round(video_seconds, 2), mediaPreflightSeconds=round(preflight_seconds, 2),
-                   musicPolicy="keepOriginalDynamics")
+                   musicPolicy="keepOriginalDynamics", musicArtworkUpdated=bool(content.cover))
     print(json.dumps(receipt, ensure_ascii=False, indent=2))
     return output
 
@@ -1207,7 +1230,9 @@ def section_function_checks(pdf, songs, grit=None):
                for song in songs]
     generic_songs = [song for song, result in zip(songs, checked) if result is None]
     generic = iter(inspect_section_functions(pdf, generic_songs)) if generic_songs else iter(())
-    return [result if result is not None else next(generic) for result in checked]
+    actual = [result if result is not None else next(generic) for result in checked]
+    return [("sourceReviewed", None) if status == "manual" and song.get("sectionFunctionReview") else (status, reason)
+            for song, (status, reason) in zip(songs, actual, strict=True)]
 
 
 def verify(path, *, manual_functions=None):
@@ -1269,10 +1294,13 @@ def revise(args):
     for song in updated["music"]:
         require(not unresolved_repeat_times(song.get("cues") or []),
                 f"Finish structural repeats before submitting {song['section']}")
+    require(not args.original_video or args.hevc_video, "--original-video requires --hevc-video.")
     replacing_cover = args.cover is not None or args.without_cover
+    require(not (args.music_artwork and args.without_cover), "选择确认过的封面后才能统一音乐封面。")
     if replacing_cover:
         if args.cover is not None:
             updated["cover"] = cover_asset(args.cover)
+            require(not prominent_qr(args.cover.read_bytes()), "封面主体包含二维码，须更换为经确认的同版图。")
         else:
             updated.pop("cover", None)
     if args.class_templates:
@@ -1290,6 +1318,45 @@ def revise(args):
                 "A revision must retain the package identity and increase its version")
         old_assets = validate_manifest(old)
         require(old_assets == reviewed_assets, "Changing media requires building a new package from source")
+        scratch = Path(directory)
+        audio_replacements = []
+        if args.music_artwork:
+            artwork = args.cover
+            if artwork is None and (original := old.get("cover")):
+                artwork = scratch / f"cover.{original['ext']}"
+                first = source.tell()
+                cover_index = len(old["music"]) + bool(old.get("video")) + bool(old.get("pdf"))
+                source.seek(sum(asset["bytes"] for asset in old_assets[:cover_index]), 1)
+                with artwork.open("xb") as destination:
+                    consume(source, original, destination=destination)
+                source.seek(first)
+            require(artwork is not None and not prominent_qr(artwork.read_bytes()),
+                    "请指定确认过的无广告封面。")
+            for index, asset in enumerate(old_assets[:len(old["music"])]):
+                path = scratch / f"audio-{index}.{asset['ext']}"
+                with path.open("xb") as destination:
+                    consume(source, asset, destination=destination)
+                replacement = music_with_cover(path, scratch / f"updated-{index}.{asset['ext']}", artwork)
+                audio_replacements.append(replacement)
+                updated["music"][index]["asset"] = identity(replacement)
+        if args.hevc_video:
+            require(old.get("video"), "找不到可替换的源视频。")
+            original = old["video"]["asset"]
+            if args.original_video:
+                original_video = same_source(str(args.original_video), original)
+            else:
+                original_video = scratch / f"original.{original['ext']}"
+                first = source.tell()
+                if not audio_replacements:
+                    source.seek(sum(asset["bytes"] for asset in old_assets[:len(old["music"])]), 1)
+                with original_video.open("xb") as destination:
+                    consume(source, original, destination=destination)
+                source.seek(first)
+            verified = verify_video_conversion(original_video, args.hevc_video, None, "hevc")
+            scores = video_quality_samples(original_video, args.hevc_video, verified["duration"],
+                                           verified["width"], verified["height"])
+            require(min(scores) >= 0.96, "替换的 H.265 未通过对比画质抽检。")
+            updated["video"] = {"asset": identity(args.hevc_video), "duration": round(verified["duration"], 6)}
         assets = validate_manifest(updated)
         encoded = json.dumps(updated, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode()
         require(0 < len(encoded) <= MAX_MANIFEST and
@@ -1299,9 +1366,23 @@ def revise(args):
         with temporary.open("xb") as stream:
             os.chmod(temporary, 0o600)
             stream.write(MAGIC + struct.pack(">I", len(encoded)) + encoded)
-            media_assets = old_assets[:len(old["music"]) + bool(old.get("video")) + bool(old.get("pdf"))]
-            for asset in media_assets:
-                consume(source, asset, destination=stream)
+            music_count = len(old["music"])
+            if audio_replacements:
+                for song, path in zip(updated["music"], audio_replacements, strict=True):
+                    with path.open("rb") as media:
+                        consume(media, song["asset"], destination=stream)
+                        require(not media.read(1), "Restaged music changed while packing")
+            else:
+                for asset in old_assets[:music_count]:
+                    consume(source, asset, destination=stream)
+            if original := old.get("video"):
+                consume(source, original["asset"], destination=None if args.hevc_video else stream)
+                if args.hevc_video:
+                    with args.hevc_video.open("rb") as video:
+                        consume(video, updated["video"]["asset"], destination=stream)
+                        require(not video.read(1), "Replacement video changed while packing")
+            if original := old.get("pdf"):
+                consume(source, original["asset"], destination=stream)
             if original_cover := old.get("cover"):
                 consume(source, original_cover, destination=None if replacing_cover else stream)
             if args.cover is not None:
@@ -1365,6 +1446,12 @@ def physical_pages(value):
     return sorted(pages)
 
 
+def inspect_score(args):
+    source = checked_pdf_path(args.score)
+    index = export_score_pages(source, args.pages, args.output_dir)
+    print(json.dumps({"index": str(index.resolve()), "pages": args.pages}, ensure_ascii=False))
+
+
 def review_problems(review, *, source_limited=False):
     plan = review["plan"]
     pdf, video = bool(plan.get("pdf")), bool(plan.get("video"))
@@ -1375,7 +1462,7 @@ def review_problems(review, *, source_limited=False):
         if not video:
             problems.append("未选视频。若原始资料确实没有，请先确认课程的交付范围。")
     for song, record in zip(plan["music"], review["tracks"], strict=True):
-        section = song["section"]
+        section = song["section"] if song["variant"] == "standard" else f"{song['section']} ({song['variant']})"
         supplement = record.get("supplementary") is True
         chapter = record.get("chapter") or {}
         video_clock = chapter.get("approved") is True and (chapter.get("evidence") == "audioMatched"
@@ -1559,6 +1646,10 @@ def main():
     p.add_argument("--output", required=True, type=Path)
     p.add_argument("--ocr", action="store_true", help="Compatibility flag; sparse scanned pages are detected automatically")
     p.add_argument("--skip-alignment", action="store_true")
+    p = commands.add_parser("inspect-score", help="Render selected original score pages and positioned text for review")
+    p.add_argument("score", type=Path)
+    p.add_argument("--pages", type=physical_pages, required=True, help="Physical PDF pages such as 4,6-8")
+    p.add_argument("--output-dir", type=Path, required=True, help="New local folder for the page images and text")
     p = commands.add_parser("build")
     p.add_argument("review", type=Path)
     p.add_argument("--output-dir", required=True, type=Path)
@@ -1596,9 +1687,13 @@ def main():
     cover_options.add_argument("--cover", type=Path, help="Use an explicitly approved replacement cover")
     cover_options.add_argument("--without-cover", action="store_true", help="Remove the previous cover")
     p.add_argument("--class-templates", type=Path, help="Reviewed class-templates.json file to add or replace")
+    p.add_argument("--music-artwork", action="store_true", help="Apply the confirmed cover to every supported music file")
+    p.add_argument("--hevc-video", type=Path, help="Verify and install a losslessly timed H.265 conversion of the packaged video")
+    p.add_argument("--original-video", type=Path, help="Exact original video, to reuse if it is already staged")
     for option in ("--rebalance", "--reduce-peak", "--lufs"):
         p.add_argument(option, action=RejectAudioEdit, help=argparse.SUPPRESS)
     p = commands.add_parser("submit", help="Create a clean batch with verified packages, QA images and fingerprints")
+    p.add_argument("--allow-non-hevc", action="store_true", help="Only for a creator-confirmed alternate codec")
     p.add_argument("packages", type=Path, nargs="+")
     add_delivery_location(p)
     p.add_argument("--batch-id")
@@ -1627,7 +1722,7 @@ def main():
             submit(args)
         else:
             {"plan": plan, "confirm-plan": confirm_plan, "text-cover": text_cover, "attribution": attribution,
-             "select-cover": select_cover, "analyze": analyze, "build": package,
+             "select-cover": select_cover, "analyze": analyze, "inspect-score": inspect_score, "build": package,
              "manifest": extract_manifest, "revise": revise, "finish": finish, "check-review": check_review}[args.command](args)
     except (ValueError, KeyError, TypeError, OSError, ImportError, subprocess.SubprocessError) as error:
         parser.exit(1, f"{error}\n")

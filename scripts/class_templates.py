@@ -12,7 +12,7 @@ import unicodedata
 
 ENGLISH_HEADER = re.compile(
     r"^(\d{1,3})\s*[-‐‑– ]?\s*MIN(?:UTE)?S?\s+"
-    r"(EXPRESS\s+FORMAT|FORMAT|STRENGTH|FLEXIBILITY)\b"
+    r"(EXPRESS\s+FORMAT|EXPRESS(?=\s*$)|FORMAT|STRENGTH|FLEXIBILITY)\b"
     r"(?:\s*[-‐‑–—]\s*OPTION\s+(\d{1,2}))?", re.I)
 SPANISH_HEADER = re.compile(r"^(FUERZA|FLEXIBILIDAD)\s+(\d{1,3})\s*MINUTOS?\b", re.I)
 TOTAL_LINE = re.compile(r"^(?:TOTAL\s+TIME|TIEMPO\s+(?:TOTAL|\d{1,3}:)|合计|总时长)", re.I)
@@ -49,6 +49,25 @@ class FormatLine:
         bottom = min(word["bottom"] for word in row)
         return cls(line_text(row), row[0]["x0"], top, bottom - top,
                    tuple(row) if row[0].get("ocr") else ())
+
+
+def join_wrapped_track_labels(column):
+    """Reconnect a track number wrapped within the same printed number column."""
+    pending = None
+    for line in column:
+        if pending:
+            width = max(14, pending.height * 1.85)
+            continuation = re.fullmatch(r"\d{1,3}[A-Z]?(?:\s*/\s*\d{1,3}[A-Z]?)*", line.text, re.I)
+            prefix = re.match(r"^(TRACK\s*(?:\d{1,3}[A-Z]?\s*/\s*TRACK\s*)?)(.*)$", pending.text, re.I)
+            if (prefix and continuation and abs(pending.left - line.left) <= 4
+                    and 0 < line.top - pending.top <= width):
+                yield replace(pending, text=f"{prefix[1].strip()} {line.text} {prefix[2]}".strip())
+                pending = None
+                continue
+            yield pending
+        pending = line
+    if pending:
+        yield pending
 
 
 def format_columns(words, width, row_lines, source_row):

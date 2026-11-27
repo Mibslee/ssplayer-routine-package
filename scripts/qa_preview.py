@@ -18,6 +18,7 @@ import tempfile
 import pypdfium2
 from PIL import Image, ImageDraw, ImageFont, ImageOps
 
+from cover_artwork import inspect_music_artwork, prominent_qr
 from delivery_policy import assess_delivery, class_recording_conditions, class_slot_label
 from grit_evidence import check_grit_section_function, grit_source_evidence
 from grit_intervals import validate_interval_review
@@ -164,6 +165,7 @@ def source_files(package, work, sealed_copy=None):
 
 def inspect_tracks(manifest, paths, optional):
     alignment = alignment_module() if optional.get("video") else None
+    expected_cover = optional["cover"].read_bytes() if "cover" in optional else None
 
     def inspect(item):
         song, path = item
@@ -175,6 +177,10 @@ def inspect_tracks(manifest, paths, optional):
                             durationMatches=abs(duration - song["duration"]) <= 0.25)
         except (ValueError, OSError, subprocess.SubprocessError):
             measured.update(decoded=False)
+        try:
+            artwork_problem = inspect_music_artwork(path, expected_cover)
+        except (ValueError, OSError):
+            artwork_problem = "unreadable"
         chapter = song.get("chapter")
         try:
             timing = timing_windows(song, path, optional["video"], alignment) if chapter else {"status": "unlocated", "windows": []}
@@ -185,6 +191,7 @@ def inspect_tracks(manifest, paths, optional):
                 "duration": song["duration"], "pdfPage": song.get("pdfPage")
                 or (song["cues"][0]["page"] if rows else None), "cueRows": rows,
                 "sectionFunction": song.get("sectionFunction"), "chapter": chapter,
+                "artworkProblem": artwork_problem,
                 "sourceVariantWithoutVideo": song.get("sourceVariantWithoutVideo"),
                 "visualClockSightings": song.get("visualClockSightings"), **measured, **timing}
 
@@ -572,7 +579,14 @@ def screenshot_cards(manifest, files, report, font_path):
     timing_rows = []
     for row in tracks if picture else ():
         values = " / ".join(f"{window['offsetMS']:+.1f}" for window in row["windows"])
-        result = "收尾曲 · 仅音乐" if row.get("supplementary") and not row["chapter"] else TIMING_STATES[row["status"]]
+        if row.get("sourceVariantWithoutVideo"):
+            result = "备选录音 · 仅音乐"
+        elif row.get("supplementary") and not row["chapter"]:
+            result = "收尾曲 · 仅音乐"
+        elif row.get("visualClockSightings"):
+            result = "画面时钟已核实"
+        else:
+            result = TIMING_STATES[row["status"]]
         timing_rows.append((section_title(row), values + " ms" if values else result))
     timing.rows(timing_rows or [("时钟复测", "本包未提供可复测的视频。")])
     decorate(timing, 85, "video", show_note=bool(delivery_display(manifest, report, "video")[1]["blockers"]))
@@ -706,17 +720,27 @@ def generate(args, *, sealed_copy=None, overview_only=False):
             add_condition(report, "video", f"{sections_for(missing_chapters)} 无可靠小节定位。可按整段视频观看。")
         if uncertain_chapters:
             add_condition(report, "video", f"{sections_for(uncertain_chapters)} 仅有近似或画面位置，音画时钟未对齐。")
+        if "cover" in optional and prominent_qr(optional["cover"].read_bytes()):
+            add_issue(report, "contents", "套路封面主体包含二维码，须换成经确认的官方同版图。")
+        for code, message in {
+            "qr": "音乐内嵌封面主体包含二维码，须更换。",
+            "mismatch": "音乐内嵌封面与已确认的套路封面不一致。",
+            "unreadable": "无法检查音乐内嵌封面。",
+        }.items():
+            if affected := [track for track in tracks if track["artworkProblem"] == code]:
+                add_issue(report, "contents", f"{sections_for(affected)} · {message}")
         if missing_cues and "pdf" not in optional:
             detail = ("本包未附动作时间线。" if len(missing_cues) == len(tracks)
                       else f"{sections_for(missing_cues)} 未提供可用动作时间线。")
             add_source_limitation(report, "timeline", "no_timed_source", detail + "音乐仍可播放和排课。")
+        for code, detail in (
+            ("visualClockSightings", "画面时钟已逐段核实。在视频备课中按画面定位。"),
+            ("sourceVariantWithoutVideo", "备选录音仅供音乐备课和排课，原教学视频无对应片段。"),
+        ):
+            if affected := [track for track in tracks if track.get(code)]:
+                report["advisories"].append({"check": "video", "code": code,
+                    "detail": f"{sections_for(affected)} · {detail}"})
         for track in tracks:
-            if track.get("visualClockSightings"):
-                add_source_limitation(report, "video", "source_visual_clock",
-                                      f"{section_title(track)} 已复核前中尾画面时钟，按视频自身计时定位。")
-            if track.get("sourceVariantWithoutVideo"):
-                add_source_limitation(report, "video", "source_variant_audio_only",
-                                      f"{section_title(track)} 为音频备选版，原教学视频无此录音。")
             if is_supplement(track):
                 track["supplementary"] = True
                 label = section_title(track)
@@ -748,6 +772,9 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                 add_issue(report, "video", "视频流无法读取，或实际视频时长与清单不符。")
             else:
                 report["videoInfo"] = picture
+                if (not getattr(args, "allow_non_hevc", False)
+                        and (picture["codec"] != "hevc" or picture["codecTag"] != "hvc1")):
+                    add_issue(report, "contents", f"成品视频为 {picture['codec'].upper()}，交付要求为 H.265（hvc1）。")
                 screen = inspect_screen_subtitles(optional["video"], picture["duration"],
                     None if overview_only else output / "subtitle-samples.jpg", getattr(args, "screen_subtitles", None))
                 report["screenSubtitles"] = screen
@@ -810,7 +837,13 @@ def generate(args, *, sealed_copy=None, overview_only=False):
                         if status == "contradiction":
                             add_issue(report, "structure", message)
                         if status == "manual":
-                            add_condition(report, "structure", message)
+                            if evidence := song.get("sectionFunctionReview"):
+                                track["sectionFunctionCheck"] = "sourceReviewed"
+                                report["advisories"].append({"check": "structure", "code": "sourceReviewed",
+                                    "detail": f"{section_title(track)} · 原谱第 {evidence['page']} 页 · "
+                                              f"{evidence['observedHeading']} · {evidence['recordingBasis']}"})
+                            else:
+                                add_condition(report, "structure", message)
                     has_printed_timeline = source["rows"] and source["status"] != "unresolved"
                     if interval := intervals.get(song["section"]):
                         state, detail = validate_interval_review(interval, song.get("cues") or [])
@@ -872,6 +905,7 @@ def main():
                         help="Assess a creator-confirmed scope with genuinely absent original materials")
     parser.add_argument("--screen-subtitles", choices=("present", "absent"), metavar="RESULT",
                         help="Visual judgment after reviewing samples from this exact package")
+    parser.add_argument("--allow-non-hevc", action="store_true", help="Creator confirmed an alternate codec")
     parser.add_argument("--strict", action="store_true", help="Write full evidence and exit 2 if delivery is blocked")
     args = parser.parse_args()
     try:

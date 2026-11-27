@@ -24,9 +24,11 @@ class VideoTimingTests(unittest.TestCase):
         beginning = self.start * self.rate
         self.video[beginning:beginning + self.audio.size] = self.audio
 
-    def measure(self):
-        def decode(source, start, seconds):
+    def measure(self, speech=None):
+        def decode(source, start, seconds, *, band=None):
             samples = self.audio if source == "music" else self.video
+            if source == "video" and speech is not None and band is None:
+                samples = speech
             first = round(start * self.rate)
             return samples[first:first + round(seconds * self.rate)]
 
@@ -79,6 +81,13 @@ class VideoTimingTests(unittest.TestCase):
         evidence, reads = self.measure()
         self.assertEqual(evidence["status"], "review")
         self.assertEqual(reads, 24)
+
+    def test_split_band_fallback_requires_a_confirmed_shared_clock(self):
+        speech = self.rng.normal(0, 1, self.video.shape)
+        evidence, _ = self.measure(speech=speech)
+        self.assertEqual(evidence.get("method"), "splitBands")
+        self.assertEqual(len(evidence["windows"]), 6)
+        self.assertTrue(all(abs(item["offsetMS"]) <= 1 for item in evidence["windows"]))
 
     def test_uniform_drift_and_indistinguishable_repeats_remain_unverified(self):
         for kind in ("drift", "repeated"):

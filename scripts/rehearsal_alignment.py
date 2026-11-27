@@ -284,6 +284,9 @@ def _classify_pdf_variant_with_source(
         return "alternate", "explicit"
     if any(marker.startswith("45-MIN") for marker in marker_words):
         return "45-minute", "explicit"
+    # Express is a separate edit. The class table provides its nominal duration.
+    if marker_words & {"EXP", "EXP.", "EXPRESS"}:
+        return "express", "explicit"
 
     # Do not mistake BODYCOMBAT's ``05A / 05B.`` numeric heading for an
     # express-format label. The slash must be embedded in a descriptive word.

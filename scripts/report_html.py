@@ -126,7 +126,7 @@ def write_html(folder, manifest, report):
                   + "".join(f'<p class="note">{show(reason)}</p>'
                             for check in report["checks"].values() for reason in check["conditions"])
                   + review)
-    delivery_sections += delivery_notes(report.get("advisories", []), "原音频峰值观察")
+    delivery_sections += delivery_notes(report.get("advisories", []), "音频与视频观察")
     if review:
         review = f'<section class="panel"><h2>需要复核的曲目和发现</h2>{review}</section>'
     normal = "".join(panel for problem, panel in panels if not problem)

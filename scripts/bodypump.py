@@ -35,7 +35,7 @@ def phrase_words(words, top, exercise):
     return near_clock or (candidates if len(candidates) == 1 else [])
 
 
-def block_boundaries(page, words, marks, exercise):
+def block_boundaries(page, words, marks, exercise, *, split_lanes=False):
     """Read vector dividers. A centred printed numeral identifies the block, not its clock."""
     if not marks:
         return {}
@@ -52,13 +52,21 @@ def block_boundaries(page, words, marks, exercise):
     rules = defaultdict(list)
     for line in page.lines:
         color = line.get("stroking_color")
-        if (isinstance(color, tuple) and len(color) == 3 and color[0] > color[1] + .25
-                and color[0] > color[2] + .25 and abs(line["bottom"] - line["top"]) <= .5
+        if (isinstance(color, tuple) and len(color) == 3
+                and (color[0] > color[1] + .25 and color[0] > color[2] + .25)
+                and abs(line["bottom"] - line["top"]) <= .5
                 and marks[0][0] < line["top"] < marks[-1][0]):
             rules[round(line["top"], 1)].append((line["x0"], line["x1"]))
     dividers = sorted(top for top, ranges in rules.items()
                       if min(a for a, _ in ranges) < clock_left and max(b for _, b in ranges) > exercise
                       and sum(b-a for a, b in ranges) >= page.width * .55)
+    if split_lanes:
+        dividers = sorted(top for top, spans in rules.items()
+                          if any(a <= exercise + 5 and b - a >= page.width * .36 for a, b in spans))
+        # A printed recovery separator can use the same rule as a divider.
+        # Pair each consecutive block number with its nearest preceding rule.
+        dividers = list(dict.fromkeys(max((top for top in dividers if top < y - 3), default=0)
+                                      for y, _ in markers))[1:]
     starts = [0, *(i for y in dividers
                    for i in [next((j for j, (top, _) in enumerate(marks) if top > y), len(marks))]
                    if 0 < i < len(marks))]
@@ -142,7 +150,7 @@ def transform_actions(rows, qualifier):
     return True
 
 
-def expand_blocks(rows, duration):
+def expand_blocks(rows, duration, *, phrase_key="counts"):
     """Expand only source-proven block repeats on the recording's printed clock."""
     blocks, current = {}, []
     for row in rows:
@@ -162,8 +170,8 @@ def expand_blocks(rows, duration):
                 or row["time"] >= target["time"] or split_directive(row["action"])[0] for row in origin):
             result.append(target)
             continue
-        beats = [phrase_size(row.get("counts", "")) for row in origin]
-        size = phrase_size(target.get("counts", ""))
+        beats = [phrase_size(row.get(phrase_key, "")) for row in origin]
+        size = phrase_size(target.get(phrase_key, ""))
         if (len(beats) > 1 and all(beat is not None for beat in beats)
                 and re.fullmatch(r"(?:HOLD|Lower bar to thigh)[.!]?", origin[-1]["action"].strip(), re.I)
                 and beats[-1] <= Fraction(1, 2) and sum(beats[:-1]) == size):
@@ -172,7 +180,8 @@ def expand_blocks(rows, duration):
         end = rows[index+1]["time"] if index+1 < len(rows) else duration
         if (size is not None and all(beat is not None for beat in beats)
                 and len(origin) > 1 and sum(beats[1:]) == size
-                and re.match(r"^(?:Set up|TRANSITION:)", origin[0]["action"], re.I)):
+                and (re.match(r"^(?:Set up|TRANSITION:)", origin[0]["action"], re.I)
+                     or (phrase_key != "counts" and re.match(r"^Intro\s*/", origin[0].get("music", ""), re.I)))):
             origin, beats = origin[1:], beats[1:]
             distance = target["time"] - origin[0]["time"]
         appendix = None
